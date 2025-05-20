@@ -782,7 +782,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         // diagonal
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> dBlock(
             data + skel.chainData[cPtr], sSize, sSize);
-        dBlock.template triangularView<Eigen::Lower>().template solveInPlace(dVec);
+        dBlock.template triangularView<Eigen::Lower>().template solveInPlace<>(dVec);
 
         // blocks below diag
         for (int64_t p = cPtr + 1, pEnd = skel.chainColPtr[s + 1]; p < pEnd; p++) {
@@ -900,7 +900,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         // diagonal
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> dBlock(
             data + skel.chainData[cPtr], sSize, sSize);
-        dBlock.template triangularView<Eigen::Lower>().template solveInPlace(dVec);
+        dBlock.template triangularView<Eigen::Lower>().template solveInPlace<>(dVec);
 
         // blocks below diag
         for (int64_t p = cPtr + 1, pEnd = skel.chainColPtr[s + 1]; p < pEnd; p++) {
@@ -945,7 +945,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         // diagonal
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>> dBlock(
             data + skel.chainData[cPtr], sSize, sSize);
-        dBlock.template triangularView<Eigen::Upper>().template solveInPlace(dVec);
+        dBlock.template triangularView<Eigen::Upper>().template solveInPlace<>(dVec);
       }
       return;
     }
@@ -1012,7 +1012,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         // diagonal
         Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>> dBlock(
             data + skel.chainData[cPtr], sSize, sSize);
-        dBlock.template triangularView<Eigen::Upper>().template solveInPlace(dVec);
+        dBlock.template triangularView<Eigen::Upper>().template solveInPlace<>(dVec);
       }
     }
   }

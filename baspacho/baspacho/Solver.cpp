@@ -593,7 +593,7 @@ void Solver::resetStats() {
   symCtx->asmblStat.reset();
 }
 
-OpsPtr getBackend(const Settings& settings) {
+static OpsPtr getBackend(const Settings& settings) {
   if (settings.backend == BackendFast) {
     return fastOps(settings.numThreads);
   } else if (settings.backend == BackendCuda) {

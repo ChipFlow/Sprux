@@ -154,7 +154,7 @@ void testSparseElim_Many(const std::function<OpsPtr()>& genOps) {
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
     int64_t largestIndep = et.sparseElimRanges[1];
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     NumericCtxPtr<T> numCtx = solver.internalSymbolicContext().createNumericCtx<T>(0, nullptr);
     numCtx->doElimination(solver.internalGetElimCtx(0), data.data(), 0, largestIndep);
     Matrix<T> computedMat = solver.skel().densify(data);
@@ -209,7 +209,7 @@ void testSparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps) {
     Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(verifyMat);
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.factor(data.data());
     Matrix<T> computedMat = solver.skel().densify(data);
 

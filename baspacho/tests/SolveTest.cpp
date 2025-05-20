@@ -148,7 +148,7 @@ void testSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps,
             Eigen::Map<Matrix<T>>(rhsData.data(), order, nRHS));
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.solveLt(data.data(), rhsData.data(), order, nRHS);
 
     ASSERT_NEAR((Eigen::Map<Matrix<T>>(rhsVerif.data(), order, nRHS) -
@@ -206,7 +206,7 @@ void testSolveL_SparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps, 
             Eigen::Map<Matrix<T>>(rhsData.data(), order, nRHS));
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.solveL(data.data(), rhsData.data(), order, nRHS);
 
     ASSERT_NEAR((Eigen::Map<Matrix<T>>(rhsVerif.data(), order, nRHS) -
