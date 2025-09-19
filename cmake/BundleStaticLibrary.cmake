@@ -36,7 +36,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
             set_property(GLOBAL PROPERTY _${tgt_name}_static_bundle_${dependency} ON)
             _recursively_collect_dependencies(${dependency})
           endif()
-        elseif("${dependency}" MATCHES "\.(a|lib)$")
+        elseif("${dependency}" MATCHES "\\.(a|lib)$")
           list(APPEND static_libs ${dependency})
         endif()
       endforeach()
@@ -51,7 +51,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
   set(bundled_tgt_full_name 
     ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}${bundled_tgt_name}${CMAKE_STATIC_LIBRARY_SUFFIX})
 
-  if (CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|GNU)$")
+  if (CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang|GNU)$")
     file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${bundled_tgt_name}.ar.in
       "CREATE ${bundled_tgt_full_name}\n" )
         
@@ -70,6 +70,15 @@ function(bundle_static_library tgt_name bundled_tgt_name)
     set(ar_tool ${CMAKE_AR})
     if (CMAKE_INTERPROCEDURAL_OPTIMIZATION)
       set(ar_tool ${CMAKE_CXX_COMPILER_AR})
+    endif()
+
+    if (CMAKE_CXX_COMPILER_ID MATCHES "^(AppleClang|Clang)$")
+      find_program(LLVM_AR NAMES llvm-ar)
+      if (LLVM_AR)
+        set(ar_tool "${LLVM_AR}")
+      else()
+        message(FATAL_ERROR "llvm-ar not found!")
+      endif()
     endif()
 
     add_custom_command(
