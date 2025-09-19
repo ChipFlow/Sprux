@@ -35,7 +35,7 @@ void SparseMatGenerator::connectRanges(int64_t begin1, int64_t end1, int64_t beg
 
   uniform_real_distribution<> dis(0.0, 1.0);
   for (int64_t i = begin1; i < end1; i++) {
-    int64_t dBegin = min(maxOffset, max(begin2 - i, 1L));
+    int64_t dBegin = min(maxOffset, max(begin2 - i, (int64_t)1));
     int64_t dEnd = min(maxOffset, end2 - i);
     for (int64_t j = i + dBegin; j < i + dEnd; j++) {
       if (fill >= 1.0 || fill > dis(gen)) {
@@ -174,11 +174,11 @@ SparseMatGenerator SparseMatGenerator::genGrid(int64_t width, int64_t height, do
 
   uniform_real_distribution<> dis(0.0, 1.0);
   for (int64_t i = 0; i < width; i++) {
-    int64_t i2begin = max(i - connMaxDist, 0L);
+    int64_t i2begin = max(i - connMaxDist, (int64_t)0);
     int64_t i2end = min(i + connMaxDist + 1, width);
 
     for (int64_t j = 0; j < height; j++) {
-      int64_t j2begin = max(j - connMaxDist, 0L);
+      int64_t j2begin = max(j - connMaxDist, (int64_t)0);
       int64_t j2end = min(j + connMaxDist + 1, height);
       int64_t off = i * height + j;
       for (int i2 = i2begin; i2 < i2end; i2++) {
