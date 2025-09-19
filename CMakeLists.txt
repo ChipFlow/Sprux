@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 
 # set the project name
 project(BaSpaCho CXX)
@@ -181,6 +181,7 @@ endif()
 # use fetchcontent to download dependencies
 include(FetchContent)
 cmake_policy(SET CMP0077 NEW)
+cmake_policy(SET CMP0169 OLD) # do not complain about FetchContent_Populate
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
 	cmake_policy(SET CMP0135 NEW)
 endif()
@@ -190,7 +191,7 @@ endif()
 message("${Cyan}============================[ dispenso ]================================${ColourReset}")
 FetchContent_Declare(
   dispenso
-  URL https://github.com/facebookincubator/dispenso/archive/552738b62a04f5d7b51dfcef822ae2d89d154881.zip
+  URL https://github.com/facebookincubator/dispenso/archive/refs/tags/v1.4.0.zip
   )
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 FetchContent_MakeAvailable(dispenso)
@@ -205,7 +206,7 @@ if(BASPACHO_BUILD_TESTS)
   message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
   FetchContent_Declare(
     googletest
-    URL https://github.com/google/googletest/archive/refs/tags/release-1.11.0.zip
+    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
     )
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
@@ -222,7 +223,9 @@ message("${Cyan}=============================[ Eigen ]==========================
 FetchContent_Declare(
   eigen
   URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
+  EXCLUDE_FROM_ALL
 	)
+FetchContent_GetProperties(eigen)
 if(NOT eigen_POPULATED)
   FetchContent_Populate(eigen)
 endif()
@@ -236,8 +239,10 @@ if(BASPACHO_BUILD_EXAMPLES)
   message("${Cyan}=============================[ Sophus ]=================================${ColourReset}")
   FetchContent_Declare(
     sophus
-    URL https://github.com/strasdat/Sophus/archive/8e1941677ef214aab0397608f42b18fbe1a19885.zip
+    URL https://github.com/strasdat/Sophus/archive/refs/tags/1.24.6.zip
+    EXCLUDE_FROM_ALL
   )
+  FetchContent_GetProperties(sophus)
   if(NOT sophus_POPULATED)
     FetchContent_Populate(sophus)
   endif()
