@@ -81,7 +81,7 @@ void testPartialFactor_Many(const std::function<OpsPtr()>& genOps) {
     verifyMat.bottomRightCorner(afterBar, afterBar) = marginalBr;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.factorUpTo(data.data(), nocross);
     Matrix<T> computedMat = solver.skel().densify(data);
 
@@ -128,7 +128,7 @@ void testSplitFactor_Many(const std::function<OpsPtr()>& genOps) {
     Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(verifyMat);
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.factorUpTo(data.data(), nocross);
     solver.factorFrom(data.data(), nocross);
     Matrix<T> computedMat = solver.skel().densify(data);
@@ -185,7 +185,7 @@ void testPartialSolveL_Many(const std::function<OpsPtr()>& genOps) {
     int afterBar = order - barrierAt;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 3;
@@ -242,7 +242,7 @@ void testPartialSolveLt_Many(const std::function<OpsPtr()>& genOps) {
     int afterBar = order - barrierAt;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 3;
@@ -300,7 +300,7 @@ void testPartialAddMv_Many(const std::function<OpsPtr()>& genOps) {
     int afterBar = order - barrierAt;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 3;
@@ -373,7 +373,9 @@ void testPseudoFactor_Many(const std::function<OpsPtr()>& genOps) {
       auto diagBlock = verifyMat.block(start, start, size, size);
       auto belowDiagBlock = verifyMat.block(end, start, order - end, size);
 
-      { Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(diagBlock); }
+      {
+        Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(diagBlock);
+      }
 
       diagBlock.template triangularView<Eigen::Lower>()
           .transpose()
@@ -381,7 +383,7 @@ void testPseudoFactor_Many(const std::function<OpsPtr()>& genOps) {
     }
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
     solver.pseudoFactorFrom(data.data(), 0);
     Matrix<T> computedMat = solver.skel().densify(data);
 
@@ -438,7 +440,7 @@ void testPartialSolveLFrom_Many(const std::function<OpsPtr()>& genOps) {
     int afterBar = order - barrierAt;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 3;
@@ -493,7 +495,7 @@ void testPartialSolveLtFrom_Many(const std::function<OpsPtr()>& genOps) {
     int afterBar = order - barrierAt;
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
+    Solver solver(std::move(factorSkel), std::move(et.sparseElimRanges), {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 3;
@@ -548,7 +550,7 @@ void testPartialFragmentedAddMv_Many(const std::function<OpsPtr()>& genOps) {
     int barrierAt = factorSkel.spanStart[nocross];
     int afterBar = order - barrierAt;
 
-    Solver solver(move(factorSkel), {}, {}, genOps());
+    Solver solver(std::move(factorSkel), {}, {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 1;
@@ -618,7 +620,7 @@ void testPartialFragmentedSolveL_Many(const std::function<OpsPtr()>& genOps) {
     int barrierAt = factorSkel.spanStart[nocross];
     int afterBar = order - barrierAt;
 
-    Solver solver(move(factorSkel), {}, {}, genOps());
+    Solver solver(std::move(factorSkel), {}, {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 1;
@@ -695,7 +697,7 @@ void testPartialFragmentedSolveLt_Many(const std::function<OpsPtr()>& genOps) {
     int barrierAt = factorSkel.spanStart[nocross];
     int afterBar = order - barrierAt;
 
-    Solver solver(move(factorSkel), {}, {}, genOps());
+    Solver solver(std::move(factorSkel), {}, {}, genOps());
 
     for (int j = 0; j < 5; j++) {
       int nRHS = 1;

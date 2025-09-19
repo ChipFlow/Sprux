@@ -80,7 +80,9 @@ Vec4 optimizePotrfModel(const vector<vector<double>>& samples) {
     double s = 1.0 / sqrt(t);  // scaling factor
     opt.addFactor(
         [=](const Vec4& c, Mat14* dc) -> Vec1 {
-          dc && (*dc = ComputationModel::dPotrfModel(n) * s, true);
+          if (dc) {
+            *dc = ComputationModel::dPotrfModel(n) * s;
+          }
           return Vec1{s * (ComputationModel::potrfModel(c, n) - t)};
         },
         coeffs);
@@ -115,7 +117,9 @@ Vec6 optimizeTrsmModel(const vector<vector<double>>& samples) {
     double s = 1.0 / sqrt(t);  // scaling factor
     opt.addFactor(
         [=](const Vec6& c, Mat16* dc) -> Vec1 {
-          dc && (*dc = ComputationModel::dTrsmModel(n, k) * s, true);
+          if (dc) {
+            *dc = ComputationModel::dTrsmModel(n, k) * s;
+          }
           return Vec1{s * (ComputationModel::trsmModel(c, n, k) - t)};
         },
         coeffs);
@@ -156,7 +160,9 @@ Vec6 optimizeSygeModel(const vector<vector<double>>& samples) {
     double s = 1.0 / sqrt(t);  // scaling factor
     opt.addFactor(
         [=](const Vec6& c, Mat16* dc) -> Vec1 {
-          dc && (*dc = ComputationModel::dSygeModel(m, n, k) * s, true);
+          if (dc) {
+            *dc = ComputationModel::dSygeModel(m, n, k) * s;
+          }
           return Vec1{s * (ComputationModel::sygeModel(c, m, n, k) - t)};
         },
         coeffs);
@@ -192,7 +198,9 @@ Vec4 optimizeAsmblModel(const vector<vector<double>>& samples) {
     double s = 1.0 / sqrt(t);  // scaling factor
     opt.addFactor(
         [=](const Vec4& c, Mat14* dc) -> Vec1 {
-          dc && (*dc = ComputationModel::dAsmblModel(br, bc) * s, true);
+          if (dc) {
+            *dc = ComputationModel::dAsmblModel(br, bc) * s;
+          }
           return Vec1{s * (ComputationModel::asmblModel(c, br, bc) - t)};
         },
         coeffs);
