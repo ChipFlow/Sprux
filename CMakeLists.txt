@@ -198,27 +198,37 @@ endif()
 
 # dispenso for multithreading
 # currently in facebookincubator, soon to be opensourced
-message("${Cyan}============================[ dispenso ]================================${ColourReset}")
-FetchContent_Declare(
-  dispenso
-  URL https://github.com/facebookincubator/dispenso/archive/refs/tags/v1.4.0.zip
-)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-FetchContent_MakeAvailable(dispenso)
-unset(CMAKE_POSITION_INDEPENDENT_CODE)
+if(NOT DEFINED dispenso_SOURCE_DIR)
+  message("${Cyan}============================[ dispenso ]================================${ColourReset}")
+  FetchContent_Declare(
+    dispenso
+    URL https://github.com/facebookincubator/dispenso/archive/refs/tags/v1.4.0.zip
+  )
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  FetchContent_MakeAvailable(dispenso)
+  unset(CMAKE_POSITION_INDEPENDENT_CODE)
+else()
+  message("${Cyan}Using Dispenso from parent project:${ColourReset}")
+endif()
+
 include_directories(${dispenso_SOURCE_DIR} ${dispenso_SOURCE_DIR}/dispenso/third-party/moodycamel)
 message("* Dispenso Source = " ${dispenso_SOURCE_DIR})
 message("* Dispenso Library Dir = " ${dispenso_BINARY_DIR})
 
 # gtest
 if(BASPACHO_BUILD_TESTS)
-  message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
-  FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
-  )
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
+  if(NOT DEFINED gtest_SOURCE_DIR)
+    message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
+    FetchContent_Declare(
+      googletest
+      URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.zip
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+  else()
+    message("${Cyan}Using GoogleTest from parent project:${ColourReset}")
+  endif()
+
   message("* GTest Source = " ${gtest_SOURCE_DIR})
   message("* GTest Library Dir = " ${gtest_BINARY_DIR})
   message("* GMock Source = " ${gmock_SOURCE_DIR})
@@ -227,16 +237,20 @@ if(BASPACHO_BUILD_TESTS)
 endif()
 
 # eigen
-message("${Cyan}=============================[ Eigen ]==================================${ColourReset}")
-FetchContent_Declare(
-  eigen
-  URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
-  EXCLUDE_FROM_ALL
-)
-FetchContent_GetProperties(eigen)
+if(NOT DEFINED eigen_SOURCE_DIR)
+  message("${Cyan}=============================[ Eigen ]==================================${ColourReset}")
+  FetchContent_Declare(
+    eigen
+    URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
+    EXCLUDE_FROM_ALL
+  )
+  FetchContent_GetProperties(eigen)
 
-if(NOT eigen_POPULATED)
-  FetchContent_Populate(eigen)
+  if(NOT eigen_POPULATED)
+    FetchContent_Populate(eigen)
+  endif()
+else()
+  message("${Cyan}Using Eigen from parent project:${ColourReset}")
 endif()
 
 message("* Eigen Source = " ${eigen_SOURCE_DIR})
@@ -245,16 +259,20 @@ include_directories(${eigen_SOURCE_DIR})
 
 # Sophus (only needed for BA problem in examples/benchmarks)
 if(BASPACHO_BUILD_EXAMPLES)
-  message("${Cyan}=============================[ Sophus ]=================================${ColourReset}")
-  FetchContent_Declare(
-    sophus
-    URL https://github.com/strasdat/Sophus/archive/refs/tags/1.24.6.zip
-    EXCLUDE_FROM_ALL
-  )
-  FetchContent_GetProperties(sophus)
+  if(NOT DEFINED sophus_SOURCE_DIR)
+    message("${Cyan}=============================[ Sophus ]=================================${ColourReset}")
+    FetchContent_Declare(
+      sophus
+      URL https://github.com/strasdat/Sophus/archive/refs/tags/1.24.6.zip
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_GetProperties(sophus)
 
-  if(NOT sophus_POPULATED)
-    FetchContent_Populate(sophus)
+    if(NOT sophus_POPULATED)
+      FetchContent_Populate(sophus)
+    endif()
+  else()
+    message("${Cyan}Using Sophus from parent project:${ColourReset}")
   endif()
 
   message("* Sophus Source = " ${sophus_SOURCE_DIR})
