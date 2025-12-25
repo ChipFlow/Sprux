@@ -15,6 +15,9 @@ set(BASPACHO_CXX_FLAGS -Wall -Wextra -pedantic) # -O1 -g -fsanitize=address -sta
 message("* Build type: " ${CMAKE_BUILD_TYPE})
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleStaticLibrary.cmake")
 
+# Add cmake module path for custom find modules
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 # general settings
 set(BASPACHO_BUILD_TESTS ON CACHE BOOL "If on (default), tests are build")
 set(BASPACHO_BUILD_EXAMPLES ON CACHE BOOL "If on (default), exampels/benchmarks are build")
@@ -136,6 +139,25 @@ if(BASPACHO_USE_METAL)
   # baspacho/baspacho/CMakeLists.txt.
 
   add_compile_definitions(BASPACHO_USE_METAL)
+endif()
+
+# OpenCL (with CLBlast for BLAS operations)
+set(BASPACHO_USE_OPENCL OFF CACHE BOOL "If on, OpenCL support is enabled (with CLBlast)")
+
+if(BASPACHO_USE_OPENCL)
+  message("${Cyan}==============================[ OpenCL ]=================================${ColourReset}")
+
+  find_package(OpenCL REQUIRED)
+  message("* OpenCL Version: ${OpenCL_VERSION_STRING}")
+  message("* OpenCL Include: ${OpenCL_INCLUDE_DIRS}")
+  message("* OpenCL Libraries: ${OpenCL_LIBRARIES}")
+
+  # CLBlast provides high-performance BLAS for OpenCL
+  find_package(CLBlast REQUIRED)
+  message("* CLBlast Libraries: ${CLBLAST_LIBRARIES}")
+
+  include_directories(${OpenCL_INCLUDE_DIRS})
+  add_compile_definitions(BASPACHO_USE_OPENCL)
 endif()
 
 # BLAS. a few possibilities are:

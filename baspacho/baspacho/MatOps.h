@@ -224,4 +224,8 @@ OpsPtr cudaOps();
 OpsPtr metalOps();
 #endif
 
+#ifdef BASPACHO_USE_OPENCL
+OpsPtr openclOps();
+#endif
+
 }  // end namespace BaSpaCho
