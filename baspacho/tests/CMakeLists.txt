@@ -25,3 +25,8 @@ add_baspacho_test(MetalSolveTest MetalSolveTest.cpp)
 # add_baspacho_test(BatchedMetalSolveTest BatchedMetalSolveTest.cpp)
 # add_baspacho_test(MetalPartialTest MetalPartialTest.cpp)
 endif()
+
+if(BASPACHO_USE_OPENCL)
+add_baspacho_test(OpenCLFactorTest OpenCLFactorTest.cpp)
+# add_baspacho_test(OpenCLSolveTest OpenCLSolveTest.cpp)
+endif()

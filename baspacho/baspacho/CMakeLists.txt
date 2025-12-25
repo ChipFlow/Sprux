@@ -47,6 +47,12 @@ if(BASPACHO_USE_METAL)
          MatOpsMetal.mm)
 endif()
 
+if(BASPACHO_USE_OPENCL)
+    list(APPEND BaSpaCho_sources
+         OpenCLDefs.cpp
+         MatOpsOpenCL.cpp)
+endif()
+
 add_library(${BASPACHO_LIBRARY}  ${BaSpaCho_sources})
 set_property(TARGET ${BASPACHO_LIBRARY} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -112,6 +118,20 @@ if(BASPACHO_USE_METAL)
     # Define path to compiled metallib for runtime loading
     target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE
         BASPACHO_METAL_LIBRARY_PATH="${METAL_SHADER_LIB}")
+endif()
+
+if(BASPACHO_USE_OPENCL)
+    # Link OpenCL and CLBlast
+    target_link_libraries(${BASPACHO_LIBRARY}
+                          ${OpenCL_LIBRARIES}
+                          ${CLBlast_LIBRARIES})
+    target_include_directories(${BASPACHO_LIBRARY} PRIVATE
+                               ${CLBlast_INCLUDE_DIRS})
+
+    # Embed OpenCL kernel source for runtime compilation
+    set(OPENCL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLKernels.cl")
+    target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE
+        BASPACHO_OPENCL_KERNEL_PATH="${OPENCL_KERNEL_SOURCE}")
 endif()
 
 target_compile_options(${BASPACHO_LIBRARY} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BASPACHO_CXX_FLAGS}>)

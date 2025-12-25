@@ -82,7 +82,7 @@ pixi run build_and_test # Full workflow
 - `factor()`: Cholesky factorization
 - `solve()`, `solveL()`, `solveLt()`: triangular solves
 - `factorUpTo()`, `solveLUpTo()`: partial factorization for marginals
-- Backends: `BackendRef`, `BackendFast`, `BackendCuda`, `BackendMetal`
+- Backends: `BackendRef`, `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`
 
 ### Directory Structure
 
@@ -99,6 +99,7 @@ baspacho/
 
 - `BASPACHO_USE_CUBLAS`: Enable CUDA support (default: ON)
 - `BASPACHO_USE_METAL`: Enable Apple Metal support (default: OFF, macOS only, float only)
+- `BASPACHO_USE_OPENCL`: Enable OpenCL support with CLBlast (default: OFF, experimental)
 - `BASPACHO_USE_BLAS`: Enable BLAS support (default: ON)
 - `BASPACHO_CUDA_ARCHS`: CUDA architectures ("detect", "torch", or explicit list like "60;70;75")
 - `BASPACHO_USE_SUITESPARSE_AMD`: Use SuiteSparse AMD instead of Eigen's implementation
@@ -131,6 +132,25 @@ For double precision, use `BackendFast` (CPU with BLAS) or `BackendCuda` (NVIDIA
 ### CUDA Backend (NVIDIA)
 
 The CUDA backend supports both float and double precision on NVIDIA GPUs with compute capability >= 6.0.
+
+### OpenCL Backend (Experimental)
+
+The OpenCL backend provides portable GPU acceleration using CLBlast for BLAS operations.
+
+**Status:** Experimental. Currently uses CPU fallbacks for most operations. The infrastructure is in place but full GPU kernel execution is not yet implemented.
+
+**Requirements:**
+- OpenCL 1.2+ runtime
+- CLBlast library
+
+```cpp
+// OpenCL backend usage
+Settings settings;
+settings.backend = BackendOpenCL;
+auto solver = createSolver<float>(paramSize, structure, settings);
+```
+
+For production use, prefer CUDA (NVIDIA) or Metal (Apple Silicon) backends.
 
 ## Dependencies
 
