@@ -594,13 +594,16 @@ void Solver::resetStats() {
 }
 
 BackendType detectBestBackend() {
-  // Priority: CUDA > Metal > Fast (CPU)
+  // Priority: CUDA > Metal > OpenCL > Fast (CPU)
 #ifdef BASPACHO_USE_CUBLAS
   // TODO: Could add runtime CUDA device detection here
   return BackendCuda;
 #elif defined(BASPACHO_USE_METAL)
   // Metal is available on macOS with Apple Silicon
   return BackendMetal;
+#elif defined(BASPACHO_USE_OPENCL)
+  // OpenCL is a portable fallback
+  return BackendOpenCL;
 #else
   return BackendFast;
 #endif
@@ -628,6 +631,13 @@ OpsPtr getBackend(const Settings& settings) {
     return metalOps();
 #else
     std::cerr << "Baspacho: Metal not enabled at compile time" << std::endl;
+    abort();
+#endif
+  } else if (backend == BackendOpenCL) {
+#ifdef BASPACHO_USE_OPENCL
+    return openclOps();
+#else
+    std::cerr << "Baspacho: OpenCL not enabled at compile time" << std::endl;
     abort();
 #endif
   }

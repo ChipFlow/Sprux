@@ -52,6 +52,7 @@ Libraries fetched automatical by build:
 Optional libraries:
 * CUDA toolkit (tested with CUDA 10.2/11.7), for NVIDIA GPU support. Disable with `-DBASPACHO_USE_CUBLAS=0`.
 * Metal (macOS only), for Apple Silicon GPU support. Enable with `-DBASPACHO_USE_METAL=1`.
+* OpenCL + CLBlast, for portable GPU support. Enable with `-DBASPACHO_USE_OPENCL=1`. (Experimental)
 * AMD, from SuiteSparse, can be used instead of Eigen for block reordering algorithm.
 * CHOLMOD, from SuiteSparse, used in benchmark as a reference for performance of sparse solvers.
 
@@ -116,9 +117,24 @@ settings.backend = BackendAuto;  // Auto-detect best backend
 auto solver = createSolver<float>(paramSize, structure, settings);
 ```
 
-The detection priority is: CUDA > Metal > CPU (BLAS).
+The detection priority is: CUDA > Metal > OpenCL > CPU (BLAS).
 
 You can also use `detectBestBackend()` to query the recommended backend at runtime.
+
+### OpenCL (Experimental)
+OpenCL support provides a portable GPU backend using CLBlast for BLAS operations.
+To enable:
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_OPENCL=1
+```
+
+**Requirements:**
+- OpenCL 1.2+ runtime and development headers
+- [CLBlast](https://github.com/CNugteren/CLBlast) library
+
+**Note:** The OpenCL backend is experimental. It provides infrastructure for portable GPU
+acceleration but currently uses CPU fallbacks for most operations. For production use,
+prefer CUDA (NVIDIA) or Metal (Apple Silicon) backends.
 
 ### BLAS
 The library used is specified in the CMake variable BLA_VENDOR,
