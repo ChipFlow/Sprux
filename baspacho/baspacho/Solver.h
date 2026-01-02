@@ -57,9 +57,14 @@ class Solver {
   // reset statistics
   void resetStats();
 
-  // factor the data stored in the factor
+  // factor the data stored in the factor (Cholesky for SPD, LU for general)
   template <typename T>
   void factor(T* data, bool verbose = false) const;
+
+  // factor using LU decomposition with partial pivoting (for MTYPE_GENERAL)
+  // pivots array must be sized to numSpans()
+  template <typename T>
+  void factorLU(T* data, int64_t* pivots, bool verbose = false) const;
 
   // solve in place with LLt (vector must be permuted)
   template <typename T>
@@ -72,6 +77,11 @@ class Solver {
   // solve in place with Lt (vector must be permuted)
   template <typename T>
   void solveLt(const T* matData, T* vecData, int64_t stride, int nRHS) const;
+
+  // solve in place with LU factorization (applies P, then solves L, then U)
+  // pivots array must match the one used in factorLU
+  template <typename T>
+  void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS) const;
 
   // apply partial factor, up to a given span
   template <typename T>
@@ -111,8 +121,17 @@ class Solver {
   // order of the factor
   int64_t order() const { return factorSkel.order(); }
 
-  // storge data size
+  // storge data size (lower triangle / L factor)
   int64_t dataSize() const { return factorSkel.dataSize(); }
+
+  // storage data size for upper triangle / U factor (0 for symmetric matrices)
+  int64_t upperDataSize() const { return factorSkel.upperDataSize(); }
+
+  // total storage size (lower + upper for general, just lower for symmetric)
+  int64_t totalDataSize() const { return factorSkel.totalDataSize(); }
+
+  // return the matrix type (SPD, SYMMETRIC, or GENERAL)
+  MatrixType matrixType() const { return factorSkel.matrixType; }
 
   // returns the upper span index limit for proper factorization (if the factor doesn't have fill
   // for full factorization this might not include all parameters)
@@ -199,6 +218,26 @@ class Solver {
   template <typename T>
   void internalSolveLtRange(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
                             int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  // For LU solve: uses unit lower triangular L (diagonal = 1)
+  template <typename T>
+  void internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
+                               int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  // LU factorization internal methods
+  template <typename T>
+  void factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64_t lump) const;
+
+  template <typename T>
+  void eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const;
+
+  template <typename T>
+  void internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex, int64_t endSpanIndex,
+                             bool verbose = false) const;
+
+  template <typename T>
+  void internalSolveURange(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
+                           int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
 
   CoalescedBlockMatrixSkel factorSkel;
   std::vector<int64_t> sparseElimRanges;

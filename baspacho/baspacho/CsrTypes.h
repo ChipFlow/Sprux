@@ -88,15 +88,25 @@ inline const char* matrixViewToString(MatrixView mview) {
  * Throws std::invalid_argument if unsupported.
  */
 inline void validateMatrixTypeView(MatrixType mtype, MatrixView mview) {
-  // BaSpaCho only supports SPD matrices currently
-  if (mtype != MTYPE_SPD) {
-    throw std::invalid_argument(std::string("BaSpaCho only supports MTYPE_SPD matrices, got ") +
-                                matrixTypeToString(mtype));
-  }
+  switch (mtype) {
+    case MTYPE_SPD:
+      // For SPD, FULL view is redundant (symmetric), we accept but will use lower
+      // LOWER and UPPER are both acceptable
+      (void)mview;
+      break;
 
-  // For SPD, FULL view is redundant (symmetric), we accept but will use lower
-  // LOWER and UPPER are both acceptable
-  (void)mview;  // Currently all views are acceptable for SPD
+    case MTYPE_GENERAL:
+      // General matrices require full storage (both L and U)
+      if (mview != MVIEW_FULL) {
+        throw std::invalid_argument(
+            std::string("MTYPE_GENERAL requires MVIEW_FULL, got ") + matrixViewToString(mview));
+      }
+      break;
+
+    case MTYPE_SYMMETRIC:
+      // LDL^T for symmetric indefinite - not yet implemented
+      throw std::invalid_argument("MTYPE_SYMMETRIC (LDL^T) not yet implemented");
+  }
 }
 
 }  // namespace BaSpaCho

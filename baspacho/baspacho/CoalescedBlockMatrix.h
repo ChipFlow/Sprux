@@ -12,6 +12,7 @@
 #include <limits>
 #include <vector>
 #include "baspacho/baspacho/Accessor.h"
+#include "baspacho/baspacho/CsrTypes.h"
 
 namespace BaSpaCho {
 
@@ -84,6 +85,10 @@ struct CoalescedBlockMatrixSkel {
     CoalescedAccessor retv;
     retv.init(spanStart.data(), spanToLump.data(), lumpStart.data(), spanOffsetInLump.data(),
               chainColPtr.data(), chainRowSpan.data(), chainData.data());
+    // Initialize upper triangle pointers if available (for LU factorization)
+    if (!upperChainRowPtr.empty()) {
+      retv.initUpper(upperChainRowPtr.data(), upperChainColSpan.data(), upperChainData.data());
+    }
     return retv;
   }
 
@@ -108,6 +113,29 @@ struct CoalescedBlockMatrixSkel {
   std::vector<int64_t> boardRowPtr;   // board row data start (with end)
   std::vector<int64_t> boardColLump;  // board's col lump
   std::vector<int64_t> boardColOrd;   // board order in col
+
+  // ============ LU factorization support (MTYPE_GENERAL) ============
+  // For general (non-symmetric) matrices, we need upper triangle storage.
+  // Upper triangle uses CSR-like structure (row-ordered, column indices).
+
+  MatrixType matrixType = MTYPE_SPD;  // Factorization type
+
+  // Upper triangle chain data (for U factor in LU), row-ordered
+  // Only populated when matrixType == MTYPE_GENERAL
+  std::vector<int64_t> upperChainRowPtr;   // row pointers (CSR-style, with end)
+  std::vector<int64_t> upperChainColSpan;  // column span indices
+  std::vector<int64_t> upperChainData;     // numeric data offsets
+
+  // Returns true if this skeleton supports general (non-symmetric) matrices
+  bool isGeneral() const { return matrixType == MTYPE_GENERAL; }
+
+  // Storage size for upper triangle data (0 for symmetric matrices)
+  int64_t upperDataSize() const {
+    return upperChainData.empty() ? 0 : upperChainData.back();
+  }
+
+  // Total data size (lower + upper for general, just lower for symmetric)
+  int64_t totalDataSize() const { return dataSize() + upperDataSize(); }
 };
 
 }  // end namespace BaSpaCho

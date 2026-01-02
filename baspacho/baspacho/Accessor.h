@@ -104,6 +104,60 @@ struct CoalescedAccessor {
   const int64_t* chainColPtr;
   const int64_t* chainRowSpan;
   const int64_t* chainData;
+
+  // ============ LU factorization support ============
+  // Upper triangle data (CSR-style, row-ordered)
+  const int64_t* upperChainRowPtr = nullptr;
+  const int64_t* upperChainColSpan = nullptr;
+  const int64_t* upperChainData = nullptr;
+
+  // Initialize upper triangle pointers (for MTYPE_GENERAL)
+  void initUpper(const int64_t* upperChainRowPtr_, const int64_t* upperChainColSpan_,
+                 const int64_t* upperChainData_) {
+    upperChainRowPtr = upperChainRowPtr_;
+    upperChainColSpan = upperChainColSpan_;
+    upperChainData = upperChainData_;
+  }
+
+  // Check if upper triangle is available
+  __BASPACHO_HOST_DEVICE__
+  bool hasUpper() const { return upperChainRowPtr != nullptr; }
+
+  // return: pair (offset, stride) to identify UPPER block in numeric factor data
+  // For upper triangle: rowBlockIndex < colBlockIndex
+  __BASPACHO_HOST_DEVICE__
+  std::pair<int64_t, int64_t> upperBlockOffset(int64_t rowBlockIndex, int64_t colBlockIndex) const {
+    BASPACHO_CHECK_LT(rowBlockIndex, colBlockIndex);
+    BASPACHO_CHECK(hasUpper());
+    int64_t lump = spanToLump[rowBlockIndex];
+    int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
+    int64_t offsetInLump = spanOffsetInLump[rowBlockIndex];
+    int64_t start = upperChainRowPtr[lump];
+    int64_t end = upperChainRowPtr[lump + 1];
+    // bisect to find `colBlockIndex` in upperChainColSpan[start:end]
+    int64_t pos = bisect(upperChainColSpan + start, end - start, colBlockIndex);
+    BASPACHO_CHECK_EQ(upperChainColSpan[start + pos], colBlockIndex);
+    return std::make_pair(upperChainData[start + pos] + offsetInLump, lumpSize);
+  }
+
+  // return: upper block reference, from factor data pointer
+  template <int rowSize = Eigen::Dynamic, int64_t colSize = Eigen::Dynamic, typename T>
+  __BASPACHO_HOST_DEVICE__ auto upperBlock(T* data, int64_t rowBlockIndex,
+                                            int64_t colBlockIndex) const {
+    using namespace Eigen;
+    auto offsetStride = upperBlockOffset(rowBlockIndex, colBlockIndex);
+    auto offset = std::get<0>(offsetStride);
+    auto stride = std::get<1>(offsetStride);
+    if (rowSize != Dynamic) {
+      BASPACHO_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
+    }
+    if (colSize != Dynamic) {
+      BASPACHO_CHECK_EQ(colSize, paramSize(colBlockIndex));
+    }
+    return Map<Matrix<T, rowSize, colSize, RowMajor>, 0, OuterStride<>>(
+        data + offset, rowSize != Dynamic ? rowSize : paramSize(rowBlockIndex),
+        colSize != Dynamic ? colSize : paramSize(colBlockIndex), OuterStride<>(stride));
+  }
 };
 
 // allows to retrieve a block in a coalesced-block matrix through a permutation

@@ -89,6 +89,11 @@ struct SymbolicCtx {
   mutable int64_t syrkCalls = 0;
   mutable OpStat<int, int, int> asmblStat;
 
+  // LU factorization stats
+  mutable OpStat<int, int> getrfStat;
+  mutable int64_t getrfBiggestN = 0;
+  mutable int64_t luGemmCalls = 0;
+
   mutable OpStat<> solveSparseLStat;
   mutable OpStat<> solveSparseLtStat;
   mutable OpStat<> pseudoFactorStat;
@@ -133,6 +138,79 @@ struct NumericCtx : NumericCtxBase {
 
   virtual void assemble(T* data, int64_t rectRowBegin, int64_t dstStride, int64_t srcColDataOffset,
                         int64_t srcRectWidth, int64_t numBlockRows, int64_t numBlockCols) = 0;
+
+  // ============ LU factorization methods ============
+  // These have default implementations that throw for backends not yet supporting LU.
+
+  // LU factorization with partial pivoting on dense row-major matrix A (in place)
+  // pivots must be sized to min(m,n), returns info (0 = success)
+  virtual int getrf(int64_t m, int64_t n, T* data, int64_t offA, int64_t* pivots) {
+    (void)m;
+    (void)n;
+    (void)data;
+    (void)offA;
+    (void)pivots;
+    throw std::runtime_error("getrf: LU factorization not supported by this backend");
+  }
+
+  // solve: L * X = B where L is lower triangular with unit diagonal (in place, B becomes X)
+  // Used for: solving for U row (right of diagonal block)
+  virtual void trsmLowerUnit(int64_t m, int64_t n, const T* L, int64_t offL, T* B, int64_t offB,
+                             int64_t ldb) {
+    (void)m;
+    (void)n;
+    (void)L;
+    (void)offL;
+    (void)B;
+    (void)offB;
+    (void)ldb;
+    throw std::runtime_error("trsmLowerUnit: LU not supported by this backend");
+  }
+
+  // solve: X * U = B where U is upper triangular (in place, B becomes X)
+  // Used for: solving for L column (below diagonal block)
+  virtual void trsmUpperRight(int64_t m, int64_t n, const T* U, int64_t offU, T* B, int64_t offB,
+                              int64_t ldb) {
+    (void)m;
+    (void)n;
+    (void)U;
+    (void)offU;
+    (void)B;
+    (void)offB;
+    (void)ldb;
+    throw std::runtime_error("trsmUpperRight: LU not supported by this backend");
+  }
+
+  // C -= L * U, general matrix multiply for LU elimination
+  // L is m x k, U is k x n, C is m x n
+  virtual void saveGemm(int64_t m, int64_t n, int64_t k, const T* L, int64_t offL, int64_t ldL,
+                        const T* U, int64_t offU, int64_t ldU, T* C, int64_t offC, int64_t ldC) {
+    (void)m;
+    (void)n;
+    (void)k;
+    (void)L;
+    (void)offL;
+    (void)ldL;
+    (void)U;
+    (void)offU;
+    (void)ldU;
+    (void)C;
+    (void)offC;
+    (void)ldC;
+    throw std::runtime_error("saveGemm: LU not supported by this backend");
+  }
+
+  // Apply row permutation from pivots array to a portion of the matrix
+  virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
+                            int64_t numCols) {
+    (void)pivots;
+    (void)n;
+    (void)data;
+    (void)offData;
+    (void)ld;
+    (void)numCols;
+    throw std::runtime_error("applyRowPerm: LU not supported by this backend");
+  }
 };
 
 // methods (and possibly context) for solve operations
@@ -151,6 +229,19 @@ struct SolveCtx : SolveCtxBase {
 
   virtual void solveL(const T* data, int64_t offset, int64_t n, T* C, int64_t offC,
                       int64_t ldc) = 0;
+
+  // Solve L * x = b where L is unit lower triangular (diagonal = 1) (in place)
+  // This is for LU solve where L from getrf has implicit unit diagonal
+  virtual void solveLUnit(const T* data, int64_t offset, int64_t n, T* C, int64_t offC,
+                          int64_t ldc) {
+    (void)data;
+    (void)offset;
+    (void)n;
+    (void)C;
+    (void)offC;
+    (void)ldc;
+    throw std::runtime_error("solveLUnit: LU not supported by this backend");
+  }
 
   virtual void gemv(const T* data, int64_t offset, int64_t nRows, int64_t nCols, const T* A,
                     int64_t offA, int64_t lda, BaseType<T> alpha) = 0;
@@ -180,6 +271,38 @@ struct SolveCtx : SolveCtxBase {
   virtual void fragmentedSolveLt(const T* /*data*/, int64_t /*spanBegin*/, int64_t /*spanEnd*/,
                                  T* /*y*/) {
     throw std::runtime_error("fragmentedSolveLt: not supported");
+  }
+
+  // ============ LU solve methods ============
+  // These have default implementations that throw for backends not yet supporting LU.
+
+  // Solve U * x = b where U is upper triangular (in place)
+  virtual void solveU(const T* data, int64_t offset, int64_t n, T* C, int64_t offC, int64_t ldc) {
+    (void)data;
+    (void)offset;
+    (void)n;
+    (void)C;
+    (void)offC;
+    (void)ldc;
+    throw std::runtime_error("solveU: LU not supported by this backend");
+  }
+
+  // Apply row permutation P to vector: y = P * x (for LU solve, applies pivots)
+  virtual void applyRowPermVec(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) {
+    (void)pivots;
+    (void)n;
+    (void)vec;
+    (void)ldVec;
+    throw std::runtime_error("applyRowPermVec: LU not supported by this backend");
+  }
+
+  // Apply inverse row permutation P^T to vector: y = P^T * x (for LU solve, reverse pivots)
+  virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) {
+    (void)pivots;
+    (void)n;
+    (void)vec;
+    (void)ldVec;
+    throw std::runtime_error("applyRowPermVecInv: LU not supported by this backend");
   }
 };
 

@@ -154,6 +154,18 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
 
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const T* data,
                             int64_t offset) override;
+
+  // LU factorization methods
+  virtual int getrf(int64_t m, int64_t n, T* data, int64_t offA, int64_t* pivots) override;
+
+  virtual void trsmLowerUnit(int64_t m, int64_t n, const T* L, int64_t offL, T* B, int64_t offB,
+                             int64_t ldb) override;
+
+  virtual void trsmUpperRight(int64_t m, int64_t n, const T* U, int64_t offU, T* B, int64_t offB,
+                              int64_t ldb) override;
+
+  virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
+                            int64_t numCols) override;
 #endif  // BASPACHO_USE_BLAS
 
   virtual void prepareAssemble(int64_t targetLump) override {
@@ -359,6 +371,97 @@ void BlasNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
     sym.gemmCalls++;
   }
 }
+
+// ============ LU Factorization BLAS implementations ============
+
+template <>
+int BlasNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
+                                  int64_t* pivots) {
+  auto timer = sym.getrfStat.instance(sizeof(double), m);
+  sym.getrfBiggestN = std::max(sym.getrfBiggestN, m);
+
+  // Convert int64_t pivots to LAPACK int format
+  std::vector<BLAS_INT> ipiv(std::min(m, n));
+  int info = LAPACKE_dgetrf(LAPACK_COL_MAJOR, m, n, data + offA, m, ipiv.data());
+
+  // Copy pivots back (convert from 1-based to 0-based)
+  for (int64_t i = 0; i < std::min(m, n); i++) {
+    pivots[i] = ipiv[i] - 1;  // LAPACK is 1-based
+  }
+  return info;
+}
+
+template <>
+int BlasNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
+                                 int64_t* pivots) {
+  auto timer = sym.getrfStat.instance(sizeof(float), m);
+  sym.getrfBiggestN = std::max(sym.getrfBiggestN, m);
+
+  // Convert int64_t pivots to LAPACK int format
+  std::vector<BLAS_INT> ipiv(std::min(m, n));
+  int info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, m, n, data + offA, m, ipiv.data());
+
+  // Copy pivots back (convert from 1-based to 0-based)
+  for (int64_t i = 0; i < std::min(m, n); i++) {
+    pivots[i] = ipiv[i] - 1;  // LAPACK is 1-based
+  }
+  return info;
+}
+
+template <>
+void BlasNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L, int64_t offL,
+                                           double* B, int64_t offB, int64_t ldb) {
+  // Solve L * X = B where L is unit lower triangular
+  // B is m x n, stored column-major with stride ldb
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, m, n, 1.0, L + offL, m,
+              B + offB, ldb);
+}
+
+template <>
+void BlasNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL,
+                                          float* B, int64_t offB, int64_t ldb) {
+  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, m, n, 1.0, L + offL, m,
+              B + offB, ldb);
+}
+
+template <>
+void BlasNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
+                                            double* B, int64_t offB, int64_t ldb) {
+  // Solve X * U = B where U is upper triangular
+  // B is m x n, stored column-major with stride ldb
+  cblas_dtrsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasNonUnit, m, n, 1.0,
+              U + offU, n, B + offB, ldb);
+}
+
+template <>
+void BlasNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
+                                           float* B, int64_t offB, int64_t ldb) {
+  cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasNonUnit, m, n, 1.0,
+              U + offU, n, B + offB, ldb);
+}
+
+template <typename T>
+void BlasNumericCtx<T>::applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData,
+                                     int64_t ld, int64_t numCols) {
+  // Apply row permutation to a portion of the matrix
+  // pivots[i] indicates row i should be swapped with row pivots[i]
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      // Swap rows i and swapRow for all columns
+      for (int64_t c = 0; c < numCols; c++) {
+        std::swap(data[offData + i + c * ld], data[offData + swapRow + c * ld]);
+      }
+    }
+  }
+}
+
+// Explicit template instantiation
+template void BlasNumericCtx<double>::applyRowPerm(int64_t*, int64_t, double*, int64_t, int64_t,
+                                                   int64_t);
+template void BlasNumericCtx<float>::applyRowPerm(int64_t*, int64_t, float*, int64_t, int64_t,
+                                                  int64_t);
+
 #endif  // BASPACHO_USE_BLAS
 
 using OuterStride = Eigen::OuterStride<>;
@@ -539,6 +642,9 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
   virtual void solveL(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
                       int64_t ldc) override;
 
+  virtual void solveLUnit(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                          int64_t ldc) override;
+
   virtual void gemv(const T* data, int64_t offM, int64_t nRows, int64_t nCols, const T* A,
                     int64_t offA, int64_t lda, T alpha) override;
 #endif  // BASPACHO_USE_BLAS
@@ -578,6 +684,14 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
 
   virtual void gemvT(const T* data, int64_t offM, int64_t nRows, int64_t nCols, T* A, int64_t offA,
                      int64_t lda, T alpha) override;
+
+  // LU solve methods
+  virtual void solveU(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                      int64_t ldc) override;
+
+  virtual void applyRowPermVec(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) override;
+
+  virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) override;
 #endif
 
   static inline void stridedTransSet(T* dst, int64_t dstStride, const T* src, int64_t srcStride,
@@ -1056,6 +1170,24 @@ void BlasSolveCtx<float>::solveL(const float* data, int64_t offM, int64_t n, flo
               data + offM, n, C + offC, ldc);
 }
 
+// solveLUnit: solve with unit lower triangular L (for LU factorization)
+// Solves L * X = B where L is unit lower triangular (L from getrf)
+template <>
+void BlasSolveCtx<double>::solveLUnit(const double* data, int64_t offM, int64_t n, double* C,
+                                      int64_t offC, int64_t ldc) {
+  auto timer = sym.solveLStat.instance();
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, n, nRHS, 1.0,
+              data + offM, n, C + offC, ldc);
+}
+
+template <>
+void BlasSolveCtx<float>::solveLUnit(const float* data, int64_t offM, int64_t n, float* C,
+                                     int64_t offC, int64_t ldc) {
+  auto timer = sym.solveLStat.instance();
+  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, n, nRHS, 1.0,
+              data + offM, n, C + offC, ldc);
+}
+
 template <>
 void BlasSolveCtx<double>::gemv(const double* data, int64_t offM, int64_t nRows, int64_t nCols,
                                 const double* A, int64_t offA, int64_t lda, double alpha) {
@@ -1103,6 +1235,62 @@ void BlasSolveCtx<float>::gemvT(const float* data, int64_t offM, int64_t nRows, 
   cblas_sgemm(CblasColMajor, CblasNoTrans, CblasConjTrans, nCols, nRHS, nRows, alpha, data + offM,
               nCols, tmpBuf.data(), nRHS, 1.0, A + offA, lda);
 }
+
+// ============ LU Solve BLAS implementations ============
+
+template <>
+void BlasSolveCtx<double>::solveU(const double* data, int64_t offM, int64_t n, double* C,
+                                  int64_t offC, int64_t ldc) {
+  // Solve U * x = b where U is upper triangular (from LU factorization)
+  // The diagonal block contains both L and U from LU decomposition
+  // U is the upper triangular part (including diagonal)
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit, n, nRHS, 1.0,
+              data + offM, n, C + offC, ldc);
+}
+
+template <>
+void BlasSolveCtx<float>::solveU(const float* data, int64_t offM, int64_t n, float* C,
+                                 int64_t offC, int64_t ldc) {
+  cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit, n, nRHS, 1.0,
+              data + offM, n, C + offC, ldc);
+}
+
+template <typename T>
+void BlasSolveCtx<T>::applyRowPermVec(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) {
+  // Apply row permutation P to vector: y = P * x
+  // For each i, swap row i with row pivots[i]
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      // Swap elements for all RHS
+      for (int rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+}
+
+template <typename T>
+void BlasSolveCtx<T>::applyRowPermVecInv(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) {
+  // Apply inverse row permutation P^T to vector: y = P^T * x
+  // Reverse order from applyRowPermVec
+  for (int64_t i = n - 1; i >= 0; i--) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      // Swap elements for all RHS
+      for (int rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+}
+
+// Explicit template instantiations for LU solve methods
+template void BlasSolveCtx<double>::applyRowPermVec(const int64_t*, int64_t, double*, int64_t);
+template void BlasSolveCtx<float>::applyRowPermVec(const int64_t*, int64_t, float*, int64_t);
+template void BlasSolveCtx<double>::applyRowPermVecInv(const int64_t*, int64_t, double*, int64_t);
+template void BlasSolveCtx<float>::applyRowPermVecInv(const int64_t*, int64_t, float*, int64_t);
+
 #endif  // BASPACHO_USE_BLAS
 
 NumericCtxBase* BlasSymbolicCtx::createNumericCtxForType(std::type_index tIdx, int64_t tempBufSize,

@@ -53,6 +53,12 @@ void ssyrk_(const char* uplo, const char* transa, const BLAS_INT* n, const BLAS_
 void ssymm_(const char* uplo, const char* transa, const BLAS_INT* m, const BLAS_INT* n,
             const float* alpha, const float* A, const BLAS_INT* lda, const float* B,
             const BLAS_INT* ldb, const float* beta, float* C, const BLAS_INT* ldc);
+
+// LU factorization (getrf)
+void dgetrf_(const BLAS_INT* m, const BLAS_INT* n, double* A, const BLAS_INT* lda, BLAS_INT* ipiv,
+             BLAS_INT* info);
+void sgetrf_(const BLAS_INT* m, const BLAS_INT* n, float* A, const BLAS_INT* lda, BLAS_INT* ipiv,
+             BLAS_INT* info);
 }
 
 #define CBLAS_LAYOUT int
@@ -65,10 +71,13 @@ void ssymm_(const char* uplo, const char* transa, const BLAS_INT* m, const BLAS_
 // #define CblasRowMajor ... (not supported)
 
 #define CblasLeft 'L'
+#define CblasRight 'R'
 #define CblasUpper 'U'
+#define CblasLower 'L'
 #define CblasConjTrans 'C'
 #define CblasNoTrans 'N'
 #define CblasNonUnit 'N'
+#define CblasUnit 'U'
 
 #define LAPACK_COL_MAJOR 0
 // #define LAPACK_ROW_MAJOR ... (not supported)
@@ -142,6 +151,21 @@ inline void cblas_ssymm(const CBLAS_LAYOUT /* Layout */, const CBLAS_SIDE side,
 BLAS_INT LAPACKE_spotrf(int /* matrix_layout */, char uplo, BLAS_INT n, float* a, BLAS_INT lda) {
   BLAS_INT info;
   spotrf_(&uplo, &n, a, &lda, &info);
+  return info;
+}
+
+// LU factorization wrappers
+inline BLAS_INT LAPACKE_dgetrf(int /* matrix_layout */, BLAS_INT m, BLAS_INT n, double* a,
+                               BLAS_INT lda, BLAS_INT* ipiv) {
+  BLAS_INT info;
+  dgetrf_(&m, &n, a, &lda, ipiv, &info);
+  return info;
+}
+
+inline BLAS_INT LAPACKE_sgetrf(int /* matrix_layout */, BLAS_INT m, BLAS_INT n, float* a,
+                               BLAS_INT lda, BLAS_INT* ipiv) {
+  BLAS_INT info;
+  sgetrf_(&m, &n, a, &lda, ipiv, &info);
   return info;
 }
 
