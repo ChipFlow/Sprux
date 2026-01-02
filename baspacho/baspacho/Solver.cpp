@@ -478,21 +478,39 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
   int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
   int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
                              factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
-  if (numRowsBelowDiag == 0) {
-    return;
+
+  // Process L column below diagonal (if any rows below)
+  if (numRowsBelowDiag > 0) {
+    // Apply row permutation to column below diagonal
+    numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, belowDiagOffset, lumpSize,
+                        numRowsBelowDiag);
+
+    // Solve for L column below diagonal: L_below * U_diag = A_below
+    // => solve: X * U = B where U is upper triangular part of diagonal block
+    numCtx.trsmUpperRight(numRowsBelowDiag, lumpSize, data, diagBlockOffset, data, belowDiagOffset,
+                          lumpSize);
   }
 
-  // Apply row permutation to column below diagonal
-  numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, belowDiagOffset, lumpSize,
-                      numRowsBelowDiag);
+  // Process U row to the right of diagonal (if upper triangle storage exists)
+  if (factorSkel.isGeneral()) {
+    int64_t upperRowStart = factorSkel.upperChainRowPtr[lump];
+    int64_t upperRowEnd = factorSkel.upperChainRowPtr[lump + 1];
+    int64_t upperDataBase = factorSkel.dataSize();  // Upper data starts after lower data
 
-  // Solve for L column below diagonal: L_below * U_diag = A_below
-  // => solve: X * U = B where U is upper triangular part of diagonal block
-  numCtx.trsmUpperRight(numRowsBelowDiag, lumpSize, data, diagBlockOffset, data, belowDiagOffset,
-                        lumpSize);
+    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+      int64_t colSpan = factorSkel.upperChainColSpan[i];
+      int64_t colSize = factorSkel.spanStart[colSpan + 1] - factorSkel.spanStart[colSpan];
+      int64_t upperBlockOffset = upperDataBase + factorSkel.upperChainData[i];
 
-  // For U row (right of diagonal), we would need upper triangle storage
-  // This is handled separately when upper triangle is populated
+      // Apply row permutation to upper block (pivots are within lumpSize rows)
+      numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, upperBlockOffset, colSize, 1);
+
+      // Solve L * U_block = A_block for U_block
+      // L is unit lower triangular from diagonal block
+      numCtx.trsmLowerUnit(lumpSize, colSize, data, diagBlockOffset, data, upperBlockOffset,
+                           colSize);
+    }
+  }
 }
 
 template <typename T>
@@ -515,23 +533,82 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
   int64_t numRowsSub = factorSkel.chainRowsTillEnd[chainColBegin + rowDataEnd0 - 1] - rectRowBegin;
   int64_t numRowsFull = factorSkel.chainRowsTillEnd[chainColBegin + rowDataEnd1 - 1] - rectRowBegin;
 
-  // For LU: C -= L * U (general gemm instead of syrk)
-  // L is the lower triangular part, U is the upper triangular part
-  // For now, use the same pattern as syrk but with gemm semantics
-  // The L column is at belowDiagStart, U row would need upper storage
-  // Simplified: using same call as Cholesky for now (lower triangle update)
-  numCtx.saveSyrkGemm(numRowsSub, numRowsFull, origLumpSize, data, belowDiagStart);
-
   int64_t targetLump = factorSkel.boardRowLump[boardColBegin + boardIndexInCol];
   int64_t targetLumpSize = factorSkel.lumpStart[targetLump + 1] - factorSkel.lumpStart[targetLump];
   int64_t srcColDataOffset = chainColBegin + belowDiagChainColOrd;
   int64_t numBlockRows = rowDataEnd1 - belowDiagChainColOrd;
   int64_t numBlockCols = rowDataEnd0 - belowDiagChainColOrd;
 
-  numCtx.assemble(data, rectRowBegin,
-                  targetLumpSize,    //
-                  srcColDataOffset,  //
-                  numRowsSub, numBlockRows, numBlockCols);
+  // For LU factorization with upper triangle storage, use L*U directly
+  if (factorSkel.isGeneral()) {
+    // Get upper triangle data base offset
+    int64_t upperDataBase = factorSkel.dataSize();
+
+    // For each pair of (L row span, U col span), compute C -= L * U
+    // L blocks are in the lower triangle at chainData offsets
+    // U blocks are in the upper triangle at upperChainData offsets
+
+    // Iterate over L row spans (chains in lower triangle)
+    for (int64_t lChainOrd = belowDiagChainColOrd; lChainOrd < rowDataEnd1; lChainOrd++) {
+      int64_t lRowSpan = factorSkel.chainRowSpan[chainColBegin + lChainOrd];
+      int64_t lRowStart = factorSkel.spanStart[lRowSpan];
+      int64_t lRowSize = factorSkel.spanStart[lRowSpan + 1] - lRowStart;
+      int64_t lDataOffset = factorSkel.chainData[chainColBegin + lChainOrd];
+
+      // Iterate over U col spans (blocks in upper triangle row for origLump)
+      int64_t upperRowStart = factorSkel.upperChainRowPtr[origLump];
+      int64_t upperRowEnd = factorSkel.upperChainRowPtr[origLump + 1];
+
+      for (int64_t uIdx = upperRowStart; uIdx < upperRowEnd; uIdx++) {
+        int64_t uColSpan = factorSkel.upperChainColSpan[uIdx];
+        int64_t uColStart = factorSkel.spanStart[uColSpan];
+        int64_t uColSize = factorSkel.spanStart[uColSpan + 1] - uColStart;
+        int64_t uDataOffset = upperDataBase + factorSkel.upperChainData[uIdx];
+
+        // Only update lower triangle: lRowSpan >= uColSpan (row >= col)
+        // For the target block, find its location in the lower triangle
+        if (lRowSpan >= uColSpan) {
+          // Find target block offset in lower triangle
+          // Target is at (lRowSpan row, uColSpan col) in the matrix
+          // This is in the chain column of lump containing uColSpan
+          int64_t targetColLump = factorSkel.spanToLump[uColSpan];
+          int64_t targetChainColBegin = factorSkel.chainColPtr[targetColLump];
+          int64_t targetChainColEnd = factorSkel.chainColPtr[targetColLump + 1];
+
+          // Find the chain with lRowSpan
+          int64_t targetDataOffset = -1;
+          int64_t targetLumpSize2 =
+              factorSkel.lumpStart[targetColLump + 1] - factorSkel.lumpStart[targetColLump];
+          for (int64_t tc = targetChainColBegin; tc < targetChainColEnd; tc++) {
+            if (factorSkel.chainRowSpan[tc] == lRowSpan) {
+              targetDataOffset = factorSkel.chainData[tc];
+              // Add column offset within the lump
+              int64_t colOffsetInLump = factorSkel.spanOffsetInLump[uColSpan];
+              targetDataOffset += colOffsetInLump;
+              break;
+            }
+          }
+
+          if (targetDataOffset >= 0) {
+            // C -= L * U
+            // L is lRowSize x origLumpSize at lDataOffset (row-major, ld=origLumpSize)
+            // U is origLumpSize x uColSize at uDataOffset (row-major, ld=uColSize)
+            // C is lRowSize x uColSize at targetDataOffset (row-major, ld=targetLumpSize2)
+            numCtx.saveGemm(lRowSize, uColSize, origLumpSize, data, lDataOffset, origLumpSize, data,
+                            uDataOffset, uColSize, data, targetDataOffset, targetLumpSize2);
+          }
+        }
+      }
+    }
+  } else {
+    // Fall back to symmetric (Cholesky-style) elimination for non-general matrices
+    numCtx.saveSyrkGemm(numRowsSub, numRowsFull, origLumpSize, data, belowDiagStart);
+
+    numCtx.assemble(data, rectRowBegin,
+                    targetLumpSize,    //
+                    srcColDataOffset,  //
+                    numRowsSub, numBlockRows, numBlockCols);
+  }
 }
 
 template <typename T>
@@ -588,8 +665,13 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
                      int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
+  // With transpose workaround in getrf, we have P * A = L * U (standard form).
+  // The solve for A*x = b is:
+  //   1. Apply P: y = P * b
+  //   2. Solve L * z = y (forward substitution)
+  //   3. Solve U * x = z (backward substitution)
+
   // Step 1: Apply row permutation P: y = P * b
-  // For each lump, apply the local pivot permutation
   for (int64_t l = 0; l < factorSkel.numLumps(); l++) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
@@ -651,6 +733,7 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
 template <typename T>
 void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                  int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const {
+  (void)nRHS;  // Used implicitly in slvCtx
   BASPACHO_CHECK_GE(startSpanIndex, 0);
   BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
   BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
@@ -659,6 +742,9 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
+  // Upper triangle data base offset (after lower triangle data)
+  int64_t upperDataBase = factorSkel.dataSize();
+
   // Backward substitution with U (from last lump to first)
   for (int64_t l = upToLump - 1; l >= startLump; l--) {
     int64_t lumpStart = factorSkel.lumpStart[l];
@@ -666,11 +752,26 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
     int64_t chainColBegin = factorSkel.chainColPtr[l];
     int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
 
-    // Solve U * x_l = z_l for diagonal block
-    slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+    // For off-diagonal U entries, subtract contributions: y(l) -= U_{l,k} * x(k) for k > l
+    if (factorSkel.isGeneral()) {
+      int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
+      int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
 
-    // For off-diagonal U entries, we would need upper triangle storage
-    // Simplified for now: only handle diagonal blocks
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = factorSkel.upperChainColSpan[i];
+        int64_t colStart = factorSkel.spanStart[colSpan];
+        int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+
+        // y(l) -= U_{l,k} * x(k)
+        // U block has shape (lumpSize x colSize), stored row-major
+        slvCtx.gemvDirect(matData, upperDataOffset, lumpSize, colSize, vecData, colStart, lumpStart,
+                          stride, -1.0);
+      }
+    }
+
+    // Solve U * x_l = y_l for diagonal block
+    slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
   }
 }
 

@@ -232,6 +232,26 @@ if(BASPACHO_BUILD_EXAMPLES)
     add_compile_definitions(BASPACHO_HAVE_CHOLMOD)
     include_directories(${CHOLMOD_INCLUDE_DIR})
   endif()
+
+  # UMFPACK (for LU benchmarking comparison)
+  message("${Cyan}============================[ UMFPACK ]=================================${ColourReset}")
+  find_path(UMFPACK_INCLUDE_DIR NAMES umfpack.h
+    PATHS ${INCLUDE_INSTALL_DIR}
+    PATH_SUFFIXES suitesparse ufsparse)
+  find_library(UMFPACK_LIBRARIES umfpack
+    PATHS ${LIB_INSTALL_DIR})
+
+  if((UMFPACK_INCLUDE_DIR STREQUAL "UMFPACK_INCLUDE_DIR-NOTFOUND")
+    OR(UMFPACK_LIBRARIES STREQUAL "UMFPACK_LIBRARIES-NOTFOUND"))
+    set(HAVE_UMFPACK 0)
+    message("* UMFPACK not found! LU benchmarking comparison will not be available")
+  else()
+    set(HAVE_UMFPACK 1)
+    message("* UMFPACK Source = " ${UMFPACK_INCLUDE_DIR})
+    message("* UMFPACK Libraries = " ${UMFPACK_LIBRARIES})
+    add_compile_definitions(BASPACHO_HAVE_UMFPACK)
+    include_directories(${UMFPACK_INCLUDE_DIR})
+  endif()
 endif()
 
 # use fetchcontent to download dependencies

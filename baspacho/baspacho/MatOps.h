@@ -304,6 +304,24 @@ struct SolveCtx : SolveCtxBase {
     (void)ldVec;
     throw std::runtime_error("applyRowPermVecInv: LU not supported by this backend");
   }
+
+  // Direct gemv for U backward solve: result += alpha * M * x
+  // M is row-major matrix of shape (nRows x nCols) at data+offset
+  // x is at vec+srcOff with length nCols
+  // result is updated at vec+dstOff with length nRows
+  virtual void gemvDirect(const T* data, int64_t offset, int64_t nRows, int64_t nCols, T* vec,
+                          int64_t srcOff, int64_t dstOff, int64_t ldVec, BaseType<T> alpha) {
+    (void)data;
+    (void)offset;
+    (void)nRows;
+    (void)nCols;
+    (void)vec;
+    (void)srcOff;
+    (void)dstOff;
+    (void)ldVec;
+    (void)alpha;
+    throw std::runtime_error("gemvDirect: LU not supported by this backend");
+  }
 };
 
 // introspection shortcuts

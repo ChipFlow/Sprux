@@ -129,6 +129,12 @@ struct CoalescedBlockMatrixSkel {
   // Returns true if this skeleton supports general (non-symmetric) matrices
   bool isGeneral() const { return matrixType == MTYPE_GENERAL; }
 
+  // Initialize upper triangle storage for LU factorization.
+  // Must be called before factorLU() for multi-block matrices.
+  // This derives the upper triangle pattern from the lower triangle
+  // (assumes symmetric sparsity pattern).
+  void initUpperTriangle();
+
   // Storage size for upper triangle data (0 for symmetric matrices)
   int64_t upperDataSize() const {
     return upperChainData.empty() ? 0 : upperChainData.back();

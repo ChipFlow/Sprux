@@ -56,23 +56,22 @@ void testLUFactorSimple(OpsPtr&& ops) {
   SparseStructure groupedSs = ss;
   CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
 
-  // Create a non-symmetric test matrix (data stored in row-major within the block)
-  // But BaSpaCho uses column-major internally for BLAS
+  // Create a non-symmetric test matrix
+  // BaSpaCho stores dense blocks in ROW-MAJOR format
   vector<T> data(factorSkel.dataSize());
   int64_t n = 4;
 
   // Fill with a non-symmetric matrix that has a well-conditioned LU decomposition
-  // Using column-major storage (how BaSpaCho stores dense blocks)
   Matrix<T> testMat(n, n);
   testMat << 4, 1, 2, 1,   //
       1, 5, 1, 2,          //
       2, 1, 6, 1,          //
       1, 2, 1, 7;
 
-  // Copy to data buffer (column-major)
-  for (int64_t col = 0; col < n; col++) {
-    for (int64_t row = 0; row < n; row++) {
-      data[row + col * n] = testMat(row, col);
+  // Copy to data buffer (row-major - how BaSpaCho stores blocks)
+  for (int64_t row = 0; row < n; row++) {
+    for (int64_t col = 0; col < n; col++) {
+      data[row * n + col] = testMat(row, col);
     }
   }
 
@@ -88,12 +87,12 @@ void testLUFactorSimple(OpsPtr&& ops) {
   // Perform LU factorization
   solver.factorLU(data.data(), pivots.data());
 
-  // Extract L and U from the factored data
+  // Extract L and U from the factored data (row-major storage)
   // After getrf, L is below diagonal with unit diagonal, U is upper triangular
   Matrix<T> factored(n, n);
-  for (int64_t col = 0; col < n; col++) {
-    for (int64_t row = 0; row < n; row++) {
-      factored(row, col) = data[row + col * n];
+  for (int64_t row = 0; row < n; row++) {
+    for (int64_t col = 0; col < n; col++) {
+      factored(row, col) = data[row * n + col];
     }
   }
 
@@ -146,10 +145,10 @@ void testLUSolveSimple(OpsPtr&& ops) {
       2, 1, 6, 1,   //
       1, 2, 1, 7;
 
-  // Copy to data buffer (column-major)
-  for (int64_t col = 0; col < n; col++) {
-    for (int64_t row = 0; row < n; row++) {
-      data[row + col * n] = A(row, col);
+  // Copy to data buffer (row-major - how BaSpaCho stores blocks)
+  for (int64_t row = 0; row < n; row++) {
+    for (int64_t col = 0; col < n; col++) {
+      data[row * n + col] = A(row, col);
     }
   }
 
@@ -196,14 +195,16 @@ void testLUFactorBlockSparse(const std::function<OpsPtr()>& genOps) {
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
   CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
 
-  int64_t order = factorSkel.order();
-  vector<T> data(factorSkel.dataSize());
+  // Initialize upper triangle storage for LU factorization
+  factorSkel.initUpperTriangle();
 
-  // Create a non-symmetric SPD-like matrix (diagonally dominant for stability)
-  // and fill the data buffer
+  int64_t order = factorSkel.order();
+
+  // Create a well-conditioned symmetric matrix for testing
+  // Using symmetric data simplifies verification (L and U are related by transpose)
   Matrix<T> fullMat = Matrix<T>::Zero(order, order);
 
-  // Fill diagonal blocks with well-conditioned values
+  // Fill diagonal blocks with diagonally dominant values
   fullMat.block(0, 0, 3, 3) << 10, 1, 2,  //
       1, 11, 1,                            //
       2, 1, 12;
@@ -211,25 +212,67 @@ void testLUFactorBlockSparse(const std::function<OpsPtr()>& genOps) {
   fullMat.block(3, 3, 2, 2) << 8, 1,  //
       1, 9;
 
-  // Fill off-diagonal block (lower left)
+  // Fill off-diagonal block (lower left) - symmetric data
   fullMat.block(3, 0, 2, 3) << 1, 2, 1,  //
       2, 1, 2;
 
-  // Fill upper right for non-symmetric
-  fullMat.block(0, 3, 3, 2) << 2, 1,  //
-      1, 2,                            //
-      1, 1;
+  // Fill upper right as transpose of lower left (symmetric matrix)
+  fullMat.block(0, 3, 3, 2) = fullMat.block(3, 0, 2, 3).transpose();
 
-  // Densify expects column-major, and we need to map it to BaSpaCho's storage
-  // For now, just damp the existing data to ensure positive definiteness
-  iota(data.begin(), data.end(), 13);
-  factorSkel.damp(data, T(5), T(50));
+  // Allocate data for both lower and upper triangles
+  vector<T> data(factorSkel.totalDataSize());
 
-  // Get the dense matrix from BaSpaCho storage for verification
-  Matrix<T> verifyMat = factorSkel.densify(data, true);  // Fill upper half for symmetry
+  // Fill lower triangle data from fullMat
+  // Lower triangle has: diagonal blocks (with LU in-place) and below-diagonal blocks
+  auto acc = factorSkel.accessor();
+  int64_t numLumps = factorSkel.numLumps();
+
+  for (int64_t l = 0; l < numLumps; l++) {
+    int64_t chainStart = factorSkel.chainColPtr[l];
+    int64_t chainEnd = factorSkel.chainColPtr[l + 1];
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+
+    for (int64_t c = chainStart; c < chainEnd; c++) {
+      int64_t rowSpan = factorSkel.chainRowSpan[c];
+      int64_t rowStart = factorSkel.spanStart[rowSpan];
+      int64_t rowSize = factorSkel.spanStart[rowSpan + 1] - rowStart;
+      int64_t dataOffset = factorSkel.chainData[c];
+
+      // Copy from fullMat to data buffer (row-major storage)
+      for (int64_t r = 0; r < rowSize; r++) {
+        for (int64_t col = 0; col < lumpSize; col++) {
+          data[dataOffset + r * lumpSize + col] = fullMat(rowStart + r, lumpStart + col);
+        }
+      }
+    }
+  }
+
+  // Fill upper triangle data from fullMat (transpose of lower off-diagonal blocks)
+  int64_t upperDataBase = factorSkel.dataSize();
+  for (int64_t l = 0; l < numLumps; l++) {
+    int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
+    int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+
+    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+      int64_t colSpan = factorSkel.upperChainColSpan[i];
+      int64_t colStart = factorSkel.spanStart[colSpan];
+      int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
+      int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+
+      // Copy from fullMat to upper data buffer (row-major: lumpSize rows x colSize cols)
+      for (int64_t r = 0; r < lumpSize; r++) {
+        for (int64_t c = 0; c < colSize; c++) {
+          data[upperDataOffset + r * colSize + c] = fullMat(lumpStart + r, colStart + c);
+        }
+      }
+    }
+  }
 
   // Compute reference LU decomposition
-  Eigen::PartialPivLU<Matrix<T>> eigenLU(verifyMat);
+  Eigen::PartialPivLU<Matrix<T>> eigenLU(fullMat);
 
   // Create solver and perform LU factorization
   Solver solver(std::move(factorSkel), {}, {}, genOps());
@@ -248,23 +291,166 @@ void testLUFactorBlockSparse(const std::function<OpsPtr()>& genOps) {
   solver.solveLU(data.data(), pivots.data(), x.data(), order, 1);
 
   // Check residual: ||A*x - b|| should be small
-  T residual = (verifyMat * x - b).norm();
-  T residualRef = (verifyMat * xRef - b).norm();
+  T residual = (fullMat * x - b).norm();
+  T residualRef = (fullMat * xRef - b).norm();
 
   // Both residuals should be small (close to machine precision * condition number)
   ASSERT_NEAR(residual, 0, Epsilon<T>::value2 * 1000)
       << "Block-sparse LU solve residual too large";
-  ASSERT_LT(residual, residualRef * 100)
+  // Compare to Eigen's residual (with minimum threshold to handle Eigen getting exact 0)
+  T residualThreshold = std::max(residualRef * 100, Epsilon<T>::value2);
+  ASSERT_LT(residual, residualThreshold)
       << "Block-sparse LU residual much larger than Eigen's";
 }
 
-// NOTE: Multi-block LU factorization is not fully implemented yet.
-// The upper triangle (U off-diagonal) storage and solve updates are missing.
-// These tests are disabled until multi-block support is added.
-TEST(LUFactor, DISABLED_BlockSparse_Blas_double) {
+TEST(LUFactor, BlockSparse_Blas_double) {
   testLUFactorBlockSparse<double>([] { return fastOps(); });
 }
 
-TEST(LUFactor, DISABLED_BlockSparse_Blas_float) {
+// Debug test to verify block-sparse LU step by step (disabled by default)
+TEST(LUFactor, DISABLED_DebugBlockSparse) {
+  // Create a simple 2-block structure: Block 0: 3x3, Block 1: 2x2
+  vector<set<int64_t>> colBlocks{{0, 1}, {1}};
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose().addFullEliminationFill();
+  vector<int64_t> spanStart{0, 3, 5};
+  vector<int64_t> lumpToSpan{0, 1, 2};
+  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
+  CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
+  factorSkel.initUpperTriangle();
+
+  // Create test matrix
+  Matrix<double> fullMat = Matrix<double>::Zero(5, 5);
+  fullMat.block(0, 0, 3, 3) << 10, 1, 2, 1, 11, 1, 2, 1, 12;
+  fullMat.block(3, 3, 2, 2) << 8, 1, 1, 9;
+  fullMat.block(3, 0, 2, 3) << 1, 2, 1, 2, 1, 2;
+  fullMat.block(0, 3, 3, 2) = fullMat.block(3, 0, 2, 3).transpose();
+
+  std::cout << "Original matrix:\n" << fullMat << "\n\n";
+
+  // Compute reference LU
+  Eigen::PartialPivLU<Matrix<double>> eigenLU(fullMat);
+  std::cout << "Eigen P:\n" << eigenLU.permutationP().toDenseMatrix() << "\n\n";
+  Matrix<double> L = Matrix<double>::Identity(5, 5);
+  L.template triangularView<Eigen::StrictlyLower>() =
+      eigenLU.matrixLU().template triangularView<Eigen::StrictlyLower>();
+  std::cout << "Eigen L:\n" << L << "\n\n";
+  Matrix<double> U = eigenLU.matrixLU().template triangularView<Eigen::Upper>();
+  std::cout << "Eigen U:\n" << U << "\n\n";
+
+  // Create solver and factor
+  vector<double> data(factorSkel.totalDataSize());
+  // Fill data from fullMat (same as test)
+  for (int64_t l = 0; l < factorSkel.numLumps(); l++) {
+    int64_t chainStart = factorSkel.chainColPtr[l];
+    int64_t chainEnd = factorSkel.chainColPtr[l + 1];
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    for (int64_t c = chainStart; c < chainEnd; c++) {
+      int64_t rowSpan = factorSkel.chainRowSpan[c];
+      int64_t rowStart = factorSkel.spanStart[rowSpan];
+      int64_t rowSize = factorSkel.spanStart[rowSpan + 1] - rowStart;
+      int64_t dataOffset = factorSkel.chainData[c];
+      for (int64_t r = 0; r < rowSize; r++) {
+        for (int64_t col = 0; col < lumpSize; col++) {
+          data[dataOffset + r * lumpSize + col] = fullMat(rowStart + r, lumpStart + col);
+        }
+      }
+    }
+  }
+  // Fill upper triangle
+  int64_t upperDataBase = factorSkel.dataSize();
+  for (int64_t l = 0; l < factorSkel.numLumps(); l++) {
+    int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
+    int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
+    int64_t lumpStartIdx = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStartIdx;
+    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+      int64_t colSpan = factorSkel.upperChainColSpan[i];
+      int64_t colStart = factorSkel.spanStart[colSpan];
+      int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
+      int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+      for (int64_t r = 0; r < lumpSize; r++) {
+        for (int64_t c = 0; c < colSize; c++) {
+          data[upperDataOffset + r * colSize + c] = fullMat(lumpStartIdx + r, colStart + c);
+        }
+      }
+    }
+  }
+
+  Solver solver(std::move(factorSkel), {}, {}, fastOps());
+  vector<int64_t> pivots(solver.skel().order());
+  solver.factorLU(data.data(), pivots.data());
+
+  std::cout << "BaSpaCho pivots: ";
+  for (auto p : pivots) std::cout << p << " ";
+  std::cout << "\n\n";
+
+  // Print the factored data manually
+  const auto& skel = solver.skel();
+  std::cout << "Lower triangle data (size=" << skel.dataSize() << "):\n";
+  for (int64_t i = 0; i < skel.dataSize(); i++) {
+    std::cout << data[i] << " ";
+    if ((i + 1) % 6 == 0) std::cout << "\n";
+  }
+  std::cout << "\n\nUpper triangle data (size=" << skel.upperDataSize() << "):\n";
+  for (int64_t i = skel.dataSize(); i < skel.totalDataSize(); i++) {
+    std::cout << data[i] << " ";
+  }
+  std::cout << "\n\n";
+
+  // Reconstruct L and U from BaSpaCho format for debugging
+  // Block 0 (3x3 diagonal): rows 0-2, data offset 0
+  std::cout << "Block 0 diagonal (3x3 row-major at offset 0):\n";
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      std::cout << data[r * 3 + c] << " ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "\n";
+
+  // Block L10 (2x3): rows 3-4, cols 0-2, data offset 9
+  std::cout << "Block L10 (2x3 row-major at offset 9):\n";
+  for (int r = 0; r < 2; r++) {
+    for (int c = 0; c < 3; c++) {
+      std::cout << data[9 + r * 3 + c] << " ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "\n";
+
+  // Block 1 (2x2 diagonal): rows 3-4, data offset 15
+  std::cout << "Block 1 diagonal (2x2 row-major at offset 15):\n";
+  for (int r = 0; r < 2; r++) {
+    for (int c = 0; c < 2; c++) {
+      std::cout << data[15 + r * 2 + c] << " ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "\n";
+
+  // Block U01 (3x2): rows 0-2, cols 3-4, upper triangle offset 0
+  std::cout << "Block U01 (3x2 row-major at upper offset 0):\n";
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 2; c++) {
+      std::cout << data[skel.dataSize() + r * 2 + c] << " ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "\n";
+
+  // Solve and check
+  Vector<double> b = Vector<double>::Ones(5);
+  Vector<double> xRef = eigenLU.solve(b);
+  Vector<double> x = b;
+  solver.solveLU(data.data(), pivots.data(), x.data(), 5, 1);
+
+  std::cout << "Eigen solution: " << xRef.transpose() << "\n";
+  std::cout << "BaSpaCho solution: " << x.transpose() << "\n";
+  std::cout << "Residual (Eigen): " << (fullMat * xRef - b).norm() << "\n";
+  std::cout << "Residual (BaSpaCho): " << (fullMat * x - b).norm() << "\n";
+}
+
+TEST(LUFactor, BlockSparse_Blas_float) {
   testLUFactorBlockSparse<float>([] { return fastOps(); });
 }

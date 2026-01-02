@@ -12,6 +12,11 @@ if(HAVE_CHOLMOD)
          BenchCholmod.cpp)
 endif()
 
+if(HAVE_UMFPACK)
+    list(APPEND bench_sources
+         BenchUmfpack.cpp)
+endif()
+
 add_executable(BAL_bench ${BAL_bench_sources})
 target_link_libraries (BAL_bench ${BASPACHO_LIBRARY} testing BAL_utils)
 
@@ -24,4 +29,8 @@ target_link_libraries (bench ${BASPACHO_LIBRARY} testing)
 if(HAVE_CHOLMOD)
   target_link_libraries (BAL_bench ${CHOLMOD_LIBRARIES})
   target_link_libraries (bench ${CHOLMOD_LIBRARIES})
+endif()
+
+if(HAVE_UMFPACK)
+  target_link_libraries (bench ${UMFPACK_LIBRARIES})
 endif()

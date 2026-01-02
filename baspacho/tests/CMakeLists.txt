@@ -11,6 +11,11 @@ add_baspacho_test(MathUtilsTest MathUtilsTest.cpp)
 add_baspacho_test(PartialFactorSolveTest PartialFactorSolveTest.cpp)
 add_baspacho_test(LUFactorTest LUFactorTest.cpp)
 
+if(HAVE_UMFPACK)
+add_baspacho_test(LUComparisonTest LUComparisonTest.cpp)
+target_link_libraries(LUComparisonTest ${UMFPACK_LIBRARIES})
+endif()
+
 if(BASPACHO_USE_CUBLAS)
 add_baspacho_test(CudaFactorTest CudaFactorTest.cpp)
 add_baspacho_test(CudaSolveTest CudaSolveTest.cpp)

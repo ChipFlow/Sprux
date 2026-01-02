@@ -166,6 +166,10 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
 
   virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
                             int64_t numCols) override;
+
+  virtual void saveGemm(int64_t m, int64_t n, int64_t k, const T* L, int64_t offL, int64_t ldL,
+                        const T* U, int64_t offU, int64_t ldU, T* C, int64_t offC,
+                        int64_t ldC) override;
 #endif  // BASPACHO_USE_BLAS
 
   virtual void prepareAssemble(int64_t targetLump) override {
@@ -374,15 +378,41 @@ void BlasNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
 
 // ============ LU Factorization BLAS implementations ============
 
+// Helper to transpose a square matrix in-place
+template <typename T>
+static void transposeSquareInPlace(T* data, int64_t n) {
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t j = i + 1; j < n; j++) {
+      std::swap(data[i * n + j], data[j * n + i]);
+    }
+  }
+}
+
+// LAPACK getrf with workaround for row-major storage:
+// BaSpaCho stores blocks row-major, but LAPACKE only supports COL_MAJOR for getrf.
+// When LAPACK interprets row-major data as col-major, it sees A^T instead of A.
+// To get correct P * A = L * U with L in lower and U in upper (row-major view),
+// we transpose A before getrf (so LAPACK sees A), then transpose back after.
+// This gives us L*U stored in standard row-major positions.
+
 template <>
 int BlasNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                   int64_t* pivots) {
   auto timer = sym.getrfStat.instance(sizeof(double), m);
   sym.getrfBiggestN = std::max(sym.getrfBiggestN, m);
 
-  // Convert int64_t pivots to LAPACK int format
+  // Transpose before: row-major A → col-major view sees A (not A^T)
+  if (m == n) {
+    transposeSquareInPlace(data + offA, n);
+  }
+
   std::vector<BLAS_INT> ipiv(std::min(m, n));
   int info = LAPACKE_dgetrf(LAPACK_COL_MAJOR, m, n, data + offA, m, ipiv.data());
+
+  // Transpose after: col-major L+U → row-major L+U
+  if (m == n) {
+    transposeSquareInPlace(data + offA, n);
+  }
 
   // Copy pivots back (convert from 1-based to 0-based)
   for (int64_t i = 0; i < std::min(m, n); i++) {
@@ -397,9 +427,18 @@ int BlasNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
   auto timer = sym.getrfStat.instance(sizeof(float), m);
   sym.getrfBiggestN = std::max(sym.getrfBiggestN, m);
 
-  // Convert int64_t pivots to LAPACK int format
+  // Transpose before: row-major A → col-major view sees A (not A^T)
+  if (m == n) {
+    transposeSquareInPlace(data + offA, n);
+  }
+
   std::vector<BLAS_INT> ipiv(std::min(m, n));
   int info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, m, n, data + offA, m, ipiv.data());
+
+  // Transpose after: col-major L+U → row-major L+U
+  if (m == n) {
+    transposeSquareInPlace(data + offA, n);
+  }
 
   // Copy pivots back (convert from 1-based to 0-based)
   for (int64_t i = 0; i < std::min(m, n); i++) {
@@ -411,33 +450,44 @@ int BlasNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
 template <>
 void BlasNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L, int64_t offL,
                                            double* B, int64_t offB, int64_t ldb) {
-  // Solve L * X = B where L is unit lower triangular
-  // B is m x n, stored column-major with stride ldb
-  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, m, n, 1.0, L + offL, m,
+  // Solve L * X = B where L is m x m unit lower triangular, X and B are m x n
+  // Both L and B are stored ROW-MAJOR.
+  // Row-major L_row(m x m) lower = Col-major L_col^T(m x m) upper (same data)
+  // Row-major B_row(m x n) = Col-major B_col^T(n x m) (same data, transposed dims)
+  // The equation L_row * X_row = B_row becomes X_col * L_col = B_col after transpose
+  // So: solve X * U = B with CblasRight, where U is upper unit (L^T)
+  // BLAS params: M=n (rows of B_col), N=m (cols of B_col), lda=m, ldb=n
+  cblas_dtrsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit, n, m, 1.0, L + offL, m,
               B + offB, ldb);
 }
 
 template <>
 void BlasNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL,
                                           float* B, int64_t offB, int64_t ldb) {
-  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, m, n, 1.0, L + offL, m,
+  // Same as above for float
+  cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit, n, m, 1.0, L + offL, m,
               B + offB, ldb);
 }
 
 template <>
 void BlasNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
                                             double* B, int64_t offB, int64_t ldb) {
-  // Solve X * U = B where U is upper triangular
-  // B is m x n, stored column-major with stride ldb
-  cblas_dtrsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasNonUnit, m, n, 1.0,
-              U + offU, n, B + offB, ldb);
+  // Solve X * U = B where U is n x n upper triangular (ROW-MAJOR storage)
+  // X and B are m x n, also stored ROW-MAJOR with row stride ldb
+  // For row-major: X * U = B becomes (in col-major view) U^T * X^T = B^T
+  // U^T is lower triangular, X^T and B^T have swapped dimensions
+  // So solve with CblasLeft, CblasLower: L(n,n) * X_col(n,m) = B_col(n,m)
+  (void)ldb;  // Row stride in row-major = n for tightly packed storage
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit, n, m, 1.0, U + offU,
+              n, B + offB, n);
 }
 
 template <>
 void BlasNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
                                            float* B, int64_t offB, int64_t ldb) {
-  cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasNonUnit, m, n, 1.0,
-              U + offU, n, B + offB, ldb);
+  (void)ldb;
+  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit, n, m, 1.0, U + offU,
+              n, B + offB, n);
 }
 
 template <typename T>
@@ -461,6 +511,34 @@ template void BlasNumericCtx<double>::applyRowPerm(int64_t*, int64_t, double*, i
                                                    int64_t);
 template void BlasNumericCtx<float>::applyRowPerm(int64_t*, int64_t, float*, int64_t, int64_t,
                                                   int64_t);
+
+template <>
+void BlasNumericCtx<double>::saveGemm(int64_t m, int64_t n, int64_t k, const double* L, int64_t offL,
+                                      int64_t ldL, const double* U, int64_t offU, int64_t ldU,
+                                      double* C, int64_t offC, int64_t ldC) {
+  // C -= L * U
+  // L is m x k row-major with ld=ldL
+  // U is k x n row-major with ld=ldU
+  // C is m x n row-major with ld=ldC
+  // For row-major C -= L * U, in column-major: C^T -= U^T * L^T
+  // So: call gemm with A=U^T (n,k), B=L^T (k,m), C=C^T (n,m)
+  // But our row-major data viewed as col-major is already transposed:
+  // L_row(m,k) = L_col^T, U_row(k,n) = U_col^T, C_row(m,n) = C_col^T
+  // So L_col is (k,m), U_col is (n,k), C_col is (n,m)
+  // C_col -= U_col * L_col = (n,k) * (k,m) = (n,m)
+  cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, n, m, k, -1.0, U + offU, ldU, L + offL, ldL,
+              1.0, C + offC, ldC);
+  sym.luGemmCalls++;
+}
+
+template <>
+void BlasNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const float* L, int64_t offL,
+                                     int64_t ldL, const float* U, int64_t offU, int64_t ldU,
+                                     float* C, int64_t offC, int64_t ldC) {
+  cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, n, m, k, -1.0, U + offU, ldU, L + offL, ldL,
+              1.0, C + offC, ldC);
+  sym.luGemmCalls++;
+}
 
 #endif  // BASPACHO_USE_BLAS
 
@@ -692,6 +770,9 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
   virtual void applyRowPermVec(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) override;
 
   virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) override;
+
+  virtual void gemvDirect(const T* data, int64_t offset, int64_t nRows, int64_t nCols, T* vec,
+                          int64_t srcOff, int64_t dstOff, int64_t ldVec, T alpha) override;
 #endif
 
   static inline void stridedTransSet(T* dst, int64_t dstStride, const T* src, int64_t srcStride,
@@ -1170,13 +1251,15 @@ void BlasSolveCtx<float>::solveL(const float* data, int64_t offM, int64_t n, flo
               data + offM, n, C + offC, ldc);
 }
 
-// solveLUnit: solve with unit lower triangular L (for LU factorization)
-// Solves L * X = B where L is unit lower triangular (L from getrf)
+// solveLUnit: solve L * X = B where L is unit lower triangular (for LU factorization)
+// After getrf with transpose workaround, L is stored in row-major lower.
+// For row-major L, BLAS with CblasColMajor sees it in upper triangle.
 template <>
 void BlasSolveCtx<double>::solveLUnit(const double* data, int64_t offM, int64_t n, double* C,
                                       int64_t offC, int64_t ldc) {
   auto timer = sym.solveLStat.instance();
-  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, n, nRHS, 1.0,
+  // Row-major lower L is seen as col-major upper L^T, so use CblasUpper with CblasConjTrans
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasUnit, n, nRHS, 1.0,
               data + offM, n, C + offC, ldc);
 }
 
@@ -1184,7 +1267,7 @@ template <>
 void BlasSolveCtx<float>::solveLUnit(const float* data, int64_t offM, int64_t n, float* C,
                                      int64_t offC, int64_t ldc) {
   auto timer = sym.solveLStat.instance();
-  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasUnit, n, nRHS, 1.0,
+  cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasUnit, n, nRHS, 1.0,
               data + offM, n, C + offC, ldc);
 }
 
@@ -1238,20 +1321,21 @@ void BlasSolveCtx<float>::gemvT(const float* data, int64_t offM, int64_t nRows, 
 
 // ============ LU Solve BLAS implementations ============
 
+// solveU: solve U * X = B where U is upper triangular (for LU factorization)
+// After getrf with transpose workaround, U is stored in row-major upper.
+// For row-major U, BLAS with CblasColMajor sees it in lower triangle.
 template <>
 void BlasSolveCtx<double>::solveU(const double* data, int64_t offM, int64_t n, double* C,
                                   int64_t offC, int64_t ldc) {
-  // Solve U * x = b where U is upper triangular (from LU factorization)
-  // The diagonal block contains both L and U from LU decomposition
-  // U is the upper triangular part (including diagonal)
-  cblas_dtrsm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit, n, nRHS, 1.0,
+  // Row-major upper U is seen as col-major lower U^T, so use CblasLower with CblasConjTrans
+  cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasConjTrans, CblasNonUnit, n, nRHS, 1.0,
               data + offM, n, C + offC, ldc);
 }
 
 template <>
 void BlasSolveCtx<float>::solveU(const float* data, int64_t offM, int64_t n, float* C,
                                  int64_t offC, int64_t ldc) {
-  cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasNoTrans, CblasNonUnit, n, nRHS, 1.0,
+  cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasConjTrans, CblasNonUnit, n, nRHS, 1.0,
               data + offM, n, C + offC, ldc);
 }
 
@@ -1283,6 +1367,29 @@ void BlasSolveCtx<T>::applyRowPermVecInv(const int64_t* pivots, int64_t n, T* ve
       }
     }
   }
+}
+
+// Direct gemv for U backward solve: result += alpha * M * x
+// M is row-major matrix of shape (nRows x nCols) at data+offset
+// x is at vec+srcOff, result is updated at vec+dstOff
+template <>
+void BlasSolveCtx<double>::gemvDirect(const double* data, int64_t offset, int64_t nRows,
+                                       int64_t nCols, double* vec, int64_t srcOff, int64_t dstOff,
+                                       int64_t ldVec, double alpha) {
+  // For row-major M(nRows x nCols), we want y += alpha * M * x
+  // Row-major M(nRows x nCols) stored as Col-major M_col^T where M_col has shape (nCols x nRows)
+  // y(nRows x nRHS) += alpha * M_col^T(nRows x nCols) * x(nCols x nRHS)
+  // Use gemm with m=nRows, n=nRHS, k=nCols
+  cblas_dgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, nRows, nRHS, nCols, alpha,
+              data + offset, nCols, vec + srcOff, ldVec, 1.0, vec + dstOff, ldVec);
+}
+
+template <>
+void BlasSolveCtx<float>::gemvDirect(const float* data, int64_t offset, int64_t nRows,
+                                      int64_t nCols, float* vec, int64_t srcOff, int64_t dstOff,
+                                      int64_t ldVec, float alpha) {
+  cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, nRows, nRHS, nCols, alpha,
+              data + offset, nCols, vec + srcOff, ldVec, 1.0, vec + dstOff, ldVec);
 }
 
 // Explicit template instantiations for LU solve methods
