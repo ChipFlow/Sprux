@@ -1,0 +1,106 @@
+# Doxyfile for BaSpaCho documentation
+
+#---------------------------------------------------------------------------
+# Project related configuration
+#---------------------------------------------------------------------------
+
+PROJECT_NAME           = "BaSpaCho"
+PROJECT_BRIEF          = "Batched Sparse Cholesky Decomposition"
+PROJECT_NUMBER         =
+OUTPUT_DIRECTORY       =
+CREATE_SUBDIRS         = NO
+
+#---------------------------------------------------------------------------
+# Build related configuration
+#---------------------------------------------------------------------------
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+
+#---------------------------------------------------------------------------
+# Input configuration
+#---------------------------------------------------------------------------
+
+INPUT                  = ../baspacho/baspacho \
+                         ../README.md \
+                         ../CLAUDE.md
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.h *.hpp *.cpp *.md
+RECURSIVE              = NO
+EXCLUDE                =
+EXCLUDE_PATTERNS       = *Test* *test*
+
+USE_MDFILE_AS_MAINPAGE = ../README.md
+
+#---------------------------------------------------------------------------
+# Source browsing
+#---------------------------------------------------------------------------
+
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = YES
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+#---------------------------------------------------------------------------
+# Output configuration
+#---------------------------------------------------------------------------
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_FILE_EXTENSION    = .html
+HTML_COLORSTYLE        = LIGHT
+HTML_DYNAMIC_SECTIONS  = YES
+HTML_INDEX_NUM_ENTRIES = 100
+
+GENERATE_TREEVIEW      = YES
+TREEVIEW_WIDTH         = 250
+
+GENERATE_LATEX         = NO
+GENERATE_RTF           = NO
+GENERATE_MAN           = NO
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Preprocessor
+#---------------------------------------------------------------------------
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+INCLUDE_PATH           = ../baspacho/baspacho
+
+#---------------------------------------------------------------------------
+# Diagrams
+#---------------------------------------------------------------------------
+
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = YES
+HIDE_UNDOC_RELATIONS   = YES
+
+#---------------------------------------------------------------------------
+# Warnings
+#---------------------------------------------------------------------------
+
+QUIET                  = NO
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+WARN_FORMAT            = "$file:$line: $text"
+
+#---------------------------------------------------------------------------
+# Alphabetical index
+#---------------------------------------------------------------------------
+
+ALPHABETICAL_INDEX     = YES
+
+#---------------------------------------------------------------------------
+# Search engine
+#---------------------------------------------------------------------------
+
+SEARCHENGINE           = YES
+SERVER_BASED_SEARCH    = NO
