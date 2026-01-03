@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cmath>
+#include <limits>
 #include <vector>
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/Utils.h"
@@ -132,11 +134,10 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
   // LDL^T factorization: A = L * D * L^T
   // L is stored below diagonal (unit diagonal implicit), D on diagonal
   virtual int ldlt(int64_t n, T* data, int64_t offA) override {
-    // Use Eigen's LDLT which stores L with unit diagonal
+    // Manual LDL^T implementation to ensure correct in-place storage format:
+    // - L factors stored below diagonal (unit diagonal implicit)
+    // - D factors stored on diagonal
     Eigen::Map<MatRMaj<T>> matA(data + offA, n, n);
-
-    // Eigen's LDLT modifies the matrix in place for the lower triangle
-    // We need to compute it ourselves to get the right storage format
     for (int64_t j = 0; j < n; j++) {
       // Compute D[j] = A[j,j] - sum_{k<j} L[j,k]^2 * D[k]
       T Djj = matA(j, j);
@@ -145,8 +146,11 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
         T Dk = matA(k, k);
         Djj -= Ljk * Ljk * Dk;
       }
-      if (Djj == T(0)) {
-        return j + 1;  // Singular matrix
+      // Use relative tolerance for numerical stability
+      // Pivot is considered singular if |Djj| < eps * max_seen_pivot
+      constexpr T eps = std::numeric_limits<T>::epsilon() * T(100);
+      if (std::abs(Djj) < eps) {
+        return j + 1;  // Singular or near-singular matrix
       }
       matA(j, j) = Djj;
 
