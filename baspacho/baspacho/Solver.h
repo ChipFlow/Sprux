@@ -83,6 +83,16 @@ class Solver {
   template <typename T>
   void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS) const;
 
+  // factor using LDL^T decomposition (for symmetric indefinite matrices)
+  // A = L * D * L^T where L is unit lower triangular and D is diagonal
+  // Uses same storage as Cholesky: L below diagonal, D on diagonal
+  template <typename T>
+  void factorLDLT(T* data, bool verbose = false) const;
+
+  // solve in place with LDL^T factorization (solves L, then D, then L^T)
+  template <typename T>
+  void solveLDLT(const T* matData, T* vecData, int64_t stride, int nRHS) const;
+
   // apply partial factor, up to a given span
   template <typename T>
   void factorUpTo(T* data, int64_t spanIndex, bool verbose = false) const;
@@ -238,6 +248,29 @@ class Solver {
   template <typename T>
   void internalSolveURange(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
                            int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  // LDL^T factorization internal methods
+  template <typename T>
+  void factorLumpLDLT(NumericCtx<T>& numCtx, T* data, int64_t lump) const;
+
+  template <typename T>
+  void eliminateBoardLDLT(NumericCtx<T>& numCtx, T* data, int64_t ptr) const;
+
+  template <typename T>
+  void internalFactorRangeLDLT(T* data, int64_t startSpanIndex, int64_t endSpanIndex,
+                               bool verbose = false) const;
+
+  template <typename T>
+  void internalSolveLRangeLDLT(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
+                               int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  template <typename T>
+  void internalSolveDRange(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
+                           int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  template <typename T>
+  void internalSolveLtRangeLDLT(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
+                                int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
 
   CoalescedBlockMatrixSkel factorSkel;
   std::vector<int64_t> sparseElimRanges;

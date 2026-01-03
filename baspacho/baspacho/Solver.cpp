@@ -824,6 +824,271 @@ template void Solver::solveLU<double>(const double* matData, const int64_t* pivo
 template void Solver::solveLU<float>(const float* matData, const int64_t* pivots, float* vecData,
                                      int64_t stride, int nRHS) const;
 
+// ============ LDL^T Factorization Implementation ============
+// For symmetric indefinite matrices: A = L * D * L^T
+// L is unit lower triangular (below diagonal), D is diagonal (on diagonal)
+// Uses same lower-triangle storage as Cholesky.
+
+template <typename T>
+void Solver::factorLumpLDLT(NumericCtx<T>& numCtx, T* data, int64_t lump) const {
+  int64_t lumpStart = factorSkel.lumpStart[lump];
+  int64_t lumpSize = factorSkel.lumpStart[lump + 1] - lumpStart;
+  int64_t chainColBegin = factorSkel.chainColPtr[lump];
+  int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+
+  // LDL^T factorization on diagonal block
+  int info = numCtx.ldlt(lumpSize, data, diagBlockOffset);
+  if (info != 0) {
+    throw std::runtime_error("ldlt failed with info = " + std::to_string(info));
+  }
+
+  int64_t boardColBegin = factorSkel.boardColPtr[lump];
+  int64_t boardColEnd = factorSkel.boardColPtr[lump + 1];
+  int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+  int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+  int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+  int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+                             factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+
+  if (numRowsBelowDiag == 0) {
+    return;
+  }
+
+  // For LDL^T, we need to solve for L column below diagonal.
+  // After ldlt of diagonal block, we have L_diag (unit lower) and D_diag (diagonal) stored.
+  // The relationship for off-diagonal blocks is:
+  //   A'_{below} = L_{below} * D_diag * L_diag^T
+  // Rearranging:
+  //   L_{below} = A'_{below} * L_diag^{-T} * D_diag^{-1}
+  //
+  // Use trsmUnitScaleInv which computes: B <- B * L^{-T} * D^{-1}
+  // where L is unit lower triangular (stored with D on diagonal for the scaling step)
+  numCtx.trsmUnitScaleInv(lumpSize, numRowsBelowDiag, data, diagBlockOffset, belowDiagOffset);
+}
+
+template <typename T>
+void Solver::eliminateBoardLDLT(NumericCtx<T>& numCtx, T* data, int64_t ptr) const {
+  int64_t origLump = factorSkel.boardColLump[ptr];
+  int64_t boardIndexInCol = factorSkel.boardColOrd[ptr];
+
+  int64_t origLumpSize = factorSkel.lumpStart[origLump + 1] - factorSkel.lumpStart[origLump];
+  int64_t chainColBegin = factorSkel.chainColPtr[origLump];
+  int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+
+  int64_t boardColBegin = factorSkel.boardColPtr[origLump];
+  int64_t boardColEnd = factorSkel.boardColPtr[origLump + 1];
+
+  int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + boardIndexInCol];
+  int64_t rowDataEnd0 = factorSkel.boardChainColOrd[boardColBegin + boardIndexInCol + 1];
+  int64_t rowDataEnd1 = factorSkel.boardChainColOrd[boardColEnd - 1];
+
+  int64_t belowDiagStart = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+  int64_t rectRowBegin = factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+  int64_t numRowsSub = factorSkel.chainRowsTillEnd[chainColBegin + rowDataEnd0 - 1] - rectRowBegin;
+  int64_t numRowsFull = factorSkel.chainRowsTillEnd[chainColBegin + rowDataEnd1 - 1] - rectRowBegin;
+
+  // For LDL^T Schur complement: C -= L * D * L^T
+  // where L is the column below diagonal, D is diagonal on the diagonal block.
+  //
+  // After trsmUnitScaleInv in factorLumpLDLT:
+  //   L_below = A'_below * L_diag^{-T} * D_diag^{-1}
+  // This is the correct L factor for LDL^T.
+  //
+  // The Schur complement is: C -= L_below * D_diag * L_below^T
+  // We use saveSyrkGemmScaled which computes (L * D) * L^T = L * D * L^T
+  numCtx.saveSyrkGemmScaled(numRowsSub, numRowsFull, origLumpSize, data, belowDiagStart,
+                            diagBlockOffset, origLumpSize);
+
+  int64_t targetLump = factorSkel.boardRowLump[boardColBegin + boardIndexInCol];
+  int64_t targetLumpSize = factorSkel.lumpStart[targetLump + 1] - factorSkel.lumpStart[targetLump];
+  int64_t srcColDataOffset = chainColBegin + belowDiagChainColOrd;
+  int64_t numBlockRows = rowDataEnd1 - belowDiagChainColOrd;
+  int64_t numBlockCols = rowDataEnd0 - belowDiagChainColOrd;
+
+  numCtx.assemble(data, rectRowBegin,
+                  targetLumpSize,    //
+                  srcColDataOffset,  //
+                  numRowsSub, numBlockRows, numBlockCols);
+}
+
+template <typename T>
+void Solver::internalFactorRangeLDLT(T* data, int64_t startSpanIndex, int64_t endSpanIndex,
+                                     bool verbose) const {
+  BASPACHO_CHECK_GE(startSpanIndex, 0);
+  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
+  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
+
+  // Note: LDL^T does not currently support sparse elimination optimization
+  // All factorization is done in the dense phase
+  int64_t denseOpsFromLump = 0;
+  if (verbose) {
+    std::cout << "LDL^T Block-Fact from: " << denseOpsFromLump << std::endl;
+  }
+
+  for (int64_t l = std::max(startLump, denseOpsFromLump);
+       l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
+    numCtx->prepareAssemble(l);
+
+    //  iterate over columns having a non-trivial a-block
+    for (int64_t rPtr = startElimRowPtr[l - denseOpsFromLump],
+                 rEnd = factorSkel.boardRowPtr[l + 1] - 1;  // skip last (diag block)
+         rPtr < rEnd; rPtr++) {
+      int64_t origLump = factorSkel.boardColLump[rPtr];
+      if (origLump >= upToLump) {
+        break;
+      } else if (origLump < startLump) {
+        continue;
+      }
+      eliminateBoardLDLT(*numCtx, data, rPtr);
+    }
+
+    if (l < upToLump) {
+      factorLumpLDLT(*numCtx, data, l);
+    }
+  }
+}
+
+template <typename T>
+void Solver::factorLDLT(T* data, bool verbose) const {
+  internalFactorRangeLDLT(data, 0, factorSkel.numSpans(), verbose);
+}
+
+template <typename T>
+void Solver::solveLDLT(const T* matData, T* vecData, int64_t stride, int nRHS) const {
+  SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
+
+  // LDL^T solve: A*x = b where A = L * D * L^T
+  // 1. Solve L * y = b (forward substitution with unit L)
+  // 2. Solve D * z = y (diagonal solve)
+  // 3. Solve L^T * x = z (backward substitution with unit L^T)
+
+  // Step 1: Forward substitution with unit lower triangular L
+  internalSolveLRangeLDLT(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+
+  // Step 2: Diagonal solve
+  internalSolveDRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+
+  // Step 3: Backward substitution with unit L^T
+  internalSolveLtRangeLDLT(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+}
+
+template <typename T>
+void Solver::internalSolveLRangeLDLT(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
+                                     int64_t endSpanIndex, T* vecData, int64_t stride,
+                                     int nRHS) const {
+  (void)nRHS;
+  BASPACHO_CHECK_GE(startSpanIndex, 0);
+  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
+  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  for (int64_t l = startLump; l < upToLump; l++) {
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    int64_t chainColBegin = factorSkel.chainColPtr[l];
+    int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+
+    // Solve L * x = b with unit diagonal L
+    slvCtx.solveLUnitLDLT(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+
+    int64_t boardColBegin = factorSkel.boardColPtr[l];
+    int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+    int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+    int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+    int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+    int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+                               factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+    if (numRowsBelowDiag == 0) {
+      continue;
+    }
+
+    slvCtx.gemv(matData, belowDiagOffset, numRowsBelowDiag, lumpSize, vecData, lumpStart, stride,
+                -1.0);
+
+    int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+    slvCtx.assembleVec(chainColPtr, numColChains - belowDiagChainColOrd, vecData, stride);
+  }
+}
+
+template <typename T>
+void Solver::internalSolveDRange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
+                                 int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const {
+  (void)nRHS;
+  BASPACHO_CHECK_GE(startSpanIndex, 0);
+  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
+  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  for (int64_t l = startLump; l < upToLump; l++) {
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    int64_t chainColBegin = factorSkel.chainColPtr[l];
+    int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+
+    // Solve D * x = b (divide by diagonal elements)
+    slvCtx.solveDiag(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+  }
+}
+
+template <typename T>
+void Solver::internalSolveLtRangeLDLT(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
+                                      int64_t endSpanIndex, T* vecData, int64_t stride,
+                                      int nRHS) const {
+  (void)nRHS;
+  BASPACHO_CHECK_GE(startSpanIndex, 0);
+  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
+  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  // Backward substitution (reverse order)
+  for (int64_t l = upToLump - 1; l >= startLump; l--) {
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    int64_t chainColBegin = factorSkel.chainColPtr[l];
+
+    int64_t boardColBegin = factorSkel.boardColPtr[l];
+    int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+    int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+    int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+    int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+    int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+                               factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+
+    if (numRowsBelowDiag > 0) {
+      int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+      slvCtx.assembleVecT(vecData, stride, chainColPtr, numColChains - belowDiagChainColOrd);
+
+      slvCtx.gemvT(matData, belowDiagOffset, numRowsBelowDiag, lumpSize, vecData, lumpStart, stride,
+                   -1.0);
+    }
+
+    int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+    // Solve L^T * x = b with unit diagonal L^T
+    slvCtx.solveLtUnit(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+  }
+}
+
+template void Solver::factorLDLT<double>(double* data, bool verbose) const;
+template void Solver::factorLDLT<float>(float* data, bool verbose) const;
+template void Solver::solveLDLT<double>(const double* matData, double* vecData, int64_t stride,
+                                        int nRHS) const;
+template void Solver::solveLDLT<float>(const float* matData, float* vecData, int64_t stride,
+                                       int nRHS) const;
+
 template void Solver::factor<double>(double* data, bool verbose) const;
 template void Solver::factor<float>(float* data, bool verbose) const;
 template void Solver::factor<vector<double*>>(vector<double*>* data, bool verbose) const;
