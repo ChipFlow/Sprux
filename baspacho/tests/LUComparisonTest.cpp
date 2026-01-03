@@ -35,6 +35,173 @@ using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
 template <typename T>
 using Vector = Eigen::Vector<T, Eigen::Dynamic>;
 
+// ============================================================================
+// Helper functions for filling block matrix data from dense matrices
+// ============================================================================
+
+// Fill BaSpaCho block data from a dense matrix.
+// This properly fills both lower triangle (chainData) and upper triangle
+// (upperChainData) storage from the corresponding entries in fullMat.
+template <typename T>
+void fillDataFromDenseMatrix(const CoalescedBlockMatrixSkel& skel, T* data,
+                             const Matrix<T>& fullMat, bool verbose = false) {
+  int64_t numLumps = skel.numLumps();
+
+  if (verbose) {
+    cout << "fillDataFromDenseMatrix: numLumps=" << numLumps
+         << ", dataSize=" << skel.dataSize() << ", upperDataSize=" << skel.upperDataSize()
+         << ", totalDataSize=" << skel.totalDataSize() << endl;
+  }
+
+  // Fill lower triangle (includes diagonal blocks)
+  for (int64_t l = 0; l < numLumps; l++) {
+    int64_t chainStart = skel.chainColPtr[l];
+    int64_t chainEnd = skel.chainColPtr[l + 1];
+    int64_t lumpStartCol = skel.lumpStart[l];
+    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartCol;
+
+    if (verbose) {
+      cout << "  Lump " << l << ": chains [" << chainStart << ", " << chainEnd << ")"
+           << ", cols [" << lumpStartCol << ", " << lumpStartCol + lumpSize << ")" << endl;
+    }
+
+    for (int64_t c = chainStart; c < chainEnd; c++) {
+      int64_t rowSpan = skel.chainRowSpan[c];
+      int64_t rowStart = skel.spanStart[rowSpan];
+      int64_t rowSize = skel.spanStart[rowSpan + 1] - rowStart;
+      int64_t dataOffset = skel.chainData[c];
+
+      if (verbose) {
+        cout << "    Chain " << c << ": rowSpan=" << rowSpan << " rows [" << rowStart << ", "
+             << rowStart + rowSize << "), dataOffset=" << dataOffset << endl;
+      }
+
+      // Copy from fullMat to data buffer (row-major storage)
+      for (int64_t r = 0; r < rowSize; r++) {
+        for (int64_t col = 0; col < lumpSize; col++) {
+          data[dataOffset + r * lumpSize + col] = fullMat(rowStart + r, lumpStartCol + col);
+        }
+      }
+    }
+  }
+
+  // Fill upper triangle (if initialized for LU)
+  if (!skel.upperChainData.empty()) {
+    int64_t upperDataBase = skel.dataSize();
+
+    if (verbose) {
+      cout << "  Upper triangle: upperDataBase=" << upperDataBase << endl;
+    }
+
+    for (int64_t l = 0; l < numLumps; l++) {
+      int64_t upperRowStart = skel.upperChainRowPtr[l];
+      int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
+      int64_t lumpStartRow = skel.lumpStart[l];
+      int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartRow;
+
+      if (verbose && upperRowStart < upperRowEnd) {
+        cout << "  Upper lump " << l << ": entries [" << upperRowStart << ", " << upperRowEnd << ")"
+             << ", rows [" << lumpStartRow << ", " << lumpStartRow + lumpSize << ")" << endl;
+      }
+
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = skel.upperChainColSpan[i];
+        int64_t colStart = skel.spanStart[colSpan];
+        int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
+
+        if (verbose) {
+          cout << "    Upper entry " << i << ": colSpan=" << colSpan << " cols [" << colStart
+               << ", " << colStart + colSize << "), dataOffset=" << upperDataOffset << endl;
+        }
+
+        // Upper triangle stores: lumpSize rows x colSize cols
+        // This is the block at matrix position (lumpStartRow, colStart)
+        for (int64_t r = 0; r < lumpSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
+            data[upperDataOffset + r * colSize + c] = fullMat(lumpStartRow + r, colStart + c);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Reconstruct a dense matrix from BaSpaCho block data.
+// This is useful for verifying that data was filled correctly.
+template <typename T>
+Matrix<T> reconstructDenseMatrix(const CoalescedBlockMatrixSkel& skel, const T* data,
+                                 bool verbose = false) {
+  int64_t order = skel.order();
+  Matrix<T> result = Matrix<T>::Zero(order, order);
+  int64_t numLumps = skel.numLumps();
+
+  if (verbose) {
+    cout << "reconstructDenseMatrix: order=" << order << ", numLumps=" << numLumps << endl;
+  }
+
+  // Reconstruct from lower triangle
+  for (int64_t l = 0; l < numLumps; l++) {
+    int64_t chainStart = skel.chainColPtr[l];
+    int64_t chainEnd = skel.chainColPtr[l + 1];
+    int64_t lumpStartCol = skel.lumpStart[l];
+    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartCol;
+
+    for (int64_t c = chainStart; c < chainEnd; c++) {
+      int64_t rowSpan = skel.chainRowSpan[c];
+      int64_t rowStart = skel.spanStart[rowSpan];
+      int64_t rowSize = skel.spanStart[rowSpan + 1] - rowStart;
+      int64_t dataOffset = skel.chainData[c];
+
+      for (int64_t r = 0; r < rowSize; r++) {
+        for (int64_t col = 0; col < lumpSize; col++) {
+          result(rowStart + r, lumpStartCol + col) = data[dataOffset + r * lumpSize + col];
+        }
+      }
+    }
+  }
+
+  // Reconstruct from upper triangle (if present)
+  if (!skel.upperChainData.empty()) {
+    int64_t upperDataBase = skel.dataSize();
+
+    for (int64_t l = 0; l < numLumps; l++) {
+      int64_t upperRowStart = skel.upperChainRowPtr[l];
+      int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
+      int64_t lumpStartRow = skel.lumpStart[l];
+      int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartRow;
+
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = skel.upperChainColSpan[i];
+        int64_t colStart = skel.spanStart[colSpan];
+        int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
+
+        for (int64_t r = 0; r < lumpSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
+            result(lumpStartRow + r, colStart + c) = data[upperDataOffset + r * colSize + c];
+          }
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+// Print sparse structure info for debugging
+void printSparseStructure(const string& name, const SparseStructure& ss) {
+  cout << name << ": " << ss.ptrs.size() - 1 << " rows" << endl;
+  for (size_t i = 0; i + 1 < ss.ptrs.size(); i++) {
+    cout << "  Row " << i << ": cols [";
+    for (int64_t k = ss.ptrs[i]; k < ss.ptrs[i + 1]; k++) {
+      if (k > ss.ptrs[i]) cout << ", ";
+      cout << ss.inds[k];
+    }
+    cout << "]" << endl;
+  }
+}
+
 // Helper struct to hold UMFPACK solve results
 struct UmfpackSolveResult {
   double analysisTime;
@@ -341,9 +508,226 @@ TEST(LUComparison, VsUmfpack_TwoBlock) {
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }
 
+// Debug test to trace the BlockSparse data filling issue
+TEST(LUComparison, DebugBlockSparse) {
+  // Use a small structure for easier debugging: 4 blocks
+  // Structure: block 0 connects to 0,1,2; block 1 connects to 1,2,3; etc.
+  vector<set<int64_t>> colBlocks{{0, 1, 2}, {1, 2, 3}, {2, 3}, {3}};
+  SparseStructure ssOrig = columnsToCscStruct(colBlocks).transpose();
+
+  cout << "\n=== Debug BlockSparse Test ===" << endl;
+  printSparseStructure("Original (before fill)", ssOrig);
+
+  SparseStructure ss = ssOrig.addFullEliminationFill();
+  printSparseStructure("After addFullEliminationFill", ss);
+
+  // Use small block sizes: 2x2 each
+  vector<int64_t> paramSize(colBlocks.size(), 2);
+  int64_t totalSize = 8;
+
+  cout << "Blocks: " << paramSize.size() << ", Total size: " << totalSize << "x" << totalSize
+       << endl;
+
+  // Build full dense matrix with ALL entries filled
+  // Use a deterministic pattern for debugging
+  Matrix<double> fullMat = Matrix<double>::Zero(totalSize, totalSize);
+
+  vector<int64_t> spanStart;
+  spanStart.push_back(0);
+  for (int64_t ps : paramSize) {
+    spanStart.push_back(spanStart.back() + ps);
+  }
+
+  // Fill based on sparsity structure
+  // SparseStructure is CSR format: ptrs[row] gives start of row's column indices
+  cout << "\nFilling blocks from SparseStructure (CSR format):" << endl;
+  for (int64_t rowBlock = 0; rowBlock < (int64_t)ss.ptrs.size() - 1; rowBlock++) {
+    for (int64_t k = ss.ptrs[rowBlock]; k < ss.ptrs[rowBlock + 1]; k++) {
+      int64_t colBlock = ss.inds[k];
+      cout << "  Block (" << rowBlock << ", " << colBlock << "): rows ["
+           << spanStart[rowBlock] << ", " << spanStart[rowBlock + 1] << "), cols ["
+           << spanStart[colBlock] << ", " << spanStart[colBlock + 1] << ")" << endl;
+
+      // Fill the block with a recognizable pattern: 10*rowBlock + colBlock + 0.1*r + 0.01*c
+      for (int64_t r = spanStart[rowBlock]; r < spanStart[rowBlock + 1]; r++) {
+        for (int64_t c = spanStart[colBlock]; c < spanStart[colBlock + 1]; c++) {
+          double val = 10 * rowBlock + colBlock + 0.1 * (r - spanStart[rowBlock]) +
+                       0.01 * (c - spanStart[colBlock]);
+          fullMat(r, c) = val;
+          // Mirror to upper triangle for symmetric matrix
+          if (r != c && rowBlock != colBlock) {
+            fullMat(c, r) = val;
+          }
+        }
+      }
+    }
+  }
+
+  // Add diagonal dominance
+  for (int64_t i = 0; i < totalSize; i++) {
+    fullMat(i, i) += totalSize * 10;
+  }
+
+  cout << "\nFull matrix (before factorization):\n" << fullMat << endl;
+
+  // Build BaSpaCho skeleton
+  vector<int64_t> lumpToSpan(paramSize.size() + 1);
+  iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
+  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
+  CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
+
+  cout << "\nBefore initUpperTriangle:" << endl;
+  cout << "  dataSize = " << factorSkel.dataSize() << endl;
+  cout << "  upperDataSize = " << factorSkel.upperDataSize() << endl;
+
+  factorSkel.initUpperTriangle();
+
+  cout << "\nAfter initUpperTriangle:" << endl;
+  cout << "  dataSize = " << factorSkel.dataSize() << endl;
+  cout << "  upperDataSize = " << factorSkel.upperDataSize() << endl;
+  cout << "  totalDataSize = " << factorSkel.totalDataSize() << endl;
+
+  // Allocate and fill data using helper function
+  vector<double> data(factorSkel.totalDataSize());
+  cout << "\nFilling data using fillDataFromDenseMatrix (verbose):" << endl;
+  fillDataFromDenseMatrix(factorSkel, data.data(), fullMat, true);
+
+  // Verify by reconstructing
+  Matrix<double> reconstructed = reconstructDenseMatrix(factorSkel, data.data());
+  cout << "\nReconstructed matrix:\n" << reconstructed << endl;
+
+  // Check for differences
+  Matrix<double> diff = fullMat - reconstructed;
+  double maxDiff = diff.cwiseAbs().maxCoeff();
+  cout << "\nMax difference between original and reconstructed: " << maxDiff << endl;
+
+  if (maxDiff > 1e-10) {
+    cout << "Difference matrix (non-zeros indicate missing data):\n" << diff << endl;
+    FAIL() << "Data reconstruction mismatch! maxDiff=" << maxDiff;
+  }
+
+  // Now try to solve
+  Solver solver(std::move(factorSkel), {}, {}, fastOps());
+  vector<int64_t> pivots(totalSize);
+
+  // Make a copy of data before factorization for debugging
+  vector<double> dataBeforeFactor = data;
+
+  solver.factorLU(data.data(), pivots.data());
+
+  cout << "\nPivots: ";
+  for (auto p : pivots) cout << p << " ";
+  cout << endl;
+
+  // Reconstruct L and U from factored data to verify P*A = L*U
+  cout << "\n=== Verifying P*A = L*U ===" << endl;
+  const auto& skel = solver.skel();
+
+  // Build L (unit lower triangular from diagonal and below-diagonal blocks)
+  Matrix<double> L = Matrix<double>::Identity(totalSize, totalSize);
+  Matrix<double> U = Matrix<double>::Zero(totalSize, totalSize);
+
+  // Extract L and U from lower triangle (diagonal blocks have both L and U)
+  for (int64_t l = 0; l < skel.numLumps(); l++) {
+    int64_t lumpStartCol = skel.lumpStart[l];
+    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartCol;
+    int64_t chainStart = skel.chainColPtr[l];
+    int64_t chainEnd = skel.chainColPtr[l + 1];
+
+    for (int64_t c = chainStart; c < chainEnd; c++) {
+      int64_t rowSpan = skel.chainRowSpan[c];
+      int64_t rowStart = skel.spanStart[rowSpan];
+      int64_t rowSize = skel.spanStart[rowSpan + 1] - rowStart;
+      int64_t dataOffset = skel.chainData[c];
+
+      bool isDiag = (rowSpan == skel.lumpToSpan[l]);
+
+      for (int64_t r = 0; r < rowSize; r++) {
+        for (int64_t col = 0; col < lumpSize; col++) {
+          double val = data[dataOffset + r * lumpSize + col];
+          if (isDiag) {
+            // Diagonal block: L is strictly lower (unit diag), U is upper
+            if (r > col) {
+              L(rowStart + r, lumpStartCol + col) = val;  // Below diagonal -> L
+            } else {
+              U(rowStart + r, lumpStartCol + col) = val;  // On/above diagonal -> U
+            }
+          } else {
+            // Below diagonal block: this is L
+            L(rowStart + r, lumpStartCol + col) = val;
+          }
+        }
+      }
+    }
+  }
+
+  // Extract U from upper triangle storage
+  int64_t upperDataBase = skel.dataSize();
+  for (int64_t l = 0; l < skel.numLumps(); l++) {
+    int64_t upperRowStart = skel.upperChainRowPtr[l];
+    int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
+    int64_t lumpStartRow = skel.lumpStart[l];
+    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartRow;
+
+    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+      int64_t colSpan = skel.upperChainColSpan[i];
+      int64_t colStart = skel.spanStart[colSpan];
+      int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
+      int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
+
+      for (int64_t r = 0; r < lumpSize; r++) {
+        for (int64_t c = 0; c < colSize; c++) {
+          U(lumpStartRow + r, colStart + c) = data[upperDataOffset + r * colSize + c];
+        }
+      }
+    }
+  }
+
+  cout << "L (unit lower triangular):\n" << L << endl;
+  cout << "\nU (upper triangular):\n" << U << endl;
+
+  // Build P from pivots
+  Matrix<double> P = Matrix<double>::Identity(totalSize, totalSize);
+  for (int64_t l = 0; l < skel.numLumps(); l++) {
+    int64_t lumpStart2 = skel.lumpStart[l];
+    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStart2;
+    int64_t pivotOffset = lumpStart2;  // Row-based pivot index
+    for (int64_t i = 0; i < lumpSize; i++) {
+      int64_t pivotRow = pivots[pivotOffset + i];
+      if (pivotRow != i) {
+        P.row(lumpStart2 + i).swap(P.row(lumpStart2 + pivotRow));
+      }
+    }
+  }
+  cout << "\nP (permutation):\n" << P << endl;
+
+  Matrix<double> PA = P * fullMat;
+  Matrix<double> LU = L * U;
+  cout << "\nP*A:\n" << PA << endl;
+  cout << "\nL*U:\n" << LU << endl;
+
+  double factorError = (PA - LU).norm();
+  cout << "\n||P*A - L*U|| = " << factorError << endl;
+
+  Vector<double> b = Vector<double>::Ones(totalSize);
+  Vector<double> x = b;
+  solver.solveLU(data.data(), pivots.data(), x.data(), totalSize, 1);
+
+  double residual = (fullMat * x - b).norm() / b.norm();
+  cout << "BaSpaCho solution: " << x.transpose() << endl;
+  cout << "Residual: " << residual << endl;
+
+  // Compare with Eigen
+  Vector<double> xRef = fullMat.partialPivLu().solve(b);
+  double residualRef = (fullMat * xRef - b).norm() / b.norm();
+  cout << "Eigen solution: " << xRef.transpose() << endl;
+  cout << "Eigen residual: " << residualRef << endl;
+
+  EXPECT_LT(residual, 1e-8) << "BaSpaCho residual too large";
+}
+
 // Compare on a sparse block matrix
-TEST(LUComparison, DISABLED_VsUmfpack_BlockSparse) {
-  // DISABLED: This test has issues with data setup for random structures
+TEST(LUComparison, VsUmfpack_BlockSparse) {
   // Create a block-sparse structure using TestingMatGen
   SparseMatGenerator gen = SparseMatGenerator::genFlat(20, 0.3, 42);
   SparseStructure ss = columnsToCscStruct(gen.columns).transpose();
@@ -517,7 +901,7 @@ TEST(LUComparison, DISABLED_VsUmfpack_BlockSparse) {
 }
 
 // Compare on a larger sparse matrix for performance
-TEST(LUComparison, DISABLED_VsUmfpack_Performance) {
+TEST(LUComparison, VsUmfpack_Performance) {
   // Create a larger block-sparse structure
   SparseMatGenerator gen = SparseMatGenerator::genGrid(20, 20, 0.5, 2, 42);
   SparseStructure ss = columnsToCscStruct(gen.columns).transpose();

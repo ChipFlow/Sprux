@@ -465,7 +465,7 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
 
   // LU factorization with partial pivoting on diagonal block
   // pivots array stores the row permutation for this lump
-  int64_t pivotOffset = factorSkel.lumpToSpan[lump];  // Pivot index for this lump
+  int64_t pivotOffset = factorSkel.lumpStart[lump];  // Pivot index (row-based, not span-based)
   int info = numCtx.getrf(lumpSize, lumpSize, data, diagBlockOffset, pivots + pivotOffset);
   if (info != 0) {
     throw std::runtime_error("getrf failed with info = " + std::to_string(info));
@@ -547,6 +547,9 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
     // For each pair of (L row span, U col span), compute C -= L * U
     // L blocks are in the lower triangle at chainData offsets
     // U blocks are in the upper triangle at upperChainData offsets
+    //
+    // IMPORTANT: Only update blocks where the target column lump is >= targetLump.
+    // This prevents updating the same block multiple times from different calls.
 
     // Iterate over L row spans (chains in lower triangle)
     for (int64_t lChainOrd = belowDiagChainColOrd; lChainOrd < rowDataEnd1; lChainOrd++) {
@@ -561,15 +564,26 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
 
       for (int64_t uIdx = upperRowStart; uIdx < upperRowEnd; uIdx++) {
         int64_t uColSpan = factorSkel.upperChainColSpan[uIdx];
+        int64_t uColLump = factorSkel.spanToLump[uColSpan];
+        int64_t lRowLump = factorSkel.spanToLump[lRowSpan];
+
+        // Determine when to apply this update:
+        // - Lower triangle (lRowSpan >= uColSpan): block is in column uColLump, update when targetLump == uColLump
+        // - Upper triangle (lRowSpan < uColSpan): block is in row lRowLump, update when targetLump == lRowLump
+        // - Diagonal (lRowSpan == uColSpan): update when targetLump == lRowLump (== uColLump)
+        int64_t updateAtLump = (lRowSpan >= uColSpan) ? uColLump : lRowLump;
+        if (updateAtLump != targetLump) {
+          continue;
+        }
+
         int64_t uColStart = factorSkel.spanStart[uColSpan];
         int64_t uColSize = factorSkel.spanStart[uColSpan + 1] - uColStart;
         int64_t uDataOffset = upperDataBase + factorSkel.upperChainData[uIdx];
 
-        // Only update lower triangle: lRowSpan >= uColSpan (row >= col)
-        // For the target block, find its location in the lower triangle
+        // Update target block: C -= L * U
+        // Target can be in lower triangle (lRowSpan >= uColSpan) or upper triangle (lRowSpan < uColSpan)
         if (lRowSpan >= uColSpan) {
-          // Find target block offset in lower triangle
-          // Target is at (lRowSpan row, uColSpan col) in the matrix
+          // Target is in lower triangle at (lRowSpan row, uColSpan col)
           // This is in the chain column of lump containing uColSpan
           int64_t targetColLump = factorSkel.spanToLump[uColSpan];
           int64_t targetChainColBegin = factorSkel.chainColPtr[targetColLump];
@@ -596,6 +610,34 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
             // C is lRowSize x uColSize at targetDataOffset (row-major, ld=targetLumpSize2)
             numCtx.saveGemm(lRowSize, uColSize, origLumpSize, data, lDataOffset, origLumpSize, data,
                             uDataOffset, uColSize, data, targetDataOffset, targetLumpSize2);
+          }
+        } else {
+          // Target is in upper triangle at (lRowSpan row, uColSpan col)
+          // lRowSpan < uColSpan, so we need to find this block in the upper triangle
+          // of the lump containing lRowSpan
+          int64_t targetRowLump = factorSkel.spanToLump[lRowSpan];
+          int64_t targetUpperRowStart = factorSkel.upperChainRowPtr[targetRowLump];
+          int64_t targetUpperRowEnd = factorSkel.upperChainRowPtr[targetRowLump + 1];
+
+          // Find the upper triangle entry pointing to uColSpan
+          int64_t targetDataOffset = -1;
+          for (int64_t tu = targetUpperRowStart; tu < targetUpperRowEnd; tu++) {
+            if (factorSkel.upperChainColSpan[tu] == uColSpan) {
+              targetDataOffset = upperDataBase + factorSkel.upperChainData[tu];
+              // Add row offset within the lump
+              int64_t rowOffsetInLump = factorSkel.spanOffsetInLump[lRowSpan];
+              targetDataOffset += rowOffsetInLump * uColSize;
+              break;
+            }
+          }
+
+          if (targetDataOffset >= 0) {
+            // C -= L * U
+            // L is lRowSize x origLumpSize at lDataOffset (row-major, ld=origLumpSize)
+            // U is origLumpSize x uColSize at uDataOffset (row-major, ld=uColSize)
+            // C is lRowSize x uColSize at targetDataOffset (row-major, ld=uColSize)
+            numCtx.saveGemm(lRowSize, uColSize, origLumpSize, data, lDataOffset, origLumpSize, data,
+                            uDataOffset, uColSize, data, targetDataOffset, uColSize);
           }
         }
       }
@@ -675,7 +717,7 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   for (int64_t l = 0; l < factorSkel.numLumps(); l++) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t pivotOffset = factorSkel.lumpToSpan[l];
+    int64_t pivotOffset = factorSkel.lumpStart[l];  // Row-based pivot index
     slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
   }
 
