@@ -166,6 +166,9 @@ set(BASPACHO_USE_WEBGPU OFF CACHE BOOL "If on, WebGPU support is enabled (via Da
 if(BASPACHO_USE_WEBGPU)
   message("${Cyan}==============================[ WebGPU ]=================================${ColourReset}")
 
+  # Include FetchContent early (before main FetchContent section)
+  include(FetchContent)
+
   # Use FetchContent to get Dawn
   FetchContent_Declare(
     dawn
