@@ -129,6 +129,108 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
     Eigen::LLT<Eigen::Ref<MatRMaj<T>>> llt(matA);
   }
 
+  // LDL^T factorization: A = L * D * L^T
+  // L is stored below diagonal (unit diagonal implicit), D on diagonal
+  virtual int ldlt(int64_t n, T* data, int64_t offA) override {
+    // Use Eigen's LDLT which stores L with unit diagonal
+    Eigen::Map<MatRMaj<T>> matA(data + offA, n, n);
+
+    // Eigen's LDLT modifies the matrix in place for the lower triangle
+    // We need to compute it ourselves to get the right storage format
+    for (int64_t j = 0; j < n; j++) {
+      // Compute D[j] = A[j,j] - sum_{k<j} L[j,k]^2 * D[k]
+      T Djj = matA(j, j);
+      for (int64_t k = 0; k < j; k++) {
+        T Ljk = matA(j, k);
+        T Dk = matA(k, k);
+        Djj -= Ljk * Ljk * Dk;
+      }
+      if (Djj == T(0)) {
+        return j + 1;  // Singular matrix
+      }
+      matA(j, j) = Djj;
+
+      // Compute L[i,j] for i > j: L[i,j] = (A[i,j] - sum_{k<j} L[i,k]*L[j,k]*D[k]) / D[j]
+      for (int64_t i = j + 1; i < n; i++) {
+        T Lij = matA(i, j);
+        for (int64_t k = 0; k < j; k++) {
+          T Lik = matA(i, k);
+          T Ljk = matA(j, k);
+          T Dk = matA(k, k);
+          Lij -= Lik * Ljk * Dk;
+        }
+        matA(i, j) = Lij / Djj;
+      }
+    }
+    return 0;
+  }
+
+  // Scale rows of matrix by diagonal: B[i,:] *= D[i]
+  virtual void scaleRowsByDiag(int64_t m, int64_t n, const T* D, int64_t offD, T* B, int64_t offB,
+                               int64_t ldb) override {
+    for (int64_t i = 0; i < m; i++) {
+      T di = D[offD + i * (m + 1)];  // D stored on diagonal, stride = n+1 for row-major
+      for (int64_t j = 0; j < n; j++) {
+        B[offB + i * ldb + j] *= di;
+      }
+    }
+  }
+
+  // C -= L * D * L^T where L is m x k, D is k diagonal elements
+  virtual void saveSyrkScaled(int64_t m, int64_t k, const T* L, int64_t offL, int64_t ldL,
+                              const T* D, int64_t offD, T* C, int64_t offC, int64_t ldC) override {
+    // Compute C -= L * D * L^T
+    // This updates the lower triangle of C
+    for (int64_t i = 0; i < m; i++) {
+      for (int64_t j = 0; j <= i; j++) {
+        T sum = T(0);
+        for (int64_t q = 0; q < k; q++) {
+          T Liq = L[offL + i * ldL + q];
+          T Ljq = L[offL + j * ldL + q];
+          T Dq = D[offD + q * (k + 1)];  // D on diagonal
+          sum += Liq * Dq * Ljq;
+        }
+        C[offC + i * ldC + j] -= sum;
+      }
+    }
+  }
+
+  // LDL^T off-diagonal column solve: solve X * L^T = B for unit L, then scale by D^{-1}
+  // L is n x n with unit diagonal (stored with D on diagonal, which is used for scaling)
+  // B is k x n (k rows, n cols), result is stored back in B
+  // This computes: B <- B * L^{-T} * D^{-1}
+  virtual void trsmUnitScaleInv(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override {
+    // The stored row-major matrix M at offA has:
+    // - D on diagonal (D_0, D_1, ..., D_{n-1})
+    // - L (unit lower triangular, L_{ij} for i > j) below diagonal
+    //
+    // B is k x n stored row-major at offB
+    //
+    // We want to compute: B <- B * L^{-T} * D^{-1}
+    // where L is unit lower triangular (1's on diagonal, values below diagonal from M)
+    //
+    // Step 1: Solve X * L^T = B for unit upper triangular L^T
+    // Step 2: Scale each column j by 1/D_j
+
+    Eigen::Map<const MatRMaj<T>> matA(data + offA, n, n);
+    Eigen::Map<MatRMaj<T>> matB(data + offB, k, n);
+
+    // Step 1: Solve X * L^T = B where L is unit lower triangular
+    // L^T is unit upper triangular
+    // Use Eigen's UnitLower for L, then its adjoint (transpose) for L^T solve
+    matA.template triangularView<Eigen::UnitLower>()
+        .adjoint()
+        .template solveInPlace<Eigen::OnTheRight>(matB);
+
+    // Step 2: Scale each column of B by 1/D_j
+    for (int64_t j = 0; j < n; j++) {
+      T Dj = matA(j, j);  // D_j is on diagonal
+      for (int64_t i = 0; i < k; i++) {
+        matB(i, j) /= Dj;
+      }
+    }
+  }
+
   virtual void trsm(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override {
     auto timer = sym.trsmStat.instance(sizeof(T), n, k);
 
@@ -138,6 +240,36 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
     Eigen::Map<const MatCMajD> matA(data + offA, n, n);
     Eigen::Map<MatRMaj<T>> matB(data + offB, k, n);
     matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
+  }
+
+  // For LDL^T Schur complement: computes temp = (L * D) * L^T
+  // This is like saveSyrkGemm but each column of L is scaled by D[j]
+  virtual void saveSyrkGemmScaled(int64_t m, int64_t n, int64_t k, T* data, int64_t offL,
+                                  int64_t offD, int64_t ldD) override {
+    BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+
+    const T* L = data + offL;
+    const T* D = data + offD;  // Diagonal block, D[j] at position D[j * ldD + j]
+    T* C = tempBuffer.data();
+
+    Eigen::Map<const MatRMaj<T>> matL_sub(L, m, k);       // First m rows of L
+    Eigen::Map<const MatRMaj<T>> matL_full(L, n, k);      // All n rows of L
+    Eigen::Map<MatRMaj<T>> matC(C, n, m);
+
+    // Compute W = L_full * diag(D) (scale each column of L by D[j])
+    // Then C = W * L_sub^T
+    // We do this efficiently by noting: C[i,j] = sum_q L_full[i,q] * D[q] * L_sub[j,q]
+
+    for (int64_t i = 0; i < n; i++) {
+      for (int64_t j = 0; j < m; j++) {
+        T sum = T(0);
+        for (int64_t q = 0; q < k; q++) {
+          T Dq = D[q * ldD + q];  // D[q] is at diagonal position (q, q)
+          sum += matL_full(i, q) * Dq * matL_sub(j, q);
+        }
+        matC(i, j) = sum;
+      }
+    }
   }
 
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const T* data,
@@ -402,6 +534,14 @@ struct CpuBaseSolveCtx : SolveCtx<T> {
     matA.template triangularView<Eigen::Lower>().solveInPlace(matC);
   }
 
+  // Solve L * x = b where L is unit lower triangular (forward substitution)
+  virtual void solveLUnit(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                          int64_t ldc) override {
+    Eigen::Map<const MatRMaj<T>> matA(data + offM, n, n);
+    OuterStridedCMajMatM<T> matC(C + offC, n, nRHS, OuterStride(ldc));
+    matA.template triangularView<Eigen::UnitLower>().solveInPlace(matC);
+  }
+
   virtual void gemv(const T* data, int64_t offM, int64_t nRows, int64_t nCols, const T* A,
                     int64_t offA, int64_t lda, T alpha) override {
     auto timer = sym.solveGemvStat.instance();
@@ -426,6 +566,30 @@ struct CpuBaseSolveCtx : SolveCtx<T> {
     OuterStridedCMajMatM<T> matA(A + offA, nCols, nRHS, OuterStride(lda));
     Eigen::Map<const MatRMaj<T>> matC(tmpBuf.data(), nRows, nRHS);
     matA.noalias() += alpha * (matM.transpose() * matC);
+  }
+
+  // LDL^T solve methods
+
+  // Solve D * x = b where D is diagonal (stored on diagonal of matrix)
+  virtual void solveDiag(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                         int64_t ldc) override {
+    OuterStridedCMajMatM<T> matC(C + offC, n, nRHS, OuterStride(ldc));
+    for (int64_t i = 0; i < n; i++) {
+      T di = data[offM + i * n + i];  // Diagonal element at (i,i)
+      for (int64_t j = 0; j < nRHS; j++) {
+        matC(i, j) /= di;
+      }
+    }
+  }
+
+  // Solve L^T * x = b where L is unit lower triangular (backward substitution)
+  virtual void solveLtUnit(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                           int64_t ldc) override {
+    Eigen::Map<const MatRMaj<T>> matA(data + offM, n, n);
+    OuterStridedCMajMatM<T> matC(C + offC, n, nRHS, OuterStride(ldc));
+    // L^T is unit upper triangular, solve from bottom up
+    // Using Eigen's unit lower triangular transpose solve
+    matA.template triangularView<Eigen::UnitLower>().adjoint().solveInPlace(matC);
   }
 
   const CpuBaseSymbolicCtx& sym;

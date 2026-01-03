@@ -211,6 +211,83 @@ struct NumericCtx : NumericCtxBase {
     (void)numCols;
     throw std::runtime_error("applyRowPerm: LU not supported by this backend");
   }
+
+  // ============ LDL^T factorization methods ============
+  // For symmetric indefinite matrices: A = L * D * L^T
+  // L is unit lower triangular (stored below diagonal), D is diagonal (stored on diagonal)
+
+  // LDL^T factorization on dense row-major matrix A (in place)
+  // After: diagonal contains D, lower triangle contains L (unit diagonal implicit)
+  // Returns 0 on success, >0 if matrix is singular (zero pivot at position info)
+  virtual int ldlt(int64_t n, T* data, int64_t offA) {
+    (void)n;
+    (void)data;
+    (void)offA;
+    throw std::runtime_error("ldlt: LDL^T factorization not supported by this backend");
+  }
+
+  // Scale rows of matrix by diagonal: B[i,:] *= D[i]
+  // Used for computing L*D from L
+  virtual void scaleRowsByDiag(int64_t m, int64_t n, const T* D, int64_t offD, T* B, int64_t offB,
+                               int64_t ldb) {
+    (void)m;
+    (void)n;
+    (void)D;
+    (void)offD;
+    (void)B;
+    (void)offB;
+    (void)ldb;
+    throw std::runtime_error("scaleRowsByDiag: LDL^T not supported by this backend");
+  }
+
+  // C -= L * D * L^T, symmetric rank-k update with diagonal scaling
+  // L is m x k, D is k (diagonal), result is m x m symmetric (lower triangle updated)
+  virtual void saveSyrkScaled(int64_t m, int64_t k, const T* L, int64_t offL, int64_t ldL,
+                              const T* D, int64_t offD, T* C, int64_t offC, int64_t ldC) {
+    (void)m;
+    (void)k;
+    (void)L;
+    (void)offL;
+    (void)ldL;
+    (void)D;
+    (void)offD;
+    (void)C;
+    (void)offC;
+    (void)ldC;
+    throw std::runtime_error("saveSyrkScaled: LDL^T not supported by this backend");
+  }
+
+  // LDL^T off-diagonal column solve: solve X * L^T = B for unit L, then scale by D^{-1}
+  // L is n x n with unit diagonal (stored with D on diagonal, which is used for scaling)
+  // B is k x n, result is stored back in B
+  // This computes: B <- B * L^{-T} * D^{-1}
+  virtual void trsmUnitScaleInv(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) {
+    (void)n;
+    (void)k;
+    (void)data;
+    (void)offA;
+    (void)offB;
+    throw std::runtime_error("trsmUnitScaleInv: LDL^T not supported by this backend");
+  }
+
+  // For LDL^T Schur complement: computes temp = (L * D) * L^T and stores in tempData
+  // m1 = number of columns in symmetric part (same rows for left and right L)
+  // m2 = total rows in L (for rectangular gemm part)
+  // k = number of columns in L (diagonal block size)
+  // L is m2 x k starting at offL
+  // D is k diagonal elements starting at offD with stride ldD
+  // Result stored in tempData (same layout as saveSyrkGemm)
+  virtual void saveSyrkGemmScaled(int64_t m1, int64_t m2, int64_t k, T* data, int64_t offL,
+                                  int64_t offD, int64_t ldD) {
+    (void)m1;
+    (void)m2;
+    (void)k;
+    (void)data;
+    (void)offL;
+    (void)offD;
+    (void)ldD;
+    throw std::runtime_error("saveSyrkGemmScaled: LDL^T not supported by this backend");
+  }
 };
 
 // methods (and possibly context) for solve operations
@@ -321,6 +398,42 @@ struct SolveCtx : SolveCtxBase {
     (void)ldVec;
     (void)alpha;
     throw std::runtime_error("gemvDirect: LU not supported by this backend");
+  }
+
+  // ============ LDL^T solve methods ============
+  // For symmetric indefinite factorization A = L * D * L^T
+
+  // Solve L * x = b where L is unit lower triangular (in place)
+  // Same as solveLUnit but named for clarity in LDL^T context
+  virtual void solveLUnitLDLT(const T* data, int64_t offset, int64_t n, T* C, int64_t offC,
+                              int64_t ldc) {
+    // Default: use solveLUnit if available
+    solveLUnit(data, offset, n, C, offC, ldc);
+  }
+
+  // Solve D * x = b where D is diagonal (stored on diagonal of factored matrix)
+  virtual void solveDiag(const T* data, int64_t offset, int64_t n, T* C, int64_t offC,
+                         int64_t ldc) {
+    (void)data;
+    (void)offset;
+    (void)n;
+    (void)C;
+    (void)offC;
+    (void)ldc;
+    throw std::runtime_error("solveDiag: LDL^T not supported by this backend");
+  }
+
+  // Solve L^T * x = b where L is unit lower triangular (in place)
+  // (backward substitution with unit diagonal)
+  virtual void solveLtUnit(const T* data, int64_t offset, int64_t n, T* C, int64_t offC,
+                           int64_t ldc) {
+    (void)data;
+    (void)offset;
+    (void)n;
+    (void)C;
+    (void)offC;
+    (void)ldc;
+    throw std::runtime_error("solveLtUnit: LDL^T not supported by this backend");
   }
 };
 
