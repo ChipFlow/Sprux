@@ -162,6 +162,128 @@ void testLDLTSingleLump(BackendType backend) {
 TEST(LDLTFactor, SingleLump_Blas_double) { testLDLTSingleLump<double>(BackendFast); }
 TEST(LDLTFactor, SingleLump_Ref_double) { testLDLTSingleLump<double>(BackendRef); }
 
+// Test LDL^T on indefinite matrices (matrices with negative eigenvalues)
+// This is a key advantage of LDL^T over Cholesky - it works for symmetric indefinite matrices
+template <typename T>
+void testLDLTIndefinite(const std::function<OpsPtr()>& genOps) {
+  for (int i = 0; i < 5; i++) {
+    auto colBlocks = randomCols(20, 0.15, 33 + i);
+    SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+
+    vector<int64_t> permutation = ss.fillReducingPermutation();
+    vector<int64_t> invPerm = inversePermutation(permutation);
+    SparseStructure sortedSs = ss.symmetricPermutation(invPerm, false);
+
+    vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 1, 3, 47);
+    EliminationTree et(paramSize, sortedSs);
+    et.buildTree();
+    et.processTree(false);
+    et.computeAggregateStruct();
+
+    CoalescedBlockMatrixSkel factorSkel(et.computeSpanStart(), et.lumpToSpan, et.colStart,
+                                        et.rowParam);
+
+    // Create random matrix and damp it moderately (SPD with eigenvalues around 1)
+    vector<T> data = randomData<T>(factorSkel.dataSize(), -1.0, 1.0, 9 + i);
+    factorSkel.damp(data, T(0.0), T(factorSkel.order() * 1.0));
+
+    // Make it indefinite by flipping the sign of some diagonal blocks
+    // This creates negative eigenvalues while keeping the matrix non-singular
+    int64_t n = factorSkel.order();
+    for (int64_t lump = 0; lump < (int64_t)factorSkel.lumpStart.size() - 1; lump += 2) {
+      int64_t lumpSize = factorSkel.lumpStart[lump + 1] - factorSkel.lumpStart[lump];
+      int64_t chainColBegin = factorSkel.chainColPtr[lump];
+      int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+      // Flip sign of entire diagonal block
+      for (int64_t ii = 0; ii < lumpSize; ii++) {
+        for (int64_t jj = 0; jj <= ii; jj++) {
+          data[diagBlockOffset + ii * lumpSize + jj] *= T(-1);
+        }
+      }
+    }
+
+    Matrix<T> A = factorSkel.densify(data);
+    // Symmetrize A - densify only fills lower triangle
+    for (int64_t row = 0; row < A.rows(); row++) {
+      for (int64_t col = row + 1; col < A.cols(); col++) {
+        A(row, col) = A(col, row);
+      }
+    }
+
+    // Verify it's indefinite (has both positive and negative eigenvalues)
+    Eigen::SelfAdjointEigenSolver<Matrix<T>> eigSolver(A);
+    Vector<T> eigenvalues = eigSolver.eigenvalues();
+    bool hasPositive = false, hasNegative = false;
+    for (int64_t j = 0; j < n; j++) {
+      if (eigenvalues(j) > T(0.1)) hasPositive = true;
+      if (eigenvalues(j) < T(-0.1)) hasNegative = true;
+    }
+    // Skip test if matrix happens to be definite (rare)
+    if (!(hasPositive && hasNegative)) continue;
+
+    // Factor with LDL^T
+    Solver solver(CoalescedBlockMatrixSkel(factorSkel), {}, {}, genOps());
+    solver.factorLDLT(data.data());
+
+    // Extract L and D and verify reconstruction
+    Matrix<T> factored = factorSkel.densify(data);
+    Matrix<T> L = Matrix<T>::Identity(n, n);
+    Vector<T> D(n);
+    for (int64_t row = 0; row < n; row++) {
+      D(row) = factored(row, row);
+      for (int64_t col = 0; col < row; col++) {
+        L(row, col) = factored(row, col);
+      }
+    }
+
+    Matrix<T> reconstructed = L * D.asDiagonal() * L.transpose();
+    ASSERT_NEAR((A - reconstructed).norm() / A.norm(), 0, Epsilon<T>::value2)
+        << "Indefinite matrix reconstruction failed at iteration " << i;
+
+    // Also verify solve works
+    Vector<T> b = Vector<T>::Random(n);
+    Vector<T> x_ref = A.ldlt().solve(b);
+
+    // Re-factor (factorLDLT modifies data in place)
+    for (int64_t lump = 0; lump < (int64_t)factorSkel.lumpStart.size() - 1; lump += 2) {
+      int64_t lumpSize = factorSkel.lumpStart[lump + 1] - factorSkel.lumpStart[lump];
+      int64_t chainColBegin = factorSkel.chainColPtr[lump];
+      int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+      for (int64_t ii = 0; ii < lumpSize; ii++) {
+        for (int64_t jj = 0; jj <= ii; jj++) {
+          data[diagBlockOffset + ii * lumpSize + jj] = A(factorSkel.lumpStart[lump] + ii,
+                                                          factorSkel.lumpStart[lump] + jj);
+        }
+      }
+    }
+    // Refill the data from the symmetric A
+    data = randomData<T>(factorSkel.dataSize(), -1.0, 1.0, 9 + i);
+    factorSkel.damp(data, T(0.0), T(factorSkel.order() * 1.0));
+    for (int64_t lump = 0; lump < (int64_t)factorSkel.lumpStart.size() - 1; lump += 2) {
+      int64_t lumpSize = factorSkel.lumpStart[lump + 1] - factorSkel.lumpStart[lump];
+      int64_t chainColBegin = factorSkel.chainColPtr[lump];
+      int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+      for (int64_t ii = 0; ii < lumpSize; ii++) {
+        for (int64_t jj = 0; jj <= ii; jj++) {
+          data[diagBlockOffset + ii * lumpSize + jj] *= T(-1);
+        }
+      }
+    }
+
+    Solver solver2(CoalescedBlockMatrixSkel(factorSkel), {}, {}, genOps());
+    solver2.factorLDLT(data.data());
+
+    Vector<T> x = b;
+    solver2.solveLDLT(data.data(), x.data(), n, 1);
+
+    ASSERT_NEAR((x - x_ref).norm() / x_ref.norm(), 0, Epsilon<T>::value2)
+        << "Indefinite matrix solve failed at iteration " << i;
+  }
+}
+
+TEST(LDLTFactor, Indefinite_Blas_double) { testLDLTIndefinite<double>([] { return fastOps(); }); }
+TEST(LDLTFactor, Indefinite_Ref_double) { testLDLTIndefinite<double>([] { return simpleOps(); }); }
+
 // Test LDL^T solve (factor + solve)
 template <typename T>
 void testLDLTSolve(const std::function<OpsPtr()>& genOps) {

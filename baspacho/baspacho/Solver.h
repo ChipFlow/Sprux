@@ -83,13 +83,47 @@ class Solver {
   template <typename T>
   void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS) const;
 
-  // factor using LDL^T decomposition (for symmetric indefinite matrices)
-  // A = L * D * L^T where L is unit lower triangular and D is diagonal
-  // Uses same storage as Cholesky: L below diagonal, D on diagonal
+  /**
+   * @brief Factor using LDL^T decomposition for symmetric indefinite matrices.
+   *
+   * Computes A = L * D * L^T where:
+   * - L is unit lower triangular (stored below diagonal, diagonal implicitly 1)
+   * - D is diagonal (stored on diagonal, can have negative entries)
+   *
+   * Uses the same lower-triangle storage as Cholesky, making it a drop-in
+   * replacement for applications that only store the lower triangle.
+   *
+   * Use this instead of Cholesky (factor()) when:
+   * - The matrix may have negative eigenvalues (e.g., Hessians at saddle points)
+   * - You need to handle general symmetric matrices, not just SPD
+   * - The matrix definiteness is unknown or variable
+   *
+   * Throws std::runtime_error if a zero pivot is encountered (matrix is singular).
+   *
+   * Note: Currently uses dense elimination for each lump. The sparse elimination
+   * path is not yet implemented for LDL^T.
+   *
+   * @param data Matrix data buffer (modified in place with L and D factors)
+   * @param verbose If true, prints timing information
+   */
   template <typename T>
   void factorLDLT(T* data, bool verbose = false) const;
 
-  // solve in place with LDL^T factorization (solves L, then D, then L^T)
+  /**
+   * @brief Solve in place with LDL^T factorization.
+   *
+   * Solves A*x = b where A = L*D*L^T by computing:
+   * 1. Forward substitution: L*y = b (unit lower triangular)
+   * 2. Diagonal solve: D*z = y
+   * 3. Backward substitution: L^T*x = z (unit upper triangular)
+   *
+   * The solution overwrites the input vector.
+   *
+   * @param matData Factored matrix data (from factorLDLT)
+   * @param vecData Right-hand side vector(s), overwritten with solution
+   * @param stride Leading dimension of vecData (must be >= order())
+   * @param nRHS Number of right-hand side vectors
+   */
   template <typename T>
   void solveLDLT(const T* matData, T* vecData, int64_t stride, int nRHS) const;
 
