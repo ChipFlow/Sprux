@@ -482,4 +482,8 @@ OpsPtr metalOps();
 OpsPtr openclOps();
 #endif
 
+#ifdef BASPACHO_USE_WEBGPU
+OpsPtr webgpuOps();
+#endif
+
 }  // end namespace BaSpaCho

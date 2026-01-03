@@ -38,3 +38,8 @@ if(BASPACHO_USE_OPENCL)
 add_baspacho_test(OpenCLFactorTest OpenCLFactorTest.cpp)
 # add_baspacho_test(OpenCLSolveTest OpenCLSolveTest.cpp)
 endif()
+
+if(BASPACHO_USE_WEBGPU)
+add_baspacho_test(WebGPUFactorTest WebGPUFactorTest.cpp)
+# add_baspacho_test(WebGPUSolveTest WebGPUSolveTest.cpp)
+endif()

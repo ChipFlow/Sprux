@@ -82,7 +82,7 @@ pixi run build_and_test # Full workflow
 - `factor()`: Cholesky factorization
 - `solve()`, `solveL()`, `solveLt()`: triangular solves
 - `factorUpTo()`, `solveLUpTo()`: partial factorization for marginals
-- Backends: `BackendRef`, `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`
+- Backends: `BackendRef`, `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`, `BackendWebGPU`
 
 ### Directory Structure
 
@@ -100,6 +100,7 @@ baspacho/
 - `BASPACHO_USE_CUBLAS`: Enable CUDA support (default: ON)
 - `BASPACHO_USE_METAL`: Enable Apple Metal support (default: OFF, macOS only, float only)
 - `BASPACHO_USE_OPENCL`: Enable OpenCL support with CLBlast (default: OFF, experimental)
+- `BASPACHO_USE_WEBGPU`: Enable WebGPU support via Dawn (default: OFF, float only)
 - `BASPACHO_USE_BLAS`: Enable BLAS support (default: ON)
 - `BASPACHO_CUDA_ARCHS`: CUDA architectures ("detect", "torch", or explicit list like "60;70;75")
 - `BASPACHO_USE_SUITESPARSE_AMD`: Use SuiteSparse AMD instead of Eigen's implementation
@@ -151,6 +152,36 @@ auto solver = createSolver<float>(paramSize, structure, settings);
 ```
 
 For production use, prefer CUDA (NVIDIA) or Metal (Apple Silicon) backends.
+
+### WebGPU Backend (Experimental)
+
+The WebGPU backend provides portable GPU acceleration using Dawn (Google's WebGPU implementation) with custom WGSL compute shaders.
+
+**Status:** Experimental. Uses CPU fallbacks for BLAS operations. WGSL kernels provide the core sparse Cholesky operations.
+
+**Important: Float-only precision.** WebGPU/WGSL has limited double-precision support across GPU backends. The WebGPU backend only supports `float` operations.
+
+**Requirements:**
+- Dawn is fetched automatically via CMake FetchContent
+
+```cpp
+// WebGPU backend usage (float only)
+Settings settings;
+settings.backend = BackendWebGPU;
+auto solver = createSolver<float>(paramSize, structure, settings);
+
+// Use WebGPUMirror for GPU memory management
+WebGPUMirror<float> dataGpu(hostData);
+solver.factor(dataGpu.ptr());
+dataGpu.get(hostData);  // Copy back to CPU
+```
+
+**Configure with WebGPU:**
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_WEBGPU=1
+```
+
+For double precision, use `BackendFast` (CPU with BLAS) or `BackendCuda` (NVIDIA GPU).
 
 ## Dependencies
 

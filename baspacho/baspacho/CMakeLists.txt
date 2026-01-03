@@ -54,6 +54,12 @@ if(BASPACHO_USE_OPENCL)
          MatOpsOpenCL.cpp)
 endif()
 
+if(BASPACHO_USE_WEBGPU)
+    list(APPEND BaSpaCho_sources
+         WebGPUDefs.cpp
+         MatOpsWebGPU.cpp)
+endif()
+
 add_library(${BASPACHO_LIBRARY}  ${BaSpaCho_sources})
 set_property(TARGET ${BASPACHO_LIBRARY} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -133,6 +139,21 @@ if(BASPACHO_USE_OPENCL)
     set(OPENCL_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/OpenCLKernels.cl")
     target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE
         BASPACHO_OPENCL_KERNEL_PATH="${OPENCL_KERNEL_SOURCE}")
+endif()
+
+if(BASPACHO_USE_WEBGPU)
+    # Link Dawn WebGPU implementation
+    target_link_libraries(${BASPACHO_LIBRARY}
+                          webgpu_dawn
+                          dawncpp)
+    target_include_directories(${BASPACHO_LIBRARY} PRIVATE
+                               ${dawn_SOURCE_DIR}/include
+                               ${dawn_BINARY_DIR}/gen/include)
+
+    # Embed WGSL kernel source for runtime compilation
+    set(WEBGPU_KERNEL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/WebGPUKernels.wgsl")
+    target_compile_definitions(${BASPACHO_LIBRARY} PRIVATE
+        BASPACHO_WEBGPU_KERNEL_PATH="${WEBGPU_KERNEL_SOURCE}")
 endif()
 
 target_compile_options(${BASPACHO_LIBRARY} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BASPACHO_CXX_FLAGS}>)
