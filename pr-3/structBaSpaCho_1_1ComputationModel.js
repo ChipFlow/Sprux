@@ -1,0 +1,27 @@
+var structBaSpaCho_1_1ComputationModel =
+[
+    [ "ComputationModel", "structBaSpaCho_1_1ComputationModel.html#a2889b0c81d830d76033e3cea6c6967c9", null ],
+    [ "ComputationModel", "structBaSpaCho_1_1ComputationModel.html#a1c6efbb4da8d014d46096f11f1d3231f", null ],
+    [ "asmblEst", "structBaSpaCho_1_1ComputationModel.html#a7fe024584a2e167f3317dd06560550bb", null ],
+    [ "asmblLinEst", "structBaSpaCho_1_1ComputationModel.html#a5cafe31ad8797ac6c89683692ef44bf9", null ],
+    [ "asmblLinModel", "structBaSpaCho_1_1ComputationModel.html#a7a271c8e0fa759b4b93d15540655d405", null ],
+    [ "asmblModel", "structBaSpaCho_1_1ComputationModel.html#a470efa22695f0a2950fe32b03d3855ff", null ],
+    [ "dAsmblModel", "structBaSpaCho_1_1ComputationModel.html#a2d7486587f7eafb5575d4d28a05199e9", null ],
+    [ "dPotrfModel", "structBaSpaCho_1_1ComputationModel.html#a0649aa7c5b43d61b08cac6d8d2cbe957", null ],
+    [ "dSygeModel", "structBaSpaCho_1_1ComputationModel.html#a23c70e20b233a15447cdf11001d1f09e", null ],
+    [ "dTrsmModel", "structBaSpaCho_1_1ComputationModel.html#aeb3c6101949ea37816d52c7755c33bb9", null ],
+    [ "potrfEst", "structBaSpaCho_1_1ComputationModel.html#a19b85fedd652d3023fc5b22ff50ed917", null ],
+    [ "potrfModel", "structBaSpaCho_1_1ComputationModel.html#a7fd8d4124bfd52eb6554d84976173868", null ],
+    [ "sygeEst", "structBaSpaCho_1_1ComputationModel.html#a9f6d0cfc8c78f4e9a694a2428942becd", null ],
+    [ "sygeLinEst", "structBaSpaCho_1_1ComputationModel.html#a7ff9ea8b4362449e4f1b5b5fd5a2c132", null ],
+    [ "sygeLinModel", "structBaSpaCho_1_1ComputationModel.html#af7aabddd393d84f4a662b78b23609329", null ],
+    [ "sygeModel", "structBaSpaCho_1_1ComputationModel.html#ac846d2ea504eded6ae408106cb6d2eff", null ],
+    [ "trsmEst", "structBaSpaCho_1_1ComputationModel.html#ad2f659f1bf13ebde8445e0bc0bffbe77", null ],
+    [ "trsmModel", "structBaSpaCho_1_1ComputationModel.html#ad55e5b566fcfcaaeaa698327fafa4acc", null ],
+    [ "asmblParams", "structBaSpaCho_1_1ComputationModel.html#a2bc5aa4fa252a851b8f07d62ab8b5d0c", null ],
+    [ "model_Cuda117_2080Ti", "structBaSpaCho_1_1ComputationModel.html#a5cbb497219d9439b9cce8df57fde8f57", null ],
+    [ "model_OpenBlas_i7_1185g7", "structBaSpaCho_1_1ComputationModel.html#a5a2d9d318ecf5b695c150246dc91c5b5", null ],
+    [ "potrfParams", "structBaSpaCho_1_1ComputationModel.html#aeffe0aaa5461892266747b12c5a8e674", null ],
+    [ "sygeParams", "structBaSpaCho_1_1ComputationModel.html#a1fb434f7a87cccf929e90ad2de1b7209", null ],
+    [ "trsmParams", "structBaSpaCho_1_1ComputationModel.html#aa0c7432ee05bdec5f50ed21bf94d7c86", null ]
+];

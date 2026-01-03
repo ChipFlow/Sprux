@@ -1,0 +1,38 @@
+var annotated_dup =
+[
+    [ "BaSpaCho", "namespaceBaSpaCho.html", [
+      [ "Batch", "structBaSpaCho_1_1Batch.html", "structBaSpaCho_1_1Batch" ],
+      [ "Batch< std::vector< T * > >", "structBaSpaCho_1_1Batch_3_01std_1_1vector_3_01T_01_5_01_4_01_4.html", "structBaSpaCho_1_1Batch_3_01std_1_1vector_3_01T_01_5_01_4_01_4" ],
+      [ "BlasNumericCtx", "structBaSpaCho_1_1BlasNumericCtx.html", "structBaSpaCho_1_1BlasNumericCtx" ],
+      [ "BlasOps", "structBaSpaCho_1_1BlasOps.html", "structBaSpaCho_1_1BlasOps" ],
+      [ "BlasSolveCtx", "structBaSpaCho_1_1BlasSolveCtx.html", "structBaSpaCho_1_1BlasSolveCtx" ],
+      [ "BlasSymbolicCtx", "structBaSpaCho_1_1BlasSymbolicCtx.html", "structBaSpaCho_1_1BlasSymbolicCtx" ],
+      [ "CoalescedAccessor", "structBaSpaCho_1_1CoalescedAccessor.html", "structBaSpaCho_1_1CoalescedAccessor" ],
+      [ "CoalescedBlockMatrixSkel", "structBaSpaCho_1_1CoalescedBlockMatrixSkel.html", "structBaSpaCho_1_1CoalescedBlockMatrixSkel" ],
+      [ "ComputationModel", "structBaSpaCho_1_1ComputationModel.html", "structBaSpaCho_1_1ComputationModel" ],
+      [ "CpuBaseNumericCtx", "structBaSpaCho_1_1CpuBaseNumericCtx.html", "structBaSpaCho_1_1CpuBaseNumericCtx" ],
+      [ "CpuBaseSolveCtx", "structBaSpaCho_1_1CpuBaseSolveCtx.html", "structBaSpaCho_1_1CpuBaseSolveCtx" ],
+      [ "CpuBaseSymbolicCtx", "structBaSpaCho_1_1CpuBaseSymbolicCtx.html", "structBaSpaCho_1_1CpuBaseSymbolicCtx" ],
+      [ "CpuBaseSymElimCtx", "structBaSpaCho_1_1CpuBaseSymElimCtx.html", "structBaSpaCho_1_1CpuBaseSymElimCtx" ],
+      [ "DefaultSyncOps", "structBaSpaCho_1_1DefaultSyncOps.html", "structBaSpaCho_1_1DefaultSyncOps" ],
+      [ "EliminationTree", "structBaSpaCho_1_1EliminationTree.html", "structBaSpaCho_1_1EliminationTree" ],
+      [ "NumericCtx", "structBaSpaCho_1_1NumericCtx.html", "structBaSpaCho_1_1NumericCtx" ],
+      [ "NumericCtxBase", "structBaSpaCho_1_1NumericCtxBase.html", "structBaSpaCho_1_1NumericCtxBase" ],
+      [ "Ops", "structBaSpaCho_1_1Ops.html", "structBaSpaCho_1_1Ops" ],
+      [ "OpStat", "structBaSpaCho_1_1OpStat.html", "structBaSpaCho_1_1OpStat" ],
+      [ "PermutedCoalescedAccessor", "structBaSpaCho_1_1PermutedCoalescedAccessor.html", "structBaSpaCho_1_1PermutedCoalescedAccessor" ],
+      [ "Settings", "structBaSpaCho_1_1Settings.html", "structBaSpaCho_1_1Settings" ],
+      [ "SimpleNumericCtx", "structBaSpaCho_1_1SimpleNumericCtx.html", "structBaSpaCho_1_1SimpleNumericCtx" ],
+      [ "SimpleOps", "structBaSpaCho_1_1SimpleOps.html", "structBaSpaCho_1_1SimpleOps" ],
+      [ "SimpleSolveCtx", "structBaSpaCho_1_1SimpleSolveCtx.html", "structBaSpaCho_1_1SimpleSolveCtx" ],
+      [ "SimpleSymbolicCtx", "structBaSpaCho_1_1SimpleSymbolicCtx.html", "structBaSpaCho_1_1SimpleSymbolicCtx" ],
+      [ "SolveCtx", "structBaSpaCho_1_1SolveCtx.html", "structBaSpaCho_1_1SolveCtx" ],
+      [ "SolveCtxBase", "structBaSpaCho_1_1SolveCtxBase.html", "structBaSpaCho_1_1SolveCtxBase" ],
+      [ "Solver", "classBaSpaCho_1_1Solver.html", "classBaSpaCho_1_1Solver" ],
+      [ "SparseStructure", "structBaSpaCho_1_1SparseStructure.html", "structBaSpaCho_1_1SparseStructure" ],
+      [ "SymbolicCtx", "structBaSpaCho_1_1SymbolicCtx.html", "structBaSpaCho_1_1SymbolicCtx" ],
+      [ "SymElimCtx", "structBaSpaCho_1_1SymElimCtx.html", "structBaSpaCho_1_1SymElimCtx" ]
+    ] ],
+    [ "DevMirror", "structDevMirror.html", "structDevMirror" ],
+    [ "DevPtrMirror", "structDevPtrMirror.html", "structDevPtrMirror" ]
+];
