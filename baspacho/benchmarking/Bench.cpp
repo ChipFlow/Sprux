@@ -25,6 +25,10 @@
 #include "baspacho/baspacho/MetalDefs.h"
 #endif
 
+#ifdef BASPACHO_USE_WEBGPU
+#include "baspacho/baspacho/WebGPUDefs.h"
+#endif
+
 #ifdef BASPACHO_HAVE_CHOLMOD
 #include "BenchCholmod.h"
 #endif
@@ -459,6 +463,55 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            return retv;
          }},
 #endif  // BASPACHO_USE_METAL
+#ifdef BASPACHO_USE_WEBGPU
+        {"4_BaSpaCho_WebGPU",
+         [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
+            bool collectStats) -> BenchResults {
+           // WebGPU only supports float precision
+           auto startAnalysis = hrc::now();
+           Settings settings = {.findSparseEliminationRanges = true, .backend = BackendWebGPU};
+           SolverPtr solver = createSolver(settings, prob.paramSize, prob.sparseStruct);
+           if (verbose || collectStats) {
+             solver->enableStats();
+           }
+           double analysisTime = tdelta(hrc::now() - startAnalysis).count();
+
+           // Generate float data (WebGPU is float-only)
+           vector<float> data = randomData<float>(solver->dataSize(), -1.0f, 1.0f, 37);
+           solver->skel().damp(data, float(0), float(solver->order() * 1.2f));
+
+           double factorTime;
+           map<int64_t, double> solveTimes;
+
+           WebGPUMirror<float> dataGpu(data);
+           auto startFactor = hrc::now();
+           solver->factor(dataGpu.ptr());
+           factorTime = tdelta(hrc::now() - startFactor).count();
+
+           for (int64_t nRHS : nRHSs) {
+             vector<float> vecData = randomData<float>(nRHS * solver->order(), -1.0f, 1.0f, 38);
+             WebGPUMirror<float> vecDataGpu(vecData);
+
+             // heat up
+             solver->solve(dataGpu.ptr(), vecDataGpu.ptr(), solver->order(), nRHS);
+
+             auto startSolve = hrc::now();
+             solver->solve(dataGpu.ptr(), vecDataGpu.ptr(), solver->order(), nRHS);
+             solveTimes[nRHS] = tdelta(hrc::now() - startSolve).count();
+           }
+
+           if (verbose) {
+             solver->printStats();
+             cout << "sparse elim ranges: " << printVec(solver->sparseEliminationRanges()) << endl;
+           }
+
+           BenchResults retv;
+           retv.analysisTime = analysisTime;
+           retv.factorTime = factorTime;
+           retv.solveTimes = solveTimes;
+           return retv;
+         }},
+#endif  // BASPACHO_USE_WEBGPU
 };
 
 struct BenchmarkSettings {
