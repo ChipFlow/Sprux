@@ -313,6 +313,11 @@ map<string, function<SparseProblem(int64_t)>> problemGenerators = {
        SparseMatGenerator gen = SparseMatGenerator::genFlat(2000, 0.03, seed);
        return matGenToSparseProblem(gen, 2, 5);
      }},  //
+    {"13_FLAT_size=10000_fill=0.002_bsize=3",
+     [](int64_t seed) -> SparseProblem {
+       SparseMatGenerator gen = SparseMatGenerator::genFlat(10000, 0.002, seed);
+       return matGenToSparseProblem(gen, 3, 3);
+     }},  //
 
     // random entries + schur
     {"20_FLAT+SCHUR_size=1000_fill=0.1_bsize=3_schursize=50000_schurfill=0.02",

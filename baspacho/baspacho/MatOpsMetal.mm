@@ -322,12 +322,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Use row-major (matches CpuBaseNumericCtx)
+      // Use CPU Eigen for all sizes - MPS Cholesky has too much overhead
+      // The potrf is called many times for small diagonal blocks and the
+      // MPS dispatch + sync overhead dominates any GPU acceleration benefit.
+      // The main GPU acceleration comes from gemm/syrk in saveSyrkGemm.
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
       Eigen::Map<MatRMaj> matA(data + offA, n, n);
       Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
-
       if (llt.info() != Eigen::Success) {
         fprintf(stderr, "Metal potrf: Cholesky failed\n");
       }
@@ -338,7 +339,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
-      // Use row-major for B, column-major for A (matches CpuBaseNumericCtx)
+      // Use CPU Eigen - MPS triangular solve has too much dispatch overhead
+      // for the many small operations in sparse Cholesky
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
