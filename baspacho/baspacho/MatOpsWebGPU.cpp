@@ -362,11 +362,13 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
+      // Copy to mutable ColMajor for triangular solve
+      Eigen::Map<const MatRMaj> matLRMaj(diagBlock, lumpSize, lumpSize);
+      MatCMaj matL = matLRMaj;
+
       for (int rhs = 0; rhs < nRHS; rhs++) {
         float* v = C + lumpStart + ldc * rhs;
         Eigen::Map<Eigen::VectorXf> vecV(v, lumpSize);
-        Eigen::Map<const MatCMaj> matL(diagBlock, lumpSize, lumpSize);
-        // Use Lower triangular view on const map (avoid transpose on const)
         vecV = matL.template triangularView<Eigen::Lower>().solve(vecV);
       }
     }
@@ -386,10 +388,13 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
+      // Copy to mutable ColMajor for triangular solve
+      Eigen::Map<const MatRMaj> matLRMaj(diagBlock, lumpSize, lumpSize);
+      MatCMaj matL = matLRMaj;
+
       for (int rhs = 0; rhs < nRHS; rhs++) {
         float* v = C + lumpStart + ldc * rhs;
         Eigen::Map<Eigen::VectorXf> vecV(v, lumpSize);
-        Eigen::Map<const MatCMaj> matL(diagBlock, lumpSize, lumpSize);
         vecV = matL.template triangularView<Eigen::Upper>().solve(vecV);
       }
     }
@@ -411,11 +416,12 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
 
   virtual void solveL(const float* data, int64_t offset, int64_t n, float* C, int64_t offC,
                       int64_t ldc) override {
-    // CPU fallback
+    // CPU fallback - copy to ColMajor for Eigen triangular solve
     using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
-    Eigen::Map<const MatRMaj> matL(data + offset, n, n);
+    Eigen::Map<const MatRMaj> matLRMaj(data + offset, n, n);
+    MatCMaj matL = matLRMaj;  // Copy to ColMajor
     Eigen::Map<MatCMaj> matC(C + offC, n, nRHS);
 
     matC = matL.template triangularView<Eigen::Lower>().solve(matC);
@@ -423,11 +429,12 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
 
   virtual void solveLt(const float* data, int64_t offset, int64_t n, float* C, int64_t offC,
                        int64_t ldc) override {
-    // CPU fallback
+    // CPU fallback - copy to ColMajor for Eigen triangular solve
     using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
-    Eigen::Map<const MatRMaj> matL(data + offset, n, n);
+    Eigen::Map<const MatRMaj> matLRMaj(data + offset, n, n);
+    MatCMaj matL = matLRMaj;  // Copy to ColMajor
     Eigen::Map<MatCMaj> matC(C + offC, n, nRHS);
 
     // L^T * x = b is equivalent to (L^T).solve(b) = Upper triangular solve
