@@ -366,7 +366,8 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
         float* v = C + lumpStart + ldc * rhs;
         Eigen::Map<Eigen::VectorXf> vecV(v, lumpSize);
         Eigen::Map<const MatCMaj> matL(diagBlock, lumpSize, lumpSize);
-        matL.template triangularView<Eigen::Upper>().transpose().solveInPlace(vecV);
+        // Use Lower triangular view on const map (avoid transpose on const)
+        vecV = matL.template triangularView<Eigen::Lower>().solve(vecV);
       }
     }
   }
@@ -389,7 +390,7 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
         float* v = C + lumpStart + ldc * rhs;
         Eigen::Map<Eigen::VectorXf> vecV(v, lumpSize);
         Eigen::Map<const MatCMaj> matL(diagBlock, lumpSize, lumpSize);
-        matL.template triangularView<Eigen::Upper>().solveInPlace(vecV);
+        vecV = matL.template triangularView<Eigen::Upper>().solve(vecV);
       }
     }
   }
@@ -417,7 +418,7 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
     Eigen::Map<const MatRMaj> matL(data + offset, n, n);
     Eigen::Map<MatCMaj> matC(C + offC, n, nRHS);
 
-    matL.template triangularView<Eigen::Lower>().solveInPlace(matC);
+    matC = matL.template triangularView<Eigen::Lower>().solve(matC);
   }
 
   virtual void solveLt(const float* data, int64_t offset, int64_t n, float* C, int64_t offC,
@@ -429,7 +430,8 @@ struct WebGPUSolveCtx<float> : SolveCtx<float> {
     Eigen::Map<const MatRMaj> matL(data + offset, n, n);
     Eigen::Map<MatCMaj> matC(C + offC, n, nRHS);
 
-    matL.template triangularView<Eigen::Lower>().transpose().solveInPlace(matC);
+    // L^T * x = b is equivalent to (L^T).solve(b) = Upper triangular solve
+    matC = matL.template triangularView<Eigen::Upper>().solve(matC);
   }
 
   virtual void gemv(const float* data, int64_t offset, int64_t nRows, int64_t nCols, const float* A,
