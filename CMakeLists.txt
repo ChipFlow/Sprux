@@ -185,6 +185,10 @@ if(BASPACHO_USE_WEBGPU)
   set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(TINT_BUILD_CMD_TOOLS OFF CACHE BOOL "" FORCE)
 
+  # Disable -Werror to allow builds with different compiler versions
+  set(DAWN_WERROR OFF CACHE BOOL "" FORCE)
+  set(TINT_BUILD_WERROR OFF CACHE BOOL "" FORCE)
+
   # Disable backends we don't need (keeps build smaller)
   set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
   set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
