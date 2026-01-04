@@ -139,11 +139,13 @@ struct MetalOps : Ops {
   }
 };
 
-// Helper to dispatch a Metal compute kernel
-static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
+// Helper to dispatch a Metal compute kernel using shared command buffer
+static void dispatchKernel(id<MTLComputePipelineState> pipeline,
                            void (^encodeBlock)(id<MTLComputeCommandEncoder>), NSUInteger numThreads) {
   @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    // Use shared command buffer for batching
+    id<MTLCommandBuffer> cmdBuf =
+        (__bridge id<MTLCommandBuffer>)MetalContext::instance().getCommandBuffer();
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
 
     [encoder setComputePipelineState:pipeline];
@@ -158,8 +160,7 @@ static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState
 
     [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
     [encoder endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    // No commit - batched in shared command buffer, committed on synchronize()
   }
 }
 
@@ -193,7 +194,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (numSpans <= 0) return;
 
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
@@ -248,7 +249,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                 "factor_lumps_kernel_float");
 
         dispatchKernel(
-            sym.commandQueue, pipeline,
+            pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
                           offset:0
@@ -282,7 +283,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                 "sparse_elim_straight_kernel_float");
 
         dispatchKernel(
-            sym.commandQueue, pipeline,
+            pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
                           offset:0
@@ -322,16 +323,38 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Use CPU Eigen for all sizes - MPS Cholesky has too much overhead
-      // The potrf is called many times for small diagonal blocks and the
-      // MPS dispatch + sync overhead dominates any GPU acceleration benefit.
-      // The main GPU acceleration comes from gemm/syrk in saveSyrkGemm.
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      Eigen::Map<MatRMaj> matA(data + offA, n, n);
-      Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
-      if (llt.info() != Eigen::Success) {
-        fprintf(stderr, "Metal potrf: Cholesky failed\n");
+      // Find the MTLBuffer for data
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::potrf: data buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      // MPS Cholesky - fully async, batched with other GPU ops
+      MPSMatrixDescriptor* descA =
+          [MPSMatrixDescriptor matrixDescriptorWithRows:n
+                                                columns:n
+                                               rowBytes:n * sizeof(float)
+                                               dataType:MPSDataTypeFloat32];
+
+      MPSMatrix* mpsA = [[MPSMatrix alloc] initWithBuffer:dataBuffer
+                                                   offset:dataBaseOffset + offA * sizeof(float)
+                                               descriptor:descA];
+
+      MPSMatrixDecompositionCholesky* cholesky =
+          [[MPSMatrixDecompositionCholesky alloc] initWithDevice:sym.device
+                                                           lower:YES
+                                                           order:n];
+
+      // Use shared command buffer for batching
+      id<MTLCommandBuffer> cmdBuf =
+          (__bridge id<MTLCommandBuffer>)MetalContext::instance().getCommandBuffer();
+      [cholesky encodeToCommandBuffer:cmdBuf
+                         sourceMatrix:mpsA
+                         resultMatrix:mpsA
+                               status:nil];
+      // No commit - batched in shared command buffer, committed on synchronize()
     }
   }
 
@@ -339,15 +362,55 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
-      // Use CPU Eigen - MPS triangular solve has too much dispatch overhead
-      // for the many small operations in sparse Cholesky
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+      // Find the MTLBuffer for data
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::trsm: data buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
 
-      // col-major's upper = (row-major's lower).transpose()
-      Eigen::Map<const MatCMaj> matA(data + offA, n, n);
-      Eigen::Map<MatRMaj> matB(data + offB, k, n);
-      matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
+      // MPS triangular solve - fully async
+      // Solve: B = B * L^{-T} where L is lower triangular at offA
+      // B is at offB with dimensions (k rows, n cols)
+      MPSMatrixDescriptor* descL =
+          [MPSMatrixDescriptor matrixDescriptorWithRows:n
+                                                columns:n
+                                               rowBytes:n * sizeof(float)
+                                               dataType:MPSDataTypeFloat32];
+
+      MPSMatrixDescriptor* descB =
+          [MPSMatrixDescriptor matrixDescriptorWithRows:k
+                                                columns:n
+                                               rowBytes:n * sizeof(float)
+                                               dataType:MPSDataTypeFloat32];
+
+      MPSMatrix* mpsL = [[MPSMatrix alloc] initWithBuffer:dataBuffer
+                                                   offset:dataBaseOffset + offA * sizeof(float)
+                                               descriptor:descL];
+      MPSMatrix* mpsB = [[MPSMatrix alloc] initWithBuffer:dataBuffer
+                                                   offset:dataBaseOffset + offB * sizeof(float)
+                                               descriptor:descB];
+
+      // Solve X * L^T = B (right side, transpose of lower triangular)
+      MPSMatrixSolveTriangular* solve =
+          [[MPSMatrixSolveTriangular alloc] initWithDevice:sym.device
+                                                     right:YES
+                                                     upper:NO
+                                                 transpose:YES
+                                                      unit:NO
+                                                     order:n
+                                          numberOfRightHandSides:k
+                                                     alpha:1.0];
+
+      // Use shared command buffer for batching
+      id<MTLCommandBuffer> cmdBuf =
+          (__bridge id<MTLCommandBuffer>)MetalContext::instance().getCommandBuffer();
+      [solve encodeToCommandBuffer:cmdBuf
+                      sourceMatrix:mpsL
+               rightHandSideMatrix:mpsB
+                    solutionMatrix:mpsB];
+      // No commit - batched in shared command buffer, committed on synchronize()
     }
   }
 
@@ -424,10 +487,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                                                       alpha:1.0
                                                        beta:0.0];
 
-        id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
+        // Use shared command buffer for batching
+        id<MTLCommandBuffer> cmdBuf =
+            (__bridge id<MTLCommandBuffer>)MetalContext::instance().getCommandBuffer();
         [gemm encodeToCommandBuffer:cmdBuf leftMatrix:mpsB rightMatrix:mpsA resultMatrix:mpsC];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // No commit - batched in shared command buffer, committed on synchronize()
       } else {
         // Use Eigen for small matrices (lower overhead)
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -481,7 +545,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       int64_t startRow = (srcColDataOffset > 0) ? sym.skel.chainRowsTillEnd[srcColDataOffset - 1] : 0;
 
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBytes:&numBlockRows length:sizeof(int64_t) atIndex:0];
             [encoder setBytes:&numBlockCols length:sizeof(int64_t) atIndex:1];
@@ -552,7 +616,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       int64_t nRHS64 = nRHS;
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -597,7 +661,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       int64_t nRHS64 = nRHS;
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -697,7 +761,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       int64_t nRHS64 = nRHS;
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)
@@ -776,7 +840,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       int64_t nRHS64 = nRHS;
       dispatchKernel(
-          sym.commandQueue, pipeline,
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)

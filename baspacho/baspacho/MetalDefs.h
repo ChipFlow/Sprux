@@ -86,6 +86,9 @@ class MetalContext {
   // Wait for all GPU operations to complete
   void synchronize();
 
+  // Get the shared command buffer for batching operations
+  void* getCommandBuffer();  // Returns id<MTLCommandBuffer>
+
   // Get a compute pipeline state for a kernel function
   void* getPipelineState(const char* functionName);  // Returns id<MTLComputePipelineState>
 
