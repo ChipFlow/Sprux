@@ -115,14 +115,32 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y libopenblas-dev cmake build-essential \
-          libvulkan-dev vulkan-tools ninja-build python3
+          libvulkan-dev vulkan-tools ninja-build python3 git
+
+    - name: Cache Dawn source
+      uses: actions/cache@v4
+      id: cache-dawn-src
+      with:
+        path: dawn-src
+        key: dawn-src-chromium-6904-v1
+
+    - name: Prefetch Dawn
+      if: steps.cache-dawn-src.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth 1 --branch chromium/6904 https://dawn.googlesource.com/dawn dawn-src
+        cd dawn-src
+        # Fetch dependencies using Dawn's script
+        cp scripts/standalone.gclient .gclient
+        gclient sync --shallow || python3 tools/fetch_dawn_dependencies.py || true
 
     - name: Cache Dawn build
       uses: actions/cache@v4
-      id: cache-dawn
+      id: cache-dawn-build
       with:
-        path: build/_deps/dawn-build
-        key: dawn-linux-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+        path: build/_deps
+        key: dawn-build-linux-${{ hashFiles('dawn-src/.git/HEAD') }}-v1
+        restore-keys: |
+          dawn-build-linux-
 
     - name: Configure CMake
       run: |
@@ -133,7 +151,8 @@ jobs:
           -DBASPACHO_USE_OPENCL=OFF \
           -DBASPACHO_USE_WEBGPU=ON \
           -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=OFF
+          -DBASPACHO_BUILD_EXAMPLES=OFF \
+          -DFETCHCONTENT_SOURCE_DIR_DAWN=${{ github.workspace }}/dawn-src
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
