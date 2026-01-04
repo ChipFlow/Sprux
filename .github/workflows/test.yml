@@ -115,7 +115,8 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y libopenblas-dev cmake build-essential \
-          libvulkan-dev vulkan-tools ninja-build python3 git
+          libvulkan-dev vulkan-tools ninja-build python3 git \
+          libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
     - name: Cache Dawn source
       uses: actions/cache@v4
