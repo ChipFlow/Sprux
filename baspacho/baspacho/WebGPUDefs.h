@@ -88,6 +88,9 @@ class WebGPUContext {
   // Submit a command buffer
   void submit(wgpu::CommandBuffer commandBuffer);
 
+  // Process pending callbacks (needed for async operations)
+  void processEvents();
+
  private:
   WebGPUContext();
   ~WebGPUContext();

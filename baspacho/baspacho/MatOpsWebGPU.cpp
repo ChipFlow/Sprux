@@ -154,8 +154,10 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
       // Cholesky on span diagonal
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       Eigen::Map<MatRMaj> matA(spanDiag, spanSize, lumpSize);
-      auto subBlock = matA.block(0, 0, spanSize, spanSize);
-      Eigen::LLT<Eigen::Ref<Eigen::MatrixXf>> llt(subBlock);
+      // Extract square block, factor, and copy back
+      Eigen::MatrixXf subBlock = matA.block(0, 0, spanSize, spanSize);
+      Eigen::LLT<Eigen::MatrixXf> llt(subBlock);
+      matA.block(0, 0, spanSize, spanSize) = llt.matrixL();
     }
   }
 
@@ -179,7 +181,9 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
       float* diagBlock = data + dataPtr;
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       Eigen::Map<MatRMaj> matA(diagBlock, lumpSize, lumpSize);
-      Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
+      MatRMaj tempMat = matA;
+      Eigen::LLT<MatRMaj> llt(tempMat);
+      matA = llt.matrixL();
 
       // Below-diagonal solve
       int64_t gatheredStart = sym.skel.boardColPtr[l];
@@ -213,11 +217,13 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
     // CPU fallback using Eigen
     using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     Eigen::Map<MatRMaj> matA(data + offA, n, n);
-    Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
+    MatRMaj tempMat = matA;
+    Eigen::LLT<MatRMaj> llt(tempMat);
 
     if (llt.info() != Eigen::Success) {
       fprintf(stderr, "WebGPU potrf: Cholesky failed\n");
     }
+    matA = llt.matrixL();
   }
 
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
@@ -524,7 +530,7 @@ NumericCtxBase* WebGPUSymbolicCtx::createNumericCtxForType(type_index tIdx, int6
     return new WebGPUNumericCtx<double>(*this, tempBufSize, skel.numSpans());
   }
 
-  BASPACHO_CHECK(false) << "Unsupported type for WebGPU numeric context";
+  throw std::runtime_error("Unsupported type for WebGPU numeric context");
   return nullptr;
 }
 
@@ -540,7 +546,7 @@ SolveCtxBase* WebGPUSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS
     return new WebGPUSolveCtx<double>(*this, nRHS);
   }
 
-  BASPACHO_CHECK(false) << "Unsupported type for WebGPU solve context";
+  throw std::runtime_error("Unsupported type for WebGPU solve context");
   return nullptr;
 }
 

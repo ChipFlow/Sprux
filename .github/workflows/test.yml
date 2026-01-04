@@ -148,6 +148,7 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DCMAKE_CXX_FLAGS="-Wno-attributes -Wno-dangling-pointer -Wno-pessimizing-move -Wno-redundant-move -Wno-return-type" \
           -DBASPACHO_USE_CUBLAS=OFF \
           -DBASPACHO_USE_METAL=OFF \
           -DBASPACHO_USE_OPENCL=OFF \
