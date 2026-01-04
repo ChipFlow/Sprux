@@ -153,10 +153,11 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
 
       // Cholesky on span diagonal
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
       Eigen::Map<MatRMaj> matA(spanDiag, spanSize, lumpSize);
-      // Extract square block, factor, and copy back
-      Eigen::MatrixXf subBlock = matA.block(0, 0, spanSize, spanSize);
-      Eigen::LLT<Eigen::MatrixXf> llt(subBlock);
+      // Extract square block to ColMajor, factor, and copy back
+      MatCMaj subBlock = matA.block(0, 0, spanSize, spanSize);
+      Eigen::LLT<MatCMaj> llt(subBlock);
       matA.block(0, 0, spanSize, spanSize) = llt.matrixL();
     }
   }
@@ -180,9 +181,10 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
       // Cholesky on diagonal block
       float* diagBlock = data + dataPtr;
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
       Eigen::Map<MatRMaj> matA(diagBlock, lumpSize, lumpSize);
-      MatRMaj tempMat = matA;
-      Eigen::LLT<MatRMaj> llt(tempMat);
+      MatCMaj tempMat = matA;  // Copy to ColMajor for LLT
+      Eigen::LLT<MatCMaj> llt(tempMat);
       matA = llt.matrixL();
 
       // Below-diagonal solve
@@ -216,9 +218,10 @@ struct WebGPUNumericCtx<float> : NumericCtx<float> {
 
     // CPU fallback using Eigen
     using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
     Eigen::Map<MatRMaj> matA(data + offA, n, n);
-    MatRMaj tempMat = matA;
-    Eigen::LLT<MatRMaj> llt(tempMat);
+    MatCMaj tempMat = matA;  // Copy to ColMajor for LLT
+    Eigen::LLT<MatCMaj> llt(tempMat);
 
     if (llt.info() != Eigen::Success) {
       fprintf(stderr, "WebGPU potrf: Cholesky failed\n");
