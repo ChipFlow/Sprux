@@ -46,46 +46,38 @@ void WebGPUContext::initDevice() {
   instance_ = wgpu::CreateInstance(&instanceDesc);
   wgpuCHECK(instance_ != nullptr, "Failed to create WebGPU instance");
 
-  // Request adapter synchronously using CallbackInfo2
+  // Request adapter synchronously using polling
   wgpu::RequestAdapterOptions adapterOpts{};
   adapterOpts.powerPreference = wgpu::PowerPreference::HighPerformance;
 
   bool adapterReceived = false;
   wgpu::Adapter receivedAdapter;
+  std::pair<bool*, wgpu::Adapter*> adapterUserData(&adapterReceived, &receivedAdapter);
 
-  wgpu::RequestAdapterCallbackInfo2 adapterCallbackInfo{};
-  adapterCallbackInfo.mode = wgpu::CallbackMode::WaitAnyOnly;
-  adapterCallbackInfo.callback = [](WGPURequestAdapterStatus status,
-                                    WGPUAdapter adapter,
-                                    WGPUStringView message,
-                                    void* userdata1,
-                                    void* userdata2) {
-    auto* received = static_cast<bool*>(userdata1);
-    auto* adapterPtr = static_cast<wgpu::Adapter*>(userdata2);
-    if (status == WGPURequestAdapterStatus_Success) {
-      *received = true;
-      *adapterPtr = wgpu::Adapter::Acquire(adapter);
-    } else {
-      fprintf(stderr, "WebGPU: Failed to get adapter: %.*s\n",
-              static_cast<int>(message.length), message.data ? message.data : "unknown error");
-      *received = false;
-    }
-  };
-  adapterCallbackInfo.userdata1 = &adapterReceived;
-  adapterCallbackInfo.userdata2 = &receivedAdapter;
+  instance_.RequestAdapter(
+      &adapterOpts,
+      [](WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* userdata) {
+        auto* data = reinterpret_cast<std::pair<bool*, wgpu::Adapter*>*>(userdata);
+        if (status == WGPURequestAdapterStatus_Success) {
+          *data->first = true;
+          *data->second = wgpu::Adapter::Acquire(adapter);
+        } else {
+          fprintf(stderr, "WebGPU: Failed to get adapter: %.*s\n",
+                  static_cast<int>(message.length), message.data ? message.data : "unknown error");
+          *data->first = false;
+        }
+      },
+      &adapterUserData);
 
-  wgpu::Future adapterFuture = instance_.RequestAdapter(&adapterOpts, adapterCallbackInfo);
-
-  // Wait for adapter
-  wgpu::InstanceWaitStatus waitStatus =
-      instance_.WaitAny(adapterFuture, std::numeric_limits<uint64_t>::max());
-  wgpuCHECK(waitStatus == wgpu::InstanceWaitStatus::Success, "Failed to wait for adapter");
-  wgpuCHECK(adapterReceived, "Adapter callback not received");
+  // Poll until adapter is received
+  while (!adapterReceived) {
+    instance_.ProcessEvents();
+  }
 
   adapter_ = receivedAdapter;
   wgpuCHECK(adapter_ != nullptr, "Failed to get WebGPU adapter");
 
-  // Request device synchronously using CallbackInfo2
+  // Request device synchronously using polling
   wgpu::DeviceDescriptor deviceDesc{};
   deviceDesc.label = "BaSpaCho Device";
 
@@ -96,55 +88,29 @@ void WebGPUContext::initDevice() {
   deviceDesc.requiredFeatureCount = requiredFeatures.size();
   deviceDesc.requiredFeatures = requiredFeatures.data();
 
-  // Set device lost callback
-  deviceDesc.SetDeviceLostCallback(
-      wgpu::CallbackMode::AllowSpontaneous,
-      [](const wgpu::Device& device, wgpu::DeviceLostReason reason, WGPUStringView message) {
-        (void)device;
-        fprintf(stderr, "WebGPU device lost: reason=%d, message=%.*s\n",
-                static_cast<int>(reason),
-                static_cast<int>(message.length), message.data ? message.data : "unknown");
-      });
-
-  // Set uncaptured error callback
-  deviceDesc.SetUncapturedErrorCallback(
-      [](const wgpu::Device& device, wgpu::ErrorType type, WGPUStringView message) {
-        (void)device;
-        fprintf(stderr, "WebGPU error: type=%d, message=%.*s\n",
-                static_cast<int>(type),
-                static_cast<int>(message.length), message.data ? message.data : "unknown");
-      });
-
   bool deviceReceived = false;
   wgpu::Device receivedDevice;
+  std::pair<bool*, wgpu::Device*> deviceUserData(&deviceReceived, &receivedDevice);
 
-  wgpu::RequestDeviceCallbackInfo2 deviceCallbackInfo{};
-  deviceCallbackInfo.mode = wgpu::CallbackMode::WaitAnyOnly;
-  deviceCallbackInfo.callback = [](WGPURequestDeviceStatus status,
-                                   WGPUDevice device,
-                                   WGPUStringView message,
-                                   void* userdata1,
-                                   void* userdata2) {
-    auto* received = static_cast<bool*>(userdata1);
-    auto* devicePtr = static_cast<wgpu::Device*>(userdata2);
-    if (status == WGPURequestDeviceStatus_Success) {
-      *received = true;
-      *devicePtr = wgpu::Device::Acquire(device);
-    } else {
-      fprintf(stderr, "WebGPU: Failed to get device: %.*s\n",
-              static_cast<int>(message.length), message.data ? message.data : "unknown error");
-      *received = false;
-    }
-  };
-  deviceCallbackInfo.userdata1 = &deviceReceived;
-  deviceCallbackInfo.userdata2 = &receivedDevice;
+  adapter_.RequestDevice(
+      &deviceDesc,
+      [](WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void* userdata) {
+        auto* data = reinterpret_cast<std::pair<bool*, wgpu::Device*>*>(userdata);
+        if (status == WGPURequestDeviceStatus_Success) {
+          *data->first = true;
+          *data->second = wgpu::Device::Acquire(device);
+        } else {
+          fprintf(stderr, "WebGPU: Failed to get device: %.*s\n",
+                  static_cast<int>(message.length), message.data ? message.data : "unknown error");
+          *data->first = false;
+        }
+      },
+      &deviceUserData);
 
-  wgpu::Future deviceFuture = adapter_.RequestDevice(&deviceDesc, deviceCallbackInfo);
-
-  // Wait for device
-  waitStatus = instance_.WaitAny(deviceFuture, std::numeric_limits<uint64_t>::max());
-  wgpuCHECK(waitStatus == wgpu::InstanceWaitStatus::Success, "Failed to wait for device");
-  wgpuCHECK(deviceReceived, "Device callback not received");
+  // Poll until device is received
+  while (!deviceReceived) {
+    instance_.ProcessEvents();
+  }
 
   device_ = receivedDevice;
   wgpuCHECK(device_ != nullptr, "Failed to get WebGPU device");
