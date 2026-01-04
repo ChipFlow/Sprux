@@ -38,6 +38,13 @@ jobs:
     - name: Run Tests
       run: ctest --test-dir build --output-on-failure -j"$(nproc)"
 
+    - name: Run Benchmarks (CPU/BLAS)
+      run: |
+        echo "## Benchmark Results (Linux CPU/BLAS)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ./build/baspacho/benchmarking/bench -n 3 -R "FLAT_size=1000|GRID_size=100x100" -S "BLAS" 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
   # Linux with OpenCL (CPU backend via pocl)
   linux-opencl:
     runs-on: ubuntu-latest
@@ -59,13 +66,20 @@ jobs:
           -DBASPACHO_USE_METAL=OFF \
           -DBASPACHO_USE_OPENCL=ON \
           -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=OFF
+          -DBASPACHO_BUILD_EXAMPLES=ON
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
 
     - name: Run Tests (OpenCL via PoCL CPU backend)
       run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+    - name: Run Benchmarks (CPU/BLAS baseline)
+      run: |
+        echo "## Benchmark Results (Linux OpenCL build - BLAS baseline)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ./build/baspacho/benchmarking/bench -n 3 -R "FLAT_size=1000|GRID_size=100x100" -S "BLAS" 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
 
   # macOS CPU tests (Metal requires actual hardware)
   macos-cpu:
@@ -103,6 +117,13 @@ jobs:
 
     - name: Run CPU Tests (Metal tests require real GPU)
       run: ctest --test-dir build -E "Metal|Cuda|OpenCL" --output-on-failure -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run Benchmarks (macOS CPU/BLAS)
+      run: |
+        echo "## Benchmark Results (macOS Apple Silicon CPU/BLAS)" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        ./build/baspacho/benchmarking/bench -n 3 -R "FLAT_size=1000|GRID_size=100x100" -S "BLAS" 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
 
   # Linux with WebGPU (via Dawn with SwiftShader for software Vulkan)
   linux-webgpu:
@@ -154,7 +175,7 @@ jobs:
           -DBASPACHO_USE_OPENCL=OFF \
           -DBASPACHO_USE_WEBGPU=ON \
           -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=OFF \
+          -DBASPACHO_BUILD_EXAMPLES=ON \
           -DFETCHCONTENT_SOURCE_DIR_DAWN=${{ github.workspace }}/dawn-src
 
     - name: Build
@@ -164,3 +185,12 @@ jobs:
       run: |
         # Run WebGPU tests - may need software rendering
         ctest --test-dir build -R WebGPU --output-on-failure -j1 || echo "WebGPU tests may fail without GPU - checking build succeeded"
+
+    - name: Run Benchmarks (WebGPU via SwiftShader)
+      run: |
+        echo "## Benchmark Results (WebGPU via SwiftShader software renderer)" >> $GITHUB_STEP_SUMMARY
+        echo "Note: Software rendering is much slower than real GPU" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        # Run a smaller benchmark set due to software rendering speed
+        ./build/baspacho/benchmarking/bench -n 2 -R "FLAT_size=1000" -S "WebGPU|BLAS" 2>&1 | tee -a $GITHUB_STEP_SUMMARY || echo "WebGPU benchmark requires GPU"
+        echo '```' >> $GITHUB_STEP_SUMMARY
