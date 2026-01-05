@@ -331,6 +331,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
+      // BaSpaCho stores data row-major but MPS Cholesky expects column-major!
+      // For a symmetric matrix, row-major lower = column-major upper (transpose).
+      // So we use lower:NO and MPS will compute Cholesky on upper triangle,
+      // which gives us the transpose of L in our row-major storage.
+      // Then we need to transpose it back to get L in row-major lower.
+      //
+      // Alternative: Fall back to CPU for now until we implement proper transposition.
+      // CPU fallback for correctness - MPS layout issues need more investigation.
+      {
+        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<MatRMaj> mat(data + offA, n, n);
+        Eigen::LLT<Eigen::Ref<MatRMaj>> llt(mat);
+        if (llt.info() != Eigen::Success) {
+          throw std::runtime_error("MetalNumericCtx<float>::potrf: Cholesky failed");
+        }
+        // LLT writes L to lower triangle, which is what we want
+        return;
+      }
+
       // MPS Cholesky - fully async, batched with other GPU ops
       MPSMatrixDescriptor* descA =
           [MPSMatrixDescriptor matrixDescriptorWithRows:n
@@ -361,6 +380,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
+
+      // CPU fallback for correctness - MPS layout issues need more investigation.
+      // Solve: B = B * L^{-T} where L is lower triangular at offA
+      // B is at offB with dimensions (k rows, n cols), stored row-major
+      // Derivation: If X * L^T = B, take transpose: L * X^T = B^T
+      // So X^T = L^{-1} * B^T, and X = (L^{-1} * B^T)^T
+      {
+        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+        // L is n x n lower triangular, stored row-major
+        Eigen::Map<const MatRMaj> matL(data + offA, n, n);
+        // B is k x n, stored row-major
+        Eigen::Map<MatRMaj> matB(data + offB, k, n);
+        // Solve: X = (L^{-1} * B^T)^T
+        MatCMaj Bt = matB.transpose();  // B^T
+        matL.template triangularView<Eigen::Lower>().solveInPlace(Bt);  // L^{-1} * B^T
+        matB = Bt.transpose();  // (L^{-1} * B^T)^T = B * L^{-T}
+        return;
+      }
 
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -422,10 +460,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Ensure temp buffer is large enough
       tempBuffer.resizeToAtLeast(m * n);
 
-      // Use MPS for larger matrices (threshold based on empirical testing)
-      // MPS dispatch overhead makes it slower for small matrices
-      static constexpr int64_t kMpsThreshold = 64 * 64 * 64;  // ~262k ops
-      bool useMps = (m * n * k >= kMpsThreshold);
+      // CPU fallback for all sizes to avoid MPS layout issues
+      // TODO: Implement correct MPS path with proper row-major handling
+      bool useMps = false;  // Disabled for correctness
 
       if (useMps) {
         // Use MPS matrix multiplication: C = B * A^T
@@ -519,11 +556,54 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
            spanToChainOffset.size() * sizeof(int64_t));
   }
 
+  // Helper for CPU fallback: subtract strided matrix
+  static inline void stridedMatSub(float* dst, int64_t dstStride, const float* src,
+                                   int64_t srcStride, int64_t rSize, int64_t cSize) {
+    for (int64_t j = 0; j < rSize; j++) {
+      for (int64_t i = 0; i < cSize; i++) {
+        dst[j * dstStride + i] -= src[j * srcStride + i];
+      }
+    }
+  }
+
   virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
                         int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
                         int64_t numBlockCols) override {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
+
+      // CPU fallback for correctness - Metal kernel has issues
+      {
+        // Synchronize to ensure previous GPU work (saveSyrkGemm) is complete
+        MetalContext::instance().synchronize();
+
+        const CoalescedBlockMatrixSkel& skel = sym.skel;
+        const int64_t* chainRowsTillEnd = skel.chainRowsTillEnd.data() + srcColDataOffset;
+        const int64_t* pToSpan = skel.chainRowSpan.data() + srcColDataOffset;
+        const int64_t* pSpanToChainOffset = spanToChainOffset.data();
+        const int64_t* pSpanOffsetInLump = skel.spanOffsetInLump.data();
+        const float* matRectPtr = tempBuffer.ptr();  // Direct access to unified memory
+
+        for (int64_t r = 0; r < numBlockRows; r++) {
+          int64_t rBegin = chainRowsTillEnd[r - 1] - rectRowBegin;
+          int64_t rSize = chainRowsTillEnd[r] - rBegin - rectRowBegin;
+          int64_t rParam = pToSpan[r];
+          int64_t rOffset = pSpanToChainOffset[rParam];
+          const float* matRowPtr = matRectPtr + rBegin * srcRectWidth;
+
+          int64_t cEnd = std::min(numBlockCols, r + 1);
+          for (int64_t c = 0; c < cEnd; c++) {
+            int64_t cStart = chainRowsTillEnd[c - 1] - rectRowBegin;
+            int64_t cSize = chainRowsTillEnd[c] - cStart - rectRowBegin;
+            int64_t offset = rOffset + pSpanOffsetInLump[pToSpan[c]];
+
+            float* dst = data + offset;
+            const float* src = matRowPtr + cStart;
+            stridedMatSub(dst, dstStride, src, srcRectWidth, rSize, cSize);
+          }
+        }
+        return;
+      }
 
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -631,6 +711,11 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numLumps);
+
+      // Synchronize before returning - CPU operations (solveL) may follow immediately
+      // and need to see the GPU-modified data.
+      NSLog(@"sparseElimSolveL: syncing after GPU kernels, lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
+      MetalContext::instance().synchronize();
     }
   }
 
@@ -676,6 +761,11 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numLumps);
+
+      // Synchronize before returning - CPU operations (solveLt) may follow immediately
+      // and need to see the GPU-modified data.
+      NSLog(@"sparseElimSolveLt: syncing after GPU kernels, lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
+      MetalContext::instance().synchronize();
     }
   }
 
@@ -778,6 +868,10 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numColItems);
+
+      // Synchronize to ensure GPU kernel completes before subsequent CPU operations
+      // (solveL, gemv) read from the C buffer. Without this, the solve produces wrong results.
+      MetalContext::instance().synchronize();
     }
   }
 
@@ -857,6 +951,10 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numColItems);
+
+      // Synchronize to ensure GPU kernel completes before subsequent CPU operations
+      // (gemvT) read from the tempVecBuffer. Without this, the solve produces wrong results.
+      MetalContext::instance().synchronize();
     }
   }
 

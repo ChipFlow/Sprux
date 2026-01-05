@@ -198,6 +198,8 @@ void MetalMirror<T>::get(std::vector<T>& vec) const {
   if (!ptr_ || vec.empty()) {
     return;
   }
+  // Synchronize to ensure all GPU commands have completed before reading
+  MetalContext::instance().synchronize();
   // Copy data from shared buffer (directly accessible from CPU)
   memcpy(vec.data(), ptr_, vec.size() * sizeof(T));
 }
