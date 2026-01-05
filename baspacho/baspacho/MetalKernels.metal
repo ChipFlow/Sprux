@@ -331,20 +331,32 @@ kernel void sparse_elim_straight_kernel_float(
     int64_t jDataPtr = chainData[colStart + dj];
 
     // Find target block in factored matrix
-    int64_t iLump = spanToLump[iSpan];
-    int64_t iSpanOff = spanOffsetInLump[iSpan];
-    int64_t jSpanOff = spanOffsetInLump[jSpan];
-    int64_t targetLumpSize = lumpStart[iLump + 1] - lumpStart[iLump];
+    // The target is in the column corresponding to iSpan's lump
+    int64_t targetLump = spanToLump[iSpan];
+    int64_t targetSpanOffsetInLump = spanOffsetInLump[iSpan];
+    int64_t targetStartPtr = chainColPtr[targetLump];  // includes diagonal
+    int64_t targetEndPtr = chainColPtr[targetLump + 1];
+    int64_t targetLumpSize = lumpStart[targetLump + 1] - lumpStart[targetLump];
 
-    // Target chain lookup would go here...
-    // For now, this is a skeleton - full implementation requires chain lookup
+    // Use bisect to find jSpan in the target column's chain
+    // The target block (j,i) is where we write the elimination result
+    int64_t targetPos = bisect(chainRowSpan + targetStartPtr, targetEndPtr - targetStartPtr, jSpan);
+    int64_t jiDataPtr = chainData[targetStartPtr + targetPos];
 
-    // Perform elimination: target -= src_i * src_j^T (with atomics)
-    device float* srcI = data + iDataPtr;
-    device float* srcJ = data + jDataPtr;
+    // Source blocks (row-major, stride = lumpSize)
+    device float* srcI = data + iDataPtr;  // iSize rows x lumpSize cols
+    device float* srcJ = data + jDataPtr;  // jSize rows x lumpSize cols
 
-    // This is simplified - actual implementation needs target pointer lookup
-    // locked_sub_product(target, targetStride, srcI, iSize, lumpSize, lumpSize, srcJ, jSize, lumpSize);
+    // Target block with offset for span position within the lump
+    // Target is jSize rows x iSize cols, stride = targetLumpSize
+    device float* target = data + jiDataPtr + targetSpanOffsetInLump;
+
+    // Perform elimination: target -= srcJ * srcI^T (with atomics)
+    // srcJ is (jSize x lumpSize), srcI is (iSize x lumpSize)
+    // Result is (jSize x iSize)
+    locked_sub_product_float(target, int(targetLumpSize),
+                             srcJ, int(jSize), int(lumpSize), int(lumpSize),
+                             srcI, int(iSize), int(lumpSize));
 }
 
 // ============================================================================
