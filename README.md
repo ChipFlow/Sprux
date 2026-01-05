@@ -107,7 +107,6 @@ precision, use the CPU backend (`BackendFast`) or CUDA (`BackendCuda`).
 The Metal backend uses:
 - Custom Metal compute shaders for sparse operations (factor_lumps, sparse_elim, assemble)
 - Metal Performance Shaders (MPS) for dense matrix multiply on large matrices
-- Eigen/Accelerate for Cholesky factorization (potrf) and triangular solve (trsm)
 
 ### Backend Selection
 BaSpaCho supports automatic backend selection with `BackendAuto`:
