@@ -23,10 +23,12 @@ class MetalContextImpl {
   id<MTLDevice> device;
   id<MTLCommandQueue> commandQueue;
   id<MTLLibrary> library;
+  id<MTLCommandBuffer> currentCommandBuffer;  // Shared command buffer for batching
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelineCache;
   std::mutex pipelineMutex;
+  std::mutex cmdBufMutex;
 
-  MetalContextImpl() {
+  MetalContextImpl() : currentCommandBuffer(nil) {
     @autoreleasepool {
       // Get the default Metal device
       device = MTLCreateSystemDefaultDevice();
@@ -58,10 +60,34 @@ class MetalContextImpl {
 
   ~MetalContextImpl() {
     @autoreleasepool {
+      if (currentCommandBuffer) {
+        [currentCommandBuffer commit];
+        [currentCommandBuffer waitUntilCompleted];
+        currentCommandBuffer = nil;
+      }
       pipelineCache.clear();
       library = nil;
       commandQueue = nil;
       device = nil;
+    }
+  }
+
+  // Get the shared command buffer, creating one if needed
+  id<MTLCommandBuffer> getCommandBuffer() {
+    std::lock_guard<std::mutex> lock(cmdBufMutex);
+    if (!currentCommandBuffer) {
+      currentCommandBuffer = [commandQueue commandBuffer];
+    }
+    return currentCommandBuffer;
+  }
+
+  // Commit and wait for the current command buffer, then reset
+  void synchronize() {
+    std::lock_guard<std::mutex> lock(cmdBufMutex);
+    if (currentCommandBuffer) {
+      [currentCommandBuffer commit];
+      [currentCommandBuffer waitUntilCompleted];
+      currentCommandBuffer = nil;
     }
   }
 
@@ -108,11 +134,11 @@ void* MetalContext::commandQueue() { return (__bridge void*)impl->commandQueue; 
 void* MetalContext::library() { return (__bridge void*)impl->library; }
 
 void MetalContext::synchronize() {
-  @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
-  }
+  impl->synchronize();
+}
+
+void* MetalContext::getCommandBuffer() {
+  return (__bridge void*)impl->getCommandBuffer();
 }
 
 void* MetalContext::getPipelineState(const char* functionName) {
@@ -172,6 +198,8 @@ void MetalMirror<T>::get(std::vector<T>& vec) const {
   if (!ptr_ || vec.empty()) {
     return;
   }
+  // Synchronize to ensure all GPU commands have completed before reading
+  MetalContext::instance().synchronize();
   // Copy data from shared buffer (directly accessible from CPU)
   memcpy(vec.data(), ptr_, vec.size() * sizeof(T));
 }

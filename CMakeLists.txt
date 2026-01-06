@@ -160,6 +160,47 @@ if(BASPACHO_USE_OPENCL)
   add_compile_definitions(BASPACHO_USE_OPENCL)
 endif()
 
+# WebGPU (via Dawn for portable GPU compute)
+set(BASPACHO_USE_WEBGPU OFF CACHE BOOL "If on, WebGPU support is enabled (via Dawn)")
+
+if(BASPACHO_USE_WEBGPU)
+  message("${Cyan}==============================[ WebGPU ]=================================${ColourReset}")
+
+  # Include FetchContent early (before main FetchContent section)
+  include(FetchContent)
+
+  # Use FetchContent to get Dawn
+  FetchContent_Declare(
+    dawn
+    GIT_REPOSITORY https://dawn.googlesource.com/dawn
+    GIT_TAG chromium/6904
+    GIT_SHALLOW TRUE
+  )
+
+  # Configure Dawn build options
+  set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(DAWN_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(TINT_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(TINT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(TINT_BUILD_CMD_TOOLS OFF CACHE BOOL "" FORCE)
+
+  # Disable -Werror to allow builds with different compiler versions
+  set(DAWN_WERROR OFF CACHE BOOL "" FORCE)
+  set(TINT_BUILD_WERROR OFF CACHE BOOL "" FORCE)
+
+  # Disable backends we don't need (keeps build smaller)
+  set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
+  set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
+  set(DAWN_ENABLE_NULL OFF CACHE BOOL "" FORCE)
+
+  message("* Fetching Dawn (WebGPU implementation)...")
+  FetchContent_MakeAvailable(dawn)
+
+  message("* Dawn Source: ${dawn_SOURCE_DIR}")
+  add_compile_definitions(BASPACHO_USE_WEBGPU)
+endif()
+
 # BLAS. a few possibilities are:
 # * ATLAS
 # * OpenBLAS
