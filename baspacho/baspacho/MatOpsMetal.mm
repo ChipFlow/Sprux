@@ -944,12 +944,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
+      const MetalSymElimCtx& elim = *pElim;
 
       int64_t numLumps = lumpsEnd - lumpsBegin;
       if (numLumps <= 0) return;
 
-      // Use CPU fallback for debugging
-      bool useCpuFallback = true;
+      // Use CPU fallback - GPU path available but may need tuning
+      bool useCpuFallback = false;  // GPU path now available
       if (useCpuFallback) {
         MetalContext::instance().synchronize();  // Ensure GPU work is done
         sparseElimSolveLt_cpu(data, lumpsBegin, lumpsEnd, C, ldc);
@@ -967,28 +968,79 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      // Dispatch diagonal solve kernel
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-              "sparseElim_diagSolveLt_float");
+      // Step 1: Dispatch update kernel (below-diagonal contributions)
+      // Updates read from rows below (already solved in dense backward pass)
+      // and write to C at each lump (disjoint ranges, so no conflicts)
+      if (elim.numElimRows > 0) {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_updateLt_float");
 
-      int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                        offset:0
-                       atIndex:1];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
-            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
-            [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
-            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
-            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-          },
-          (NSUInteger)numLumps);
+        int64_t nRHS64 = nRHS;
+        int64_t spanRowBegin = elim.spanRowBegin;
+        int64_t numElimRows = elim.numElimRows;
+        dispatchKernel(
+            pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devRowPtr.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devColLump.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devChainColOrd.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:5];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:6];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:7];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:8];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:10];
+              [encoder setBytes:&spanRowBegin length:sizeof(int64_t) atIndex:11];
+              [encoder setBytes:&numElimRows length:sizeof(int64_t) atIndex:12];
+            },
+            (NSUInteger)numElimRows);
+      }
+
+      // Step 2: Dispatch diagonal solve kernel (after updates complete)
+      {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_diagSolveLt_float");
+
+        int64_t nRHS64 = nRHS;
+        dispatchKernel(
+            pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+            },
+            (NSUInteger)numLumps);
+      }
 
       // Synchronize before returning - CPU operations may follow immediately
       // and need to see the GPU-modified data.
