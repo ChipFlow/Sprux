@@ -36,18 +36,22 @@ struct MetalSymElimCtx : SymElimCtx {
   MetalSymElimCtx() {}
   virtual ~MetalSymElimCtx() override {}
 
-  // GPU data for elimination
+  // GPU data for factor elimination kernel
   int64_t numColumns;
   int64_t numBlockPairs;
   MetalMirror<int64_t> makeBlockPairEnumStraight;
 
-  // CPU data for sparse elimination solve (same as CpuBaseSymElimCtx)
-  // Needed for the below-diagonal update loop in solve
+  // CPU data for sparse elimination solve update loop (same as CpuBaseSymElimCtx)
   int64_t spanRowBegin;
-  int64_t maxBufferSize;
-  std::vector<int64_t> rowPtr;       // row data pointer (CSR format)
+  std::vector<int64_t> rowPtr;       // CSR row pointers
   std::vector<int64_t> colLump;      // column lump for each entry
-  std::vector<int64_t> chainColOrd;  // order in column chain elements
+  std::vector<int64_t> chainColOrd;  // chain column order for each entry
+
+  // GPU data for sparse elimination solve update kernels
+  int64_t numElimRows;
+  MetalMirror<int64_t> devRowPtr;       // GPU mirror of rowPtr
+  MetalMirror<int64_t> devColLump;      // GPU mirror of colLump
+  MetalMirror<int64_t> devChainColOrd;  // GPU mirror of chainColOrd
 };
 
 // Forward declarations
@@ -146,6 +150,14 @@ struct MetalSymbolicCtx : SymbolicCtx {
       }
     }
     rewindVec(elim->rowPtr);  // Restore starting positions after filling
+
+    // Store elimination metadata for GPU kernels
+    elim->numElimRows = numSpanRows;
+
+    // Load elimination context data to GPU buffers
+    elim->devRowPtr.load(elim->rowPtr);
+    elim->devColLump.load(elim->colLump);
+    elim->devChainColOrd.load(elim->chainColOrd);
 
     return SymElimCtxPtr(elim);
   }
@@ -795,11 +807,10 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       if (numLumps <= 0) return;
 
       // Use CPU fallback - includes both diagonal solve and update loop
-      bool useCpuFallback = true;
+      bool useCpuFallback = false;  // GPU path now available
       if (useCpuFallback) {
         MetalContext::instance().synchronize();  // Ensure GPU work is done
         sparseElimSolveL_cpu(elim, data, lumpsBegin, lumpsEnd, C, ldc);
-        NSLog(@"sparseElimSolveL CPU: lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
         return;
       }
 
@@ -814,32 +825,80 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      // Dispatch diagonal solve kernel
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-              "sparseElim_diagSolveL_float");
+      // Step 1: Dispatch diagonal solve kernel
+      {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_diagSolveL_float");
 
-      int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                        offset:0
-                       atIndex:1];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
-            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
-            [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
-            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
-            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-          },
-          (NSUInteger)numLumps);
+        int64_t nRHS64 = nRHS;
+        dispatchKernel(
+            pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+            },
+            (NSUInteger)numLumps);
+      }
 
-      // Synchronize before returning - CPU operations (solveL) may follow immediately
+      // Step 2: Dispatch update kernel (below-diagonal contributions)
+      if (elim.numElimRows > 0) {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparseElim_updateL_float");
+
+        int64_t nRHS64 = nRHS;
+        int64_t spanRowBegin = elim.spanRowBegin;
+        int64_t numElimRows = elim.numElimRows;
+        dispatchKernel(
+            pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devRowPtr.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devColLump.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devChainColOrd.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:5];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:6];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:7];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:8];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:10];
+              [encoder setBytes:&spanRowBegin length:sizeof(int64_t) atIndex:11];
+              [encoder setBytes:&numElimRows length:sizeof(int64_t) atIndex:12];
+            },
+            (NSUInteger)numElimRows);
+      }
+
+      // Synchronize before returning - CPU operations may follow immediately
       // and need to see the GPU-modified data.
-      NSLog(@"sparseElimSolveL: syncing after GPU kernels, lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
       MetalContext::instance().synchronize();
     }
   }
@@ -894,7 +953,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       if (useCpuFallback) {
         MetalContext::instance().synchronize();  // Ensure GPU work is done
         sparseElimSolveLt_cpu(data, lumpsBegin, lumpsEnd, C, ldc);
-        NSLog(@"sparseElimSolveLt CPU: lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
         return;
       }
 
@@ -932,9 +990,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           },
           (NSUInteger)numLumps);
 
-      // Synchronize before returning - CPU operations (solveLt) may follow immediately
+      // Synchronize before returning - CPU operations may follow immediately
       // and need to see the GPU-modified data.
-      NSLog(@"sparseElimSolveLt: syncing after GPU kernels, lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
       MetalContext::instance().synchronize();
     }
   }

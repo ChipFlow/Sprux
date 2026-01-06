@@ -503,6 +503,134 @@ kernel void assembleVecT_kernel_float(
 }
 
 // ============================================================================
+// Solve kernels: sparseElim_updateL (below-diagonal updates for forward solve)
+// One thread per elimination entry
+// Computes: Q[rowSpan] -= block * C[lump]
+// ============================================================================
+kernel void sparseElim_updateL_float(
+    constant int64_t* rowPtr [[buffer(0)]],        // CSR row pointers for elimination
+    constant int64_t* colLump [[buffer(1)]],       // Column lump for each entry
+    constant int64_t* chainColOrd [[buffer(2)]],   // Chain column order for each entry
+    constant int64_t* spanStart [[buffer(3)]],     // Span start indices
+    constant int64_t* lumpStart [[buffer(4)]],     // Lump start indices
+    constant int64_t* chainColPtr [[buffer(5)]],   // Chain column pointers
+    constant int64_t* chainData [[buffer(6)]],     // Chain data pointers
+    constant float* data [[buffer(7)]],            // Factor data (read-only)
+    device float* C [[buffer(8)]],                 // Solution vector (read-write)
+    constant int64_t& ldc [[buffer(9)]],           // Leading dimension of C
+    constant int64_t& nRHS [[buffer(10)]],         // Number of right-hand sides
+    constant int64_t& spanRowBegin [[buffer(11)]], // First span row in this elimination
+    constant int64_t& numElimRows [[buffer(12)]],  // Number of elimination rows
+    uint tid [[thread_position_in_grid]])
+{
+    // Each thread processes one elimination row
+    if (int64_t(tid) >= numElimRows) {
+        return;
+    }
+
+    int64_t sRel = tid;
+    int64_t rowSpan = sRel + spanRowBegin;
+    int64_t rowStart = spanStart[rowSpan];
+    int64_t rowSize = spanStart[rowSpan + 1] - rowStart;
+
+    // Process all entries in this elimination row
+    for (int64_t i = rowPtr[sRel]; i < rowPtr[sRel + 1]; i++) {
+        int64_t lump = colLump[i];
+        int64_t colOrd = chainColOrd[i];
+        int64_t ptr = chainColPtr[lump] + colOrd;
+        int64_t lumpStartIdx = lumpStart[lump];
+        int64_t lumpSize = lumpStart[lump + 1] - lumpStartIdx;
+        int64_t blockPtr = chainData[ptr];
+
+        // block is rowSize x lumpSize (row-major)
+        constant float* block = data + blockPtr;
+
+        // matC is at C + lumpStartIdx, size lumpSize x nRHS (column-major, stride ldc)
+        // matQ is at C + rowStart, size rowSize x nRHS (column-major, stride ldc)
+        // Compute: matQ -= block * matC
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t r = 0; r < rowSize; r++) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < lumpSize; k++) {
+                    // block[r, k] in row-major = block[r * lumpSize + k]
+                    // C[lumpStartIdx + k, rhs] in col-major = C[lumpStartIdx + k + rhs * ldc]
+                    sum += block[r * lumpSize + k] * C[lumpStartIdx + k + rhs * ldc];
+                }
+                // Q[rowStart + r, rhs] -= sum
+                // Use atomic to handle potential races from different elimination entries
+                device atomic_uint* addr = (device atomic_uint*)&C[rowStart + r + rhs * ldc];
+                atomicSubFloat(addr, sum);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Solve kernels: sparseElim_updateLt (below-diagonal updates for backward solve)
+// One thread per elimination row
+// Computes: C[lump] -= block^T * Q[rowSpan]
+// ============================================================================
+kernel void sparseElim_updateLt_float(
+    constant int64_t* rowPtr [[buffer(0)]],        // CSR row pointers for elimination
+    constant int64_t* colLump [[buffer(1)]],       // Column lump for each entry
+    constant int64_t* chainColOrd [[buffer(2)]],   // Chain column order for each entry
+    constant int64_t* spanStart [[buffer(3)]],     // Span start indices
+    constant int64_t* lumpStart [[buffer(4)]],     // Lump start indices
+    constant int64_t* chainColPtr [[buffer(5)]],   // Chain column pointers
+    constant int64_t* chainData [[buffer(6)]],     // Chain data pointers
+    constant float* data [[buffer(7)]],            // Factor data (read-only)
+    device float* C [[buffer(8)]],                 // Solution vector (read-write)
+    constant int64_t& ldc [[buffer(9)]],           // Leading dimension of C
+    constant int64_t& nRHS [[buffer(10)]],         // Number of right-hand sides
+    constant int64_t& spanRowBegin [[buffer(11)]], // First span row in this elimination
+    constant int64_t& numElimRows [[buffer(12)]],  // Number of elimination rows
+    uint tid [[thread_position_in_grid]])
+{
+    // Each thread processes one elimination row
+    if (int64_t(tid) >= numElimRows) {
+        return;
+    }
+
+    int64_t sRel = tid;
+    int64_t rowSpan = sRel + spanRowBegin;
+    int64_t rowStart = spanStart[rowSpan];
+    int64_t rowSize = spanStart[rowSpan + 1] - rowStart;
+
+    // Process all entries in this elimination row
+    for (int64_t i = rowPtr[sRel]; i < rowPtr[sRel + 1]; i++) {
+        int64_t lump = colLump[i];
+        int64_t colOrd = chainColOrd[i];
+        int64_t ptr = chainColPtr[lump] + colOrd;
+        int64_t lumpStartIdx = lumpStart[lump];
+        int64_t lumpSize = lumpStart[lump + 1] - lumpStartIdx;
+        int64_t blockPtr = chainData[ptr];
+
+        // block is rowSize x lumpSize (row-major)
+        constant float* block = data + blockPtr;
+
+        // matQ is at C + rowStart, size rowSize x nRHS (column-major, stride ldc)
+        // matC is at C + lumpStartIdx, size lumpSize x nRHS (column-major, stride ldc)
+        // Compute: matC -= block^T * matQ
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t c = 0; c < lumpSize; c++) {
+                float sum = 0.0f;
+                for (int64_t r = 0; r < rowSize; r++) {
+                    // block^T[c, r] = block[r, c] in row-major = block[r * lumpSize + c]
+                    // Q[rowStart + r, rhs] in col-major = C[rowStart + r + rhs * ldc]
+                    sum += block[r * lumpSize + c] * C[rowStart + r + rhs * ldc];
+                }
+                // C[lumpStartIdx + c, rhs] -= sum
+                // Use atomic to handle potential races
+                device atomic_uint* addr = (device atomic_uint*)&C[lumpStartIdx + c + rhs * ldc];
+                atomicSubFloat(addr, sum);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Solve kernels: sparseElim_diagSolveL
 // ============================================================================
 kernel void sparseElim_diagSolveL_float(
