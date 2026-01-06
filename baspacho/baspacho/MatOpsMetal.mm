@@ -36,9 +36,18 @@ struct MetalSymElimCtx : SymElimCtx {
   MetalSymElimCtx() {}
   virtual ~MetalSymElimCtx() override {}
 
+  // GPU data for elimination
   int64_t numColumns;
   int64_t numBlockPairs;
   MetalMirror<int64_t> makeBlockPairEnumStraight;
+
+  // CPU data for sparse elimination solve (same as CpuBaseSymElimCtx)
+  // Needed for the below-diagonal update loop in solve
+  int64_t spanRowBegin;
+  int64_t maxBufferSize;
+  std::vector<int64_t> rowPtr;       // row data pointer (CSR format)
+  std::vector<int64_t> colLump;      // column lump for each entry
+  std::vector<int64_t> chainColOrd;  // order in column chain elements
 };
 
 // Forward declarations
@@ -88,9 +97,8 @@ struct MetalSymbolicCtx : SymbolicCtx {
   virtual SymElimCtxPtr prepareElimination(int64_t lumpsBegin, int64_t lumpsEnd) override {
     MetalSymElimCtx* elim = new MetalSymElimCtx;
 
+    // GPU data: block pair enumeration for sparse elimination kernel
     vector<int64_t> makeStraight(lumpsEnd - lumpsBegin + 1);
-
-    // For each lump, compute number of pairs contributing to elimination
     for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
       int64_t startPtr = skel.chainColPtr[l] + 1;  // skip diag block
       int64_t endPtr = skel.chainColPtr[l + 1];
@@ -98,10 +106,46 @@ struct MetalSymbolicCtx : SymbolicCtx {
       makeStraight[l - lumpsBegin] = n * (n + 1) / 2;
     }
     cumSumVec(makeStraight);
-
     elim->numColumns = lumpsEnd - lumpsBegin;
     elim->numBlockPairs = makeStraight[makeStraight.size() - 1];
     elim->makeBlockPairEnumStraight.load(makeStraight);
+
+    // CPU data: needed for sparse elimination solve update loop (same as CpuBaseSymbolicCtx)
+    int64_t spanRowBegin = skel.lumpToSpan[lumpsEnd];
+    int64_t numSpanRows = skel.spanStart.size() - 1 - spanRowBegin;
+    elim->spanRowBegin = spanRowBegin;
+    elim->rowPtr.assign(numSpanRows + 1, 0);
+
+    // Count entries per row
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      for (int64_t i = skel.chainColPtr[l], iEnd = skel.chainColPtr[l + 1]; i < iEnd; i++) {
+        int64_t s = skel.chainRowSpan[i];
+        if (s < spanRowBegin) {
+          continue;
+        }
+        int64_t sRel = s - spanRowBegin;
+        elim->rowPtr[sRel]++;
+      }
+    }
+    int64_t totNumChains = cumSumVec(elim->rowPtr);
+    elim->colLump.resize(totNumChains);
+    elim->chainColOrd.resize(totNumChains);
+
+    // Fill in column and chain order data (must match CpuBaseSymbolicCtx exactly)
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      for (int64_t iBegin = skel.chainColPtr[l], iEnd = skel.chainColPtr[l + 1], i = iBegin;
+           i < iEnd; i++) {
+        int64_t s = skel.chainRowSpan[i];
+        if (s < spanRowBegin) {
+          continue;
+        }
+        int64_t sRel = s - spanRowBegin;
+        elim->colLump[elim->rowPtr[sRel]] = l;
+        elim->chainColOrd[elim->rowPtr[sRel]] = i - iBegin;
+        elim->rowPtr[sRel]++;  // Post-increment to fill
+      }
+    }
+    rewindVec(elim->rowPtr);  // Restore starting positions after filling
 
     return SymElimCtxPtr(elim);
   }
@@ -340,10 +384,34 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Alternative: Fall back to CPU for now until we implement proper transposition.
       // CPU fallback for correctness - MPS layout issues need more investigation.
       {
+        // CRITICAL: Synchronize to ensure any pending GPU work is complete
+        // before reading data for CPU operations. This ensures cache coherency
+        // on unified memory systems.
+        MetalContext::instance().synchronize();
+
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
         Eigen::Map<MatRMaj> mat(data + offA, n, n);
+
+        // Debug: check the matrix before factorization
+        float diag0 = mat(0, 0);
+        float offdiag = (n > 1) ? mat(1, 0) : 0.0f;
+        static int potrf_count = 0;
+        if (potrf_count < 5 || (potrf_count % 1000 == 0)) {
+          NSLog(@"potrf[%d]: n=%lld, offA=%lld, diag[0]=%.6f, mat[1,0]=%.6f",
+                potrf_count, (long long)n, (long long)offA, diag0, offdiag);
+        }
+        potrf_count++;
+
         Eigen::LLT<Eigen::Ref<MatRMaj>> llt(mat);
         if (llt.info() != Eigen::Success) {
+          // Debug: print more info about the failure
+          NSLog(@"potrf FAILED: n=%lld, offA=%lld, diag[0]=%.6f, llt.info=%d",
+                (long long)n, (long long)offA, diag0, (int)llt.info());
+          // Print first few elements of the matrix
+          NSLog(@"Matrix first row: ");
+          for (int i = 0; i < std::min((int64_t)5, n); ++i) {
+            NSLog(@"  [0,%d]=%.6f", i, mat(0, i));
+          }
           throw std::runtime_error("MetalNumericCtx<float>::potrf: Cholesky failed");
         }
         // LLT writes L to lower triangle, which is what we want
@@ -669,11 +737,71 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
   virtual ~MetalSolveCtx() override {}
 
+  // CPU fallback for sparseElimSolveL - matches MatOpsFast.cpp implementation
+  void sparseElimSolveL_cpu(const MetalSymElimCtx& elim, const float* data, int64_t lumpsBegin,
+                            int64_t lumpsEnd, float* C, int64_t ldc) {
+    using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+    using OuterStridedCMajMatM =
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                   OuterStride>;
+
+    const CoalescedBlockMatrixSkel& skel = sym.skel;
+
+    // Part 1: Diagonal solves for each lump
+    for (int64_t lump = lumpsBegin; lump < lumpsEnd; lump++) {
+      int64_t lumpStart = skel.lumpStart[lump];
+      int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
+      int64_t colStart = skel.chainColPtr[lump];
+      int64_t diagDataPtr = skel.chainData[colStart];
+
+      Eigen::Map<const MatRMaj> diagBlock(data + diagDataPtr, lumpSize, lumpSize);
+      OuterStridedCMajMatM matC(C + lumpStart, lumpSize, nRHS, OuterStride(ldc));
+      diagBlock.template triangularView<Eigen::Lower>().solveInPlace(matC);
+    }
+
+    // Part 2: Below-diagonal updates using elimination context
+    int64_t numElimRows = elim.rowPtr.size() - 1;
+    for (int64_t sRel = 0L; sRel < numElimRows; sRel++) {
+      int64_t rowSpan = sRel + elim.spanRowBegin;
+      int64_t rowSpanStart = skel.spanStart[rowSpan];
+      int64_t rowSpanSize = skel.spanStart[rowSpan + 1] - rowSpanStart;
+      OuterStridedCMajMatM matQ(C + rowSpanStart, rowSpanSize, nRHS, OuterStride(ldc));
+
+      for (int64_t i = elim.rowPtr[sRel], iEnd = elim.rowPtr[sRel + 1]; i < iEnd; i++) {
+        int64_t lump = elim.colLump[i];
+        int64_t lumpStart = skel.lumpStart[lump];
+        int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
+        int64_t chainColOrd = elim.chainColOrd[i];
+
+        int64_t ptr = skel.chainColPtr[lump] + chainColOrd;
+        int64_t blockPtr = skel.chainData[ptr];
+
+        Eigen::Map<const MatRMaj> block(data + blockPtr, rowSpanSize, lumpSize);
+        OuterStridedCMajMatM matC(C + lumpStart, lumpSize, nRHS, OuterStride(ldc));
+        matQ.noalias() -= block * matC;
+      }
+    }
+  }
+
   virtual void sparseElimSolveL(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
+      const MetalSymElimCtx& elim = *pElim;
+
+      int64_t numLumps = lumpsEnd - lumpsBegin;
+      if (numLumps <= 0) return;
+
+      // Use CPU fallback - includes both diagonal solve and update loop
+      bool useCpuFallback = true;
+      if (useCpuFallback) {
+        MetalContext::instance().synchronize();  // Ensure GPU work is done
+        sparseElimSolveL_cpu(elim, data, lumpsBegin, lumpsEnd, C, ldc);
+        NSLog(@"sparseElimSolveL CPU: lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
+        return;
+      }
 
       // Find buffers
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -685,9 +813,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
-
-      int64_t numLumps = lumpsEnd - lumpsBegin;
-      if (numLumps <= 0) return;
 
       // Dispatch diagonal solve kernel
       id<MTLComputePipelineState> pipeline =
@@ -719,11 +844,59 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // CPU fallback for sparseElimSolveLt - matches MatOpsFast.cpp implementation
+  void sparseElimSolveLt_cpu(const float* data, int64_t lumpsBegin, int64_t lumpsEnd, float* C,
+                             int64_t ldc) {
+    using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+    using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+    using OuterStridedCMajMatM =
+        Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                   OuterStride>;
+
+    const CoalescedBlockMatrixSkel& skel = sym.skel;
+
+    for (int64_t lump = lumpsBegin; lump < lumpsEnd; lump++) {
+      int64_t lumpStart = skel.lumpStart[lump];
+      int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
+      int64_t colStart = skel.chainColPtr[lump];
+      int64_t colEnd = skel.chainColPtr[lump + 1];
+      OuterStridedCMajMatM matC(C + lumpStart, lumpSize, nRHS, OuterStride(ldc));
+
+      // Part 1: Below-diagonal updates - done BEFORE diagonal solve
+      for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = skel.chainRowSpan[colPtr];
+        int64_t rowSpanStart = skel.spanStart[rowSpan];
+        int64_t rowSpanSize = skel.spanStart[rowSpan + 1] - rowSpanStart;
+        int64_t blockPtr = skel.chainData[colPtr];
+        Eigen::Map<const MatRMaj> block(data + blockPtr, rowSpanSize, lumpSize);
+        OuterStridedCMajMatM matQ(C + rowSpanStart, rowSpanSize, nRHS, OuterStride(ldc));
+        matC.noalias() -= block.transpose() * matQ;
+      }
+
+      // Part 2: Diagonal solve with L^T (adjoint of lower triangular)
+      int64_t diagDataPtr = skel.chainData[colStart];
+      Eigen::Map<const MatRMaj> diagBlock(data + diagDataPtr, lumpSize, lumpSize);
+      diagBlock.template triangularView<Eigen::Lower>().adjoint().solveInPlace(matC);
+    }
+  }
+
   virtual void sparseElimSolveLt(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
                                  int64_t lumpsEnd, float* C, int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
+
+      int64_t numLumps = lumpsEnd - lumpsBegin;
+      if (numLumps <= 0) return;
+
+      // Use CPU fallback for debugging
+      bool useCpuFallback = true;
+      if (useCpuFallback) {
+        MetalContext::instance().synchronize();  // Ensure GPU work is done
+        sparseElimSolveLt_cpu(data, lumpsBegin, lumpsEnd, C, ldc);
+        NSLog(@"sparseElimSolveLt CPU: lumps %lld-%lld", (long long)lumpsBegin, (long long)lumpsEnd);
+        return;
+      }
 
       // Find buffers
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -735,9 +908,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
-
-      int64_t numLumps = lumpsEnd - lumpsBegin;
-      if (numLumps <= 0) return;
 
       // Dispatch diagonal solve kernel
       id<MTLComputePipelineState> pipeline =
