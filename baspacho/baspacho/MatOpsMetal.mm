@@ -12,6 +12,7 @@
 #include <chrono>
 #include <iostream>
 #include <typeindex>
+#include <unordered_map>
 
 #include <Eigen/Dense>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
@@ -140,8 +141,33 @@ struct MetalOps : Ops {
 };
 
 // Helper to dispatch a Metal compute kernel
+// GPU profiling: set BASPACHO_METAL_PROFILE=1 to log kernel names + GPU times
+static bool metalProfilingEnabled() {
+  static bool enabled = [] {
+    const char* val = getenv("BASPACHO_METAL_PROFILE");
+    return val && std::string(val) == "1";
+  }();
+  return enabled;
+}
+
+// Map pipeline states to their kernel names for profiling output
+static std::unordered_map<const void*, std::string>& pipelineNameMap() {
+  static std::unordered_map<const void*, std::string> map;
+  return map;
+}
+
+static id<MTLComputePipelineState> getProfiledPipeline(const char* name) {
+  auto pipeline =
+      (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(name);
+  if (metalProfilingEnabled()) {
+    pipelineNameMap()[(__bridge const void*)pipeline] = name;
+  }
+  return pipeline;
+}
+
 static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
-                           void (^encodeBlock)(id<MTLComputeCommandEncoder>), NSUInteger numThreads) {
+                           void (^encodeBlock)(id<MTLComputeCommandEncoder>),
+                           NSUInteger numThreads, const char* kernelName = nullptr) {
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -160,8 +186,26 @@ static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState
     [encoder endEncoding];
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
+
+    if (metalProfilingEnabled()) {
+      double gpuTimeMs = ([cmdBuf GPUEndTime] - [cmdBuf GPUStartTime]) * 1000.0;
+      const char* name = kernelName;
+      std::string lookupName;
+      if (!name) {
+        auto it = pipelineNameMap().find((__bridge const void*)pipeline);
+        if (it != pipelineNameMap().end()) {
+          lookupName = it->second;
+          name = lookupName.c_str();
+        }
+      }
+      if (name) {
+        NSLog(@"[GPU] %-45s  threads=%-6lu  gpu=%.3fms",
+              name, (unsigned long)numThreads, gpuTimeMs);
+      }
+    }
   }
 }
+
 
 // Numeric context for float - Metal implementation
 template <>
@@ -185,8 +229,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       size_t dataBaseOffset = bufferInfo.second;
 
       // Get pipeline state for factor_spans_kernel_float
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "factor_spans_kernel_float");
 
       int64_t numSpans = spanEnd - spanBegin;
@@ -468,8 +511,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       size_t dataBaseOffset = bufferInfo.second;
 
       // Get pipeline state
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "assemble_kernel_float");
 
       int64_t numThreads = numBlockRows * numBlockCols;
@@ -525,8 +567,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_getrf_kernel_float");
 
       dispatchKernel(
@@ -563,8 +604,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
       size_t bBaseOffset = bBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_trsmLowerUnit_kernel_float");
 
       dispatchKernel(
@@ -597,8 +637,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
       size_t bBaseOffset = bBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_trsmUpperRight_kernel_float");
 
       dispatchKernel(
@@ -635,8 +674,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t cBaseOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_saveGemm_kernel_float");
 
       int64_t numThreads = m * n;
@@ -678,8 +716,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_applyRowPerm_kernel_float");
 
       dispatchKernel(
@@ -735,8 +772,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       if (numLumps <= 0) return;
 
       // Dispatch diagonal solve kernel
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "sparseElim_diagSolveL_float");
 
       int64_t nRHS64 = nRHS;
@@ -780,8 +816,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       if (numLumps <= 0) return;
 
       // Dispatch diagonal solve kernel
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "sparseElim_diagSolveLt_float");
 
       int64_t nRHS64 = nRHS;
@@ -876,8 +911,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "assembleVec_kernel_float");
 
       // startRow = chainRowsTillEnd[chainColPtr - 1] (element before chain start)
@@ -955,8 +989,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "assembleVecT_kernel_float");
 
       // startRow = chainRowsTillEnd[chainColPtr - 1] (element before chain start)
@@ -1003,8 +1036,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_solveLUnit_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -1039,8 +1071,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_solveU_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -1076,8 +1107,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_applyRowPermVec_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -1111,8 +1141,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_applyRowPermVecInv_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -1146,8 +1175,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataBaseOffset = dataBufferInfo.second;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline =
-          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_gemvDirect_kernel_float");
 
       int64_t nRHS64 = nRHS;

@@ -119,6 +119,44 @@ void* MetalContext::getPipelineState(const char* functionName) {
   return (__bridge void*)impl->getPipelineState(functionName);
 }
 
+bool MetalContext::beginCapture(const char* outputPath) {
+  @autoreleasepool {
+    MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];
+    if (![captureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+      NSLog(@"Metal capture to GPU trace document not supported. "
+            @"Set METAL_CAPTURE_ENABLED=1 environment variable before launching.");
+      return false;
+    }
+
+    // Remove existing trace file if present
+    NSString* path = [NSString stringWithUTF8String:outputPath];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+
+    MTLCaptureDescriptor* descriptor = [[MTLCaptureDescriptor alloc] init];
+    descriptor.captureObject = impl->device;
+    descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+    descriptor.outputURL = [NSURL fileURLWithPath:path];
+
+    NSError* error = nil;
+    if (![captureManager startCaptureWithDescriptor:descriptor error:&error]) {
+      NSLog(@"Failed to start Metal capture: %@", error);
+      return false;
+    }
+    NSLog(@"Metal GPU capture started → %s", outputPath);
+    return true;
+  }
+}
+
+void MetalContext::endCapture() {
+  @autoreleasepool {
+    MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];
+    if ([captureManager isCapturing]) {
+      [captureManager stopCapture];
+      NSLog(@"Metal GPU capture stopped");
+    }
+  }
+}
+
 // MetalMirror template implementation
 template <typename T>
 void MetalMirror<T>::clear() {

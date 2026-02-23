@@ -68,6 +68,16 @@ TEST_RESULT=$?
 
 echo ""
 
+# Profile CUDA LU operations to verify all ops are on GPU
+if [ $TEST_RESULT -eq 0 ] && command -v nsys &> /dev/null; then
+    echo "=== Profiling CUDA LU (Nsight Systems) ==="
+    nsys profile --trace=cuda --stats=true --force-overwrite=true \
+        --output /tmp/cuda_lu_profile \
+        ./baspacho/tests/CudaLUTest --gtest_filter="CudaLU.BlockSparse_double" 2>&1 | \
+        grep -E "cublas|cusolver|Kernel|cudaMemcpy|CUDA API|GPU" || true
+    echo ""
+fi
+
 # Run benchmarks if tests passed
 if [ $TEST_RESULT -eq 0 ]; then
     echo "=== Running Benchmarks ==="

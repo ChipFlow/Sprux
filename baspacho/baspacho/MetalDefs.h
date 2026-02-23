@@ -89,6 +89,12 @@ class MetalContext {
   // Get a compute pipeline state for a kernel function
   void* getPipelineState(const char* functionName);  // Returns id<MTLComputePipelineState>
 
+  // GPU trace capture (for profiling)
+  // Set METAL_CAPTURE_ENABLED=1 env var, then call begin/endCapture
+  // Writes a .gputrace file that can be opened in Xcode for full GPU timeline
+  bool beginCapture(const char* outputPath = "/tmp/baspacho.gputrace");
+  void endCapture();
+
  private:
   MetalContext();
   ~MetalContext();
