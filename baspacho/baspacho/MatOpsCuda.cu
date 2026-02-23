@@ -468,6 +468,22 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const T* data,
                             int64_t offset) override;
 
+  // LU factorization methods
+  virtual int getrf(int64_t m, int64_t n, T* data, int64_t offA, int64_t* pivots) override;
+
+  virtual void trsmLowerUnit(int64_t m, int64_t n, const T* L, int64_t offL, T* B, int64_t offB,
+                              int64_t ldb) override;
+
+  virtual void trsmUpperRight(int64_t m, int64_t n, const T* U, int64_t offU, T* B, int64_t offB,
+                               int64_t ldb) override;
+
+  virtual void saveGemm(int64_t m, int64_t n, int64_t k, const T* L, int64_t offL, int64_t ldL,
+                         const T* U, int64_t offU, int64_t ldU, T* C, int64_t offC,
+                         int64_t ldC) override;
+
+  virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
+                             int64_t numCols) override;
+
   virtual void prepareAssemble(int64_t targetLump) override {
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -587,6 +603,194 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
                           data + offset, k, &beta, devTempBuffer.ptr, m));
 
   sym.gemmCalls++;
+}
+
+// ============ LU NumericCtx implementations ============
+
+// Helper: transpose square matrix in-place on CPU
+template <typename T>
+static void transposeSquareInPlaceCpu(T* mat, int64_t n) {
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t j = i + 1; j < n; j++) {
+      std::swap(mat[i * n + j], mat[j * n + i]);
+    }
+  }
+}
+
+// getrf: CPU fallback - copy D→H, transpose, Eigen LU, transpose back, copy H→D
+template <>
+int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
+                                   int64_t* pivots) {
+  if (m <= 0 || n <= 0) return 0;
+  int64_t size = m * n;
+  vector<double> hostData(size);
+  cuCHECK(cudaMemcpy(hostData.data(), data + offA, size * sizeof(double), cudaMemcpyDeviceToHost));
+
+  // Transpose for col-major compatibility
+  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
+
+  // Use Eigen PartialPivLU (in-place on col-major data)
+  using MatCMaj = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+  Eigen::Map<MatCMaj> matCol(hostData.data(), m, n);
+  Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
+
+  // Transpose back to row-major
+  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
+
+  // Copy result back to device
+  cuCHECK(cudaMemcpy(data + offA, hostData.data(), size * sizeof(double), cudaMemcpyHostToDevice));
+
+  // Extract pivots from Eigen's permutation
+  auto perm = lu.permutationP();
+  auto& indices = perm.indices();
+  vector<int64_t> permVec(m);
+  for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
+  // Convert permutation vector to sequential swap pivots
+  for (int64_t i = 0; i < std::min(m, n); i++) {
+    int64_t j = i;
+    for (int64_t k = i; k < m; k++) {
+      if (permVec[k] == i) { j = k; break; }
+    }
+    pivots[i] = j;
+    if (j != i) std::swap(permVec[i], permVec[j]);
+  }
+  return 0;
+}
+
+template <>
+int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
+                                  int64_t* pivots) {
+  if (m <= 0 || n <= 0) return 0;
+  int64_t size = m * n;
+  vector<float> hostData(size);
+  cuCHECK(cudaMemcpy(hostData.data(), data + offA, size * sizeof(float), cudaMemcpyDeviceToHost));
+
+  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
+
+  using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+  Eigen::Map<MatCMaj> matCol(hostData.data(), m, n);
+  Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
+
+  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
+
+  cuCHECK(cudaMemcpy(data + offA, hostData.data(), size * sizeof(float), cudaMemcpyHostToDevice));
+
+  auto perm = lu.permutationP();
+  auto& indices = perm.indices();
+  vector<int64_t> permVec(m);
+  for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
+  for (int64_t i = 0; i < std::min(m, n); i++) {
+    int64_t j = i;
+    for (int64_t k = i; k < m; k++) {
+      if (permVec[k] == i) { j = k; break; }
+    }
+    pivots[i] = j;
+    if (j != i) std::swap(permVec[i], permVec[j]);
+  }
+  return 0;
+}
+
+// trsmLowerUnit: solve L * X = B, L is m×m unit lower, B is m×n (row-major)
+// Row-major → col-major: CblasRight, CblasUpper, CblasNoTrans, CblasUnit
+template <>
+void CudaNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L, int64_t offL,
+                                            double* B, int64_t offB, int64_t ldb) {
+  double alpha(1.0);
+  cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+                           CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
+}
+
+template <>
+void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL,
+                                           float* B, int64_t offB, int64_t ldb) {
+  float alpha(1.0);
+  cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+                           CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
+}
+
+// trsmUpperRight: solve X * U = B, U is n×n upper, B is m×n (row-major)
+// Row-major → col-major: CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit
+template <>
+void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
+                                             double* B, int64_t offB, int64_t ldb) {
+  double alpha(1.0);
+  cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                           CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
+}
+
+template <>
+void CudaNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
+                                            float* B, int64_t offB, int64_t ldb) {
+  float alpha(1.0);
+  cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
+                           CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
+}
+
+// saveGemm: C -= L * U (row-major)
+// Col-major view: C_cm -= U_cm * L_cm (transposed data, NoTrans, NoTrans)
+template <>
+void CudaNumericCtx<double>::saveGemm(int64_t m, int64_t n, int64_t k, const double* L,
+                                       int64_t offL, int64_t ldL, const double* U, int64_t offU,
+                                       int64_t ldU, double* C, int64_t offC, int64_t ldC) {
+  double alpha(-1.0), beta(1.0);
+  cublasCHECK(cublasDgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
+                           L + offL, ldL, &beta, C + offC, ldC));
+  sym.gemmCalls++;
+}
+
+template <>
+void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const float* L,
+                                      int64_t offL, int64_t ldL, const float* U, int64_t offU,
+                                      int64_t ldU, float* C, int64_t offC, int64_t ldC) {
+  float alpha(-1.0), beta(1.0);
+  cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
+                           L + offL, ldL, &beta, C + offC, ldC));
+  sym.gemmCalls++;
+}
+
+// applyRowPerm: CPU fallback - copy block D→H, apply swaps, copy H→D
+template <>
+void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* data, int64_t offData,
+                                           int64_t ld, int64_t numCols) {
+  // Data is stored col-major from cuBLAS perspective (ld × numCols)
+  // Each column has `ld` elements, we need n rows
+  int64_t copySize = ld * numCols;
+  vector<double> hostData(copySize);
+  cuCHECK(cudaMemcpy(hostData.data(), data + offData, copySize * sizeof(double),
+                      cudaMemcpyDeviceToHost));
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t c = 0; c < numCols; c++) {
+        std::swap(hostData[i + c * ld], hostData[swapRow + c * ld]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(data + offData, hostData.data(), copySize * sizeof(double),
+                      cudaMemcpyHostToDevice));
+}
+
+template <>
+void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData,
+                                          int64_t ld, int64_t numCols) {
+  int64_t copySize = ld * numCols;
+  vector<float> hostData(copySize);
+  cuCHECK(cudaMemcpy(hostData.data(), data + offData, copySize * sizeof(float),
+                      cudaMemcpyDeviceToHost));
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t c = 0; c < numCols; c++) {
+        std::swap(hostData[i + c * ld], hostData[swapRow + c * ld]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(data + offData, hostData.data(), copySize * sizeof(float),
+                      cudaMemcpyHostToDevice));
 }
 
 template <typename T>
@@ -1085,6 +1289,22 @@ struct CudaSolveCtx : SolveCtx<T> {
         sym.devSpanStart.ptr, C, ldc, nRHS, devSolveBuf.ptr, numColItems, Plain{});
   }
 
+  // LU solve methods
+  virtual void solveLUnit(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                           int64_t ldc) override;
+
+  virtual void solveU(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
+                      int64_t ldc) override;
+
+  virtual void applyRowPermVec(const int64_t* pivots, int64_t n, T* vec,
+                                int64_t ldVec) override;
+
+  virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, T* vec,
+                                   int64_t ldVec) override;
+
+  virtual void gemvDirect(const T* data, int64_t offset, int64_t nRows, int64_t nCols, T* vec,
+                           int64_t srcOff, int64_t dstOff, int64_t ldVec, T alpha) override;
+
   const CudaSymbolicCtx& sym;
   int64_t nRHS;
   DevMirror<T> devSolveBuf;
@@ -1178,6 +1398,144 @@ void CudaSolveCtx<float>::gemvT(const float* data, int64_t offM, int64_t nRows, 
   float beta(1.0);
   cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_C, nCols, nRHS, nRows, &alpha,
                           data + offM, nCols, devSolveBuf.ptr, nRHS, &beta, A + offA, lda));
+}
+
+// ============ LU SolveCtx implementations ============
+
+// solveLUnit: solve L * x = b where L is unit lower triangular
+// Row-major lower → col-major upper. Use OP_C to get lower from upper.
+template <>
+void CudaSolveCtx<double>::solveLUnit(const double* data, int64_t offM, int64_t n, double* C,
+                                       int64_t offC, int64_t ldc) {
+  double alpha(1.0);
+  cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_C,
+                           CUBLAS_DIAG_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
+}
+
+template <>
+void CudaSolveCtx<float>::solveLUnit(const float* data, int64_t offM, int64_t n, float* C,
+                                      int64_t offC, int64_t ldc) {
+  float alpha(1.0);
+  cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_C,
+                           CUBLAS_DIAG_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
+}
+
+// solveU: solve U * x = b where U is upper triangular (non-unit)
+// Row-major upper → col-major lower. Use OP_C to get upper from lower.
+template <>
+void CudaSolveCtx<double>::solveU(const double* data, int64_t offM, int64_t n, double* C,
+                                   int64_t offC, int64_t ldc) {
+  double alpha(1.0);
+  cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_C,
+                           CUBLAS_DIAG_NON_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
+}
+
+template <>
+void CudaSolveCtx<float>::solveU(const float* data, int64_t offM, int64_t n, float* C,
+                                  int64_t offC, int64_t ldc) {
+  float alpha(1.0);
+  cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_C,
+                           CUBLAS_DIAG_NON_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
+}
+
+// applyRowPermVec: CPU fallback - copy D→H, apply forward swaps, copy H→D
+template <>
+void CudaSolveCtx<double>::applyRowPermVec(const int64_t* pivots, int64_t n, double* vec,
+                                            int64_t ldVec) {
+  int64_t copySize = ldVec * nRHS;
+  vector<double> hostVec(copySize);
+  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(double), cudaMemcpyDeviceToHost));
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(double), cudaMemcpyHostToDevice));
+}
+
+template <>
+void CudaSolveCtx<float>::applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
+                                           int64_t ldVec) {
+  int64_t copySize = ldVec * nRHS;
+  vector<float> hostVec(copySize);
+  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(float), cudaMemcpyDeviceToHost));
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+// applyRowPermVecInv: CPU fallback - copy D→H, apply reverse swaps, copy H→D
+template <>
+void CudaSolveCtx<double>::applyRowPermVecInv(const int64_t* pivots, int64_t n, double* vec,
+                                               int64_t ldVec) {
+  int64_t copySize = ldVec * nRHS;
+  vector<double> hostVec(copySize);
+  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(double), cudaMemcpyDeviceToHost));
+
+  for (int64_t i = n - 1; i >= 0; i--) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(double), cudaMemcpyHostToDevice));
+}
+
+template <>
+void CudaSolveCtx<float>::applyRowPermVecInv(const int64_t* pivots, int64_t n, float* vec,
+                                              int64_t ldVec) {
+  int64_t copySize = ldVec * nRHS;
+  vector<float> hostVec(copySize);
+  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(float), cudaMemcpyDeviceToHost));
+
+  for (int64_t i = n - 1; i >= 0; i--) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
+      }
+    }
+  }
+
+  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+// gemvDirect: result += alpha * M * x, M is row-major (nRows × nCols)
+// Same pattern as existing gemv but with different source/dest offsets
+template <>
+void CudaSolveCtx<double>::gemvDirect(const double* data, int64_t offset, int64_t nRows,
+                                       int64_t nCols, double* vec, int64_t srcOff, int64_t dstOff,
+                                       int64_t ldVec, double alpha) {
+  double beta(1.0);
+  // Row-major M(nRows×nCols) in col-major is M^T(nCols×nRows)
+  // y += alpha * M * x = alpha * M_cm^T * x → use OP_C
+  cublasCHECK(cublasDgemm(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, nRows, nRHS, nCols, &alpha,
+                           data + offset, nCols, vec + srcOff, ldVec, &beta, vec + dstOff, ldVec));
+}
+
+template <>
+void CudaSolveCtx<float>::gemvDirect(const float* data, int64_t offset, int64_t nRows,
+                                      int64_t nCols, float* vec, int64_t srcOff, int64_t dstOff,
+                                      int64_t ldVec, float alpha) {
+  float beta(1.0);
+  cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_C, CUBLAS_OP_N, nRows, nRHS, nCols, &alpha,
+                           data + offset, nCols, vec + srcOff, ldVec, &beta, vec + dstOff, ldVec));
 }
 
 // solve context, batched version

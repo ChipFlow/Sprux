@@ -23,6 +23,7 @@ add_baspacho_test(CudaSolveTest CudaSolveTest.cpp)
 add_baspacho_test(BatchedCudaFactorTest BatchedCudaFactorTest.cpp)
 add_baspacho_test(BatchedCudaSolveTest BatchedCudaSolveTest.cpp)
 add_baspacho_test(CudaPartialTest CudaPartialTest.cpp)
+add_baspacho_test(CudaLUTest CudaLUTest.cpp)
 endif()
 
 if(BASPACHO_USE_METAL)
