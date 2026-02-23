@@ -67,9 +67,9 @@ jobs:
     - name: Run Tests (OpenCL via PoCL CPU backend)
       run: ctest --test-dir build --output-on-failure -j"$(nproc)"
 
-  # macOS CPU tests (Metal requires actual hardware)
-  macos-cpu:
-    runs-on: macos-14  # Apple Silicon
+  # macOS with Metal GPU tests
+  macos-metal:
+    runs-on: macos-latest-xlarge  # Bare-metal Apple Silicon with GPU access
 
     steps:
     - uses: actions/checkout@v4
@@ -101,5 +101,33 @@ jobs:
         export PATH="${LLVM_PREFIX}/bin:$PATH"
         cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(sysctl -n hw.ncpu)"
 
-    - name: Run CPU Tests (Metal tests require real GPU)
-      run: ctest --test-dir build -E "Metal|Cuda|OpenCL" --output-on-failure -j"$(sysctl -n hw.ncpu)"
+    - name: Run all tests (CPU + Metal GPU)
+      run: ctest --test-dir build --output-on-failure -j"$(sysctl -n hw.ncpu)"
+
+  # CUDA GPU tests on self-hosted NVIDIA runner
+  cuda-gpu:
+    runs-on: [self-hosted, nvidia-runner-1]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DBASPACHO_USE_CUBLAS=ON \
+          -DBASPACHO_USE_METAL=OFF \
+          -DBASPACHO_USE_OPENCL=OFF \
+          -DBASPACHO_BUILD_TESTS=ON \
+          -DBASPACHO_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Run all tests
+      run: ctest --test-dir build --output-on-failure -j"$(nproc)"
