@@ -512,58 +512,36 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return 0;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      int64_t minMN = std::min(m, n);
 
-      // Same transpose workaround as MatOpsFast: transpose before/after so
-      // Eigen's col-major partial pivot LU operates on the correct data.
-      Eigen::Map<MatRMaj> matA(data + offA, m, n);
+      // Ensure pivot buffer is large enough
+      devPivots.resizeToAtLeast(minMN);
 
-      // Transpose in-place (square matrices only, which is the diagonal block case)
-      if (m == n) {
-        for (int64_t i = 0; i < m; i++) {
-          for (int64_t j = i + 1; j < n; j++) {
-            std::swap(data[offA + i * n + j], data[offA + j * n + i]);
-          }
-        }
+      // Find the MTLBuffer for data
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::getrf: data buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
 
-      // Use Eigen's partial pivot LU on the (now col-major-compatible) data
-      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-      Eigen::Map<MatCMaj> matCol(data + offA, m, n);
-      Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_getrf_kernel_float");
 
-      // Transpose back
-      if (m == n) {
-        for (int64_t i = 0; i < m; i++) {
-          for (int64_t j = i + 1; j < n; j++) {
-            std::swap(data[offA + i * n + j], data[offA + j * n + i]);
-          }
-        }
-      }
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&offA length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:4];
+          },
+          1);  // Single thread
 
-      // Extract pivots from Eigen's permutation (convert to swap-based format)
-      auto perm = lu.permutationP();
-      // Eigen stores permutation as a product of transpositions
-      // We need to convert to LAPACK-style pivots (0-based)
-      auto& indices = perm.indices();
-      // Reconstruct swap sequence from permutation vector
-      std::vector<int64_t> permVec(m);
-      for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
-
-      for (int64_t i = 0; i < std::min(m, n); i++) {
-        // Find where i ended up in the remaining permutation
-        int64_t j = i;
-        for (int64_t k = i; k < m; k++) {
-          if (permVec[k] == i) {
-            j = k;
-            break;
-          }
-        }
-        pivots[i] = j;
-        if (j != i) {
-          std::swap(permVec[i], permVec[j]);
-        }
-      }
+      // Copy pivots from GPU buffer to caller's buffer (shared memory = just memcpy)
+      memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
 
       return 0;
     }
@@ -574,16 +552,33 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      // Find the MTLBuffer for L (and B, which is in the same data buffer)
+      auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
+      auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
+      if (!lBufferInfo.first || !bBufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::trsmLowerUnit: buffer not found");
+      }
+      id<MTLBuffer> lBuffer = (__bridge id<MTLBuffer>)lBufferInfo.first;
+      size_t lBaseOffset = lBufferInfo.second;
+      id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
+      size_t bBaseOffset = bBufferInfo.second;
 
-      // Solve L * X = B where L is m x m unit lower triangular (row-major)
-      // B is m x n with row stride ldb (row-major)
-      Eigen::Map<const MatRMaj> matL(L + offL, m, m);
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
-                 OuterStride>
-          matB(B + offB, m, n, OuterStride(ldb));
-      matL.template triangularView<Eigen::UnitLower>().solveInPlace(matB);
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_trsmLowerUnit_kernel_float");
+
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
+            [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
+            [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
+            [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
@@ -592,17 +587,32 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
+      auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
+      if (!uBufferInfo.first || !bBufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::trsmUpperRight: buffer not found");
+      }
+      id<MTLBuffer> uBuffer = (__bridge id<MTLBuffer>)uBufferInfo.first;
+      size_t uBaseOffset = uBufferInfo.second;
+      id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
+      size_t bBaseOffset = bBufferInfo.second;
 
-      // Solve X * U = B where U is n x n upper triangular (row-major)
-      // B is m x n with row stride ldb (row-major)
-      Eigen::Map<const MatRMaj> matU(U + offU, n, n);
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
-                 OuterStride>
-          matB(B + offB, m, n, OuterStride(ldb));
-      matU.template triangularView<Eigen::Upper>()
-          .template solveInPlace<Eigen::OnTheRight>(matB);
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_trsmUpperRight_kernel_float");
+
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:0];
+            [encoder setBytes:&offU length:sizeof(int64_t) atIndex:1];
+            [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
+            [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
@@ -612,19 +622,41 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
+      auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!lBufferInfo.first || !uBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::saveGemm: buffer not found");
+      }
+      id<MTLBuffer> lBuffer = (__bridge id<MTLBuffer>)lBufferInfo.first;
+      size_t lBaseOffset = lBufferInfo.second;
+      id<MTLBuffer> uBuffer = (__bridge id<MTLBuffer>)uBufferInfo.first;
+      size_t uBaseOffset = uBufferInfo.second;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t cBaseOffset = cBufferInfo.second;
 
-      // C -= L * U where L is m x k, U is k x n, C is m x n (all row-major with strides)
-      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
-                 OuterStride>
-          matL(L + offL, m, k, OuterStride(ldL));
-      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
-                 OuterStride>
-          matU(U + offU, k, n, OuterStride(ldU));
-      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
-                 OuterStride>
-          matC(C + offC, m, n, OuterStride(ldC));
-      matC.noalias() -= matL * matU;
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_saveGemm_kernel_float");
+
+      int64_t numThreads = m * n;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
+            [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&ldL length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:3];
+            [encoder setBytes:&offU length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldU length:sizeof(int64_t) atIndex:5];
+            [encoder setBuffer:cBuffer offset:cBaseOffset atIndex:6];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&ldC length:sizeof(int64_t) atIndex:8];
+            [encoder setBytes:&m length:sizeof(int64_t) atIndex:9];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:10];
+            [encoder setBytes:&k length:sizeof(int64_t) atIndex:11];
+          },
+          (NSUInteger)numThreads);
 
       sym.luGemmCalls++;
     }
@@ -632,16 +664,35 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData, int64_t ld,
                              int64_t numCols) override {
-    // Apply row permutation to a portion of the matrix
-    // pivots[i] indicates row i should be swapped with row pivots[i]
-    // Data is stored column-major with stride ld (matching BLAS convention in factorLU)
-    for (int64_t i = 0; i < n; i++) {
-      int64_t swapRow = pivots[i];
-      if (swapRow != i) {
-        for (int64_t c = 0; c < numCols; c++) {
-          std::swap(data[offData + i + c * ld], data[offData + swapRow + c * ld]);
-        }
+    @autoreleasepool {
+      if (n <= 0 || numCols <= 0) return;
+
+      // Copy pivots to GPU buffer
+      devPivots.resizeToAtLeast(n);
+      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::applyRowPerm: data buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_applyRowPerm_kernel_float");
+
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
+            [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&ld length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&numCols length:sizeof(int64_t) atIndex:5];
+          },
+          1);  // Single thread (sequential swaps)
     }
   }
 
@@ -650,6 +701,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   MetalMirror<float> tempBuffer;
   MetalMirror<int64_t> devSpanToChainOffset;
   std::vector<int64_t> spanToChainOffset;
+  MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
 };
 
 // Solve context for float - Metal implementation
@@ -941,15 +993,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::solveLUnit: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
 
-      Eigen::Map<const MatRMaj> matA(data + offM, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::UnitLower>().solveInPlace(matC);
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_solveLUnit_direct_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
+            [encoder setBytes:&offM length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:3];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
@@ -959,41 +1029,103 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::solveU: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
 
-      Eigen::Map<const MatRMaj> matA(data + offM, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::Upper>().solveInPlace(matC);
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_solveU_direct_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
+            [encoder setBytes:&offM length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:3];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
   // Apply row permutation P to vector: for each i, swap row i with row pivots[i]
   virtual void applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
                                 int64_t ldVec) override {
-    for (int64_t i = 0; i < n; i++) {
-      int64_t swapRow = pivots[i];
-      if (swapRow != i) {
-        for (int rhs = 0; rhs < nRHS; rhs++) {
-          std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
-        }
+    @autoreleasepool {
+      if (n <= 0) return;
+
+      // Copy pivots to GPU buffer
+      devPivots.resizeToAtLeast(n);
+      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
+      if (!vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::applyRowPermVec: buffer not found");
       }
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_applyRowPermVec_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:2];
+            [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
+          },
+          1);
     }
   }
 
   // Apply inverse row permutation P^T to vector (reverse order)
   virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, float* vec,
                                    int64_t ldVec) override {
-    for (int64_t i = n - 1; i >= 0; i--) {
-      int64_t swapRow = pivots[i];
-      if (swapRow != i) {
-        for (int rhs = 0; rhs < nRHS; rhs++) {
-          std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
-        }
+    @autoreleasepool {
+      if (n <= 0) return;
+
+      // Copy pivots to GPU buffer
+      devPivots.resizeToAtLeast(n);
+      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
+      if (!vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::applyRowPermVecInv: buffer not found");
       }
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_applyRowPermVecInv_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:2];
+            [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
+          },
+          1);
     }
   }
 
@@ -1004,29 +1136,43 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
 
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-      using OuterStridedCMajMatK =
-          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::gemvDirect: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
 
-      // M is row-major (nRows x nCols)
-      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-      // x is col-major at vec+srcOff, shape (nCols x nRHS) with stride ldVec
-      OuterStridedCMajMatK matX(vec + srcOff, nCols, nRHS, OuterStride(ldVec));
-      // result is col-major at vec+dstOff, shape (nRows x nRHS) with stride ldVec
-      OuterStridedCMajMatM matY(vec + dstOff, nRows, nRHS, OuterStride(ldVec));
+      id<MTLComputePipelineState> pipeline =
+          (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+              "lu_gemvDirect_kernel_float");
 
-      matY.noalias() += alpha * (matM * matX);
+      int64_t nRHS64 = nRHS;
+      dispatchKernel(
+          sym.commandQueue, pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&nRows length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nCols length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:4];
+            [encoder setBytes:&srcOff length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&dstOff length:sizeof(int64_t) atIndex:6];
+            [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&alpha length:sizeof(float) atIndex:8];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:9];
+          },
+          (NSUInteger)nRows);
     }
   }
 
   MetalSymbolicCtx& sym;
   int nRHS;
   MetalMirror<float> tempVecBuffer;
+  MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
 };
 
 // Batched numeric context for float

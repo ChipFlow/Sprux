@@ -367,6 +367,97 @@ struct Batched {
   }
 };
 
+// ============================================================================
+// LU-specific CUDA kernels
+// ============================================================================
+
+// Transpose square matrix in-place on GPU
+template <typename T>
+__global__ void transposeSquareInPlaceKernel(T* mat, int64_t n) {
+  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = n * (n - 1) / 2;
+  if (idx >= total) return;
+
+  // Map linear index to upper triangle (i, j) where j > i
+  // Use a simple row-based mapping
+  int64_t i = 0, j = 0;
+  int64_t count = 0;
+  for (i = 0; i < n - 1; i++) {
+    int64_t rowElems = n - 1 - i;
+    if (count + rowElems > idx) {
+      j = i + 1 + (idx - count);
+      break;
+    }
+    count += rowElems;
+  }
+
+  T tmp = mat[i * n + j];
+  mat[i * n + j] = mat[j * n + i];
+  mat[j * n + i] = tmp;
+}
+
+// Apply row permutation to matrix columns on GPU
+// Sequential swaps (data dependency), parallel across columns within one block.
+// IMPORTANT: Must launch with exactly 1 block since __syncthreads only syncs within a block.
+template <typename T>
+__global__ void applyRowPermKernel(const int64_t* pivots, int64_t n, T* data,
+                                    int64_t offData, int64_t ld, int64_t numCols) {
+  int64_t c = threadIdx.x;
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      // Each thread handles a column stride
+      for (int64_t col = c; col < numCols; col += blockDim.x) {
+        T tmp = data[offData + i + col * ld];
+        data[offData + i + col * ld] = data[offData + swapRow + col * ld];
+        data[offData + swapRow + col * ld] = tmp;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Apply row permutation to solve vector (forward direction)
+// IMPORTANT: Must launch with exactly 1 block.
+template <typename T>
+__global__ void applyRowPermVecKernel(const int64_t* pivots, int64_t n, T* vec,
+                                       int64_t ldVec, int64_t nRHS) {
+  int64_t tid = threadIdx.x;
+
+  for (int64_t i = 0; i < n; i++) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = tid; rhs < nRHS; rhs += blockDim.x) {
+        T tmp = vec[i + rhs * ldVec];
+        vec[i + rhs * ldVec] = vec[swapRow + rhs * ldVec];
+        vec[swapRow + rhs * ldVec] = tmp;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Apply inverse row permutation to solve vector (reverse direction)
+// IMPORTANT: Must launch with exactly 1 block.
+template <typename T>
+__global__ void applyRowPermVecInvKernel(const int64_t* pivots, int64_t n, T* vec,
+                                          int64_t ldVec, int64_t nRHS) {
+  int64_t tid = threadIdx.x;
+
+  for (int64_t i = n - 1; i >= 0; i--) {
+    int64_t swapRow = pivots[i];
+    if (swapRow != i) {
+      for (int64_t rhs = tid; rhs < nRHS; rhs += blockDim.x) {
+        T tmp = vec[i + rhs * ldVec];
+        vec[i + rhs * ldVec] = vec[swapRow + rhs * ldVec];
+        vec[swapRow + rhs * ldVec] = tmp;
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template <typename TT, typename B>
 __global__ void assemble_kernel(int64_t numBlockRows, int64_t numBlockCols, int64_t rectRowBegin,
                                 int64_t srcRectWidth, int64_t dstStride,
@@ -517,6 +608,8 @@ struct CudaNumericCtx : NumericCtx<T> {
   DevMirror<int> devPotrfSingIndex;
   DevMirror<int64_t> devSpanToChainOffset;
   vector<int64_t> spanToChainOffset;
+  DevMirror<int> devGetrfPivots;       // cuSolver int pivots (1-based)
+  DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based)
 
   const CudaSymbolicCtx& sym;
 };
@@ -607,53 +700,52 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
 
 // ============ LU NumericCtx implementations ============
 
-// Helper: transpose square matrix in-place on CPU
-template <typename T>
-static void transposeSquareInPlaceCpu(T* mat, int64_t n) {
-  for (int64_t i = 0; i < n; i++) {
-    for (int64_t j = i + 1; j < n; j++) {
-      std::swap(mat[i * n + j], mat[j * n + i]);
-    }
-  }
-}
-
-// getrf: CPU fallback - copy D→H, transpose, Eigen LU, transpose back, copy H→D
+// getrf: GPU implementation using cuSolver + transpose kernel
 template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                    int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
-  int64_t size = m * n;
-  vector<double> hostData(size);
-  cuCHECK(cudaMemcpy(hostData.data(), data + offA, size * sizeof(double), cudaMemcpyDeviceToHost));
+  int64_t minMN = std::min(m, n);
 
-  // Transpose for col-major compatibility
-  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
-
-  // Use Eigen PartialPivLU (in-place on col-major data)
-  using MatCMaj = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-  Eigen::Map<MatCMaj> matCol(hostData.data(), m, n);
-  Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
-
-  // Transpose back to row-major
-  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
-
-  // Copy result back to device
-  cuCHECK(cudaMemcpy(data + offA, hostData.data(), size * sizeof(double), cudaMemcpyHostToDevice));
-
-  // Extract pivots from Eigen's permutation
-  auto perm = lu.permutationP();
-  auto& indices = perm.indices();
-  vector<int64_t> permVec(m);
-  for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
-  // Convert permutation vector to sequential swap pivots
-  for (int64_t i = 0; i < std::min(m, n); i++) {
-    int64_t j = i;
-    for (int64_t k = i; k < m; k++) {
-      if (permVec[k] == i) { j = k; break; }
+  // Step 1: Transpose row-major → col-major on GPU (in-place for square)
+  if (m == n) {
+    int64_t numPairs = n * (n - 1) / 2;
+    if (numPairs > 0) {
+      int wgs = 256;
+      int numGroups = (numPairs + wgs - 1) / wgs;
+      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
     }
-    pivots[i] = j;
-    if (j != i) std::swap(permVec[i], permVec[j]);
   }
+
+  // Step 2: cuSolver getrf (col-major LU with partial pivoting)
+  int workspaceSize;
+  cusolverCHECK(cusolverDnDgetrf_bufferSize(sym.cusolverDnH, m, n, data + offA, m, &workspaceSize));
+
+  devTempBuffer.resizeToAtLeast(workspaceSize);
+  devGetrfPivots.resizeToAtLeast(minMN);
+  devPotrfSingIndex.resizeToAtLeast(1);
+
+  cusolverCHECK(cusolverDnDgetrf(sym.cusolverDnH, m, n, data + offA, m,
+                                  devTempBuffer.ptr, devGetrfPivots.ptr, devPotrfSingIndex.ptr));
+
+  // Step 3: Transpose col-major → row-major on GPU
+  if (m == n) {
+    int64_t numPairs = n * (n - 1) / 2;
+    if (numPairs > 0) {
+      int wgs = 256;
+      int numGroups = (numPairs + wgs - 1) / wgs;
+      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
+    }
+  }
+
+  // Step 4: Copy cuSolver pivots (int, 1-based) D→H, convert to our format (int64_t, 0-based)
+  vector<int> cuPivots(minMN);
+  cuCHECK(cudaMemcpy(cuPivots.data(), devGetrfPivots.ptr, minMN * sizeof(int),
+                      cudaMemcpyDeviceToHost));
+  for (int64_t i = 0; i < minMN; i++) {
+    pivots[i] = cuPivots[i] - 1;  // 1-based → 0-based
+  }
+
   return 0;
 }
 
@@ -661,32 +753,47 @@ template <>
 int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
                                   int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
-  int64_t size = m * n;
-  vector<float> hostData(size);
-  cuCHECK(cudaMemcpy(hostData.data(), data + offA, size * sizeof(float), cudaMemcpyDeviceToHost));
+  int64_t minMN = std::min(m, n);
 
-  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
-
-  using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-  Eigen::Map<MatCMaj> matCol(hostData.data(), m, n);
-  Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
-
-  if (m == n) transposeSquareInPlaceCpu(hostData.data(), n);
-
-  cuCHECK(cudaMemcpy(data + offA, hostData.data(), size * sizeof(float), cudaMemcpyHostToDevice));
-
-  auto perm = lu.permutationP();
-  auto& indices = perm.indices();
-  vector<int64_t> permVec(m);
-  for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
-  for (int64_t i = 0; i < std::min(m, n); i++) {
-    int64_t j = i;
-    for (int64_t k = i; k < m; k++) {
-      if (permVec[k] == i) { j = k; break; }
+  // Step 1: Transpose row-major → col-major on GPU (in-place for square)
+  if (m == n) {
+    int64_t numPairs = n * (n - 1) / 2;
+    if (numPairs > 0) {
+      int wgs = 256;
+      int numGroups = (numPairs + wgs - 1) / wgs;
+      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
     }
-    pivots[i] = j;
-    if (j != i) std::swap(permVec[i], permVec[j]);
   }
+
+  // Step 2: cuSolver getrf (col-major LU with partial pivoting)
+  int workspaceSize;
+  cusolverCHECK(cusolverDnSgetrf_bufferSize(sym.cusolverDnH, m, n, data + offA, m, &workspaceSize));
+
+  devTempBuffer.resizeToAtLeast(workspaceSize);
+  devGetrfPivots.resizeToAtLeast(minMN);
+  devPotrfSingIndex.resizeToAtLeast(1);
+
+  cusolverCHECK(cusolverDnSgetrf(sym.cusolverDnH, m, n, data + offA, m,
+                                  devTempBuffer.ptr, devGetrfPivots.ptr, devPotrfSingIndex.ptr));
+
+  // Step 3: Transpose col-major → row-major on GPU
+  if (m == n) {
+    int64_t numPairs = n * (n - 1) / 2;
+    if (numPairs > 0) {
+      int wgs = 256;
+      int numGroups = (numPairs + wgs - 1) / wgs;
+      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
+    }
+  }
+
+  // Step 4: Copy cuSolver pivots (int, 1-based) D→H, convert to our format (int64_t, 0-based)
+  vector<int> cuPivots(minMN);
+  cuCHECK(cudaMemcpy(cuPivots.data(), devGetrfPivots.ptr, minMN * sizeof(int),
+                      cudaMemcpyDeviceToHost));
+  for (int64_t i = 0; i < minMN; i++) {
+    pivots[i] = cuPivots[i] - 1;  // 1-based → 0-based
+  }
+
   return 0;
 }
 
@@ -748,49 +855,30 @@ void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
   sym.gemmCalls++;
 }
 
-// applyRowPerm: CPU fallback - copy block D→H, apply swaps, copy H→D
+// applyRowPerm: GPU kernel - copy small pivots H→D, run kernel on device
 template <>
 void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* data, int64_t offData,
                                            int64_t ld, int64_t numCols) {
-  // Data is stored col-major from cuBLAS perspective (ld × numCols)
-  // Each column has `ld` elements, we need n rows
-  int64_t copySize = ld * numCols;
-  vector<double> hostData(copySize);
-  cuCHECK(cudaMemcpy(hostData.data(), data + offData, copySize * sizeof(double),
-                      cudaMemcpyDeviceToHost));
+  if (n <= 0 || numCols <= 0) return;
 
-  for (int64_t i = 0; i < n; i++) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t c = 0; c < numCols; c++) {
-        std::swap(hostData[i + c * ld], hostData[swapRow + c * ld]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(data + offData, hostData.data(), copySize * sizeof(double),
-                      cudaMemcpyHostToDevice));
+  // Single block launch (sequential pivot dependency requires __syncthreads)
+  int wgs = std::min((int64_t)256, numCols);
+  applyRowPermKernel<<<1, wgs>>>(devPivotBuf.ptr, n, data, offData, ld, numCols);
 }
 
 template <>
 void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData,
                                           int64_t ld, int64_t numCols) {
-  int64_t copySize = ld * numCols;
-  vector<float> hostData(copySize);
-  cuCHECK(cudaMemcpy(hostData.data(), data + offData, copySize * sizeof(float),
-                      cudaMemcpyDeviceToHost));
+  if (n <= 0 || numCols <= 0) return;
 
-  for (int64_t i = 0; i < n; i++) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t c = 0; c < numCols; c++) {
-        std::swap(hostData[i + c * ld], hostData[swapRow + c * ld]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(data + offData, hostData.data(), copySize * sizeof(float),
-                      cudaMemcpyHostToDevice));
+  int wgs = std::min((int64_t)256, numCols);
+  applyRowPermKernel<<<1, wgs>>>(devPivotBuf.ptr, n, data, offData, ld, numCols);
 }
 
 template <typename T>
@@ -1308,6 +1396,7 @@ struct CudaSolveCtx : SolveCtx<T> {
   const CudaSymbolicCtx& sym;
   int64_t nRHS;
   DevMirror<T> devSolveBuf;
+  DevMirror<int64_t> devPivotBuf;  // GPU buffer for LU pivots
 };
 
 template <>
@@ -1438,82 +1527,55 @@ void CudaSolveCtx<float>::solveU(const float* data, int64_t offM, int64_t n, flo
                            CUBLAS_DIAG_NON_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
 }
 
-// applyRowPermVec: CPU fallback - copy D→H, apply forward swaps, copy H→D
+// applyRowPermVec: GPU kernel - copy small pivots H→D, run kernel on device
 template <>
 void CudaSolveCtx<double>::applyRowPermVec(const int64_t* pivots, int64_t n, double* vec,
                                             int64_t ldVec) {
-  int64_t copySize = ldVec * nRHS;
-  vector<double> hostVec(copySize);
-  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(double), cudaMemcpyDeviceToHost));
+  if (n <= 0) return;
 
-  for (int64_t i = 0; i < n; i++) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(double), cudaMemcpyHostToDevice));
+  // Single block (sequential pivot dependency)
+  int wgs = std::min((int64_t)256, nRHS);
+  applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
 }
 
 template <>
 void CudaSolveCtx<float>::applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
                                            int64_t ldVec) {
-  int64_t copySize = ldVec * nRHS;
-  vector<float> hostVec(copySize);
-  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(float), cudaMemcpyDeviceToHost));
+  if (n <= 0) return;
 
-  for (int64_t i = 0; i < n; i++) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(float), cudaMemcpyHostToDevice));
+  int wgs = std::min((int64_t)256, nRHS);
+  applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
 }
 
-// applyRowPermVecInv: CPU fallback - copy D→H, apply reverse swaps, copy H→D
+// applyRowPermVecInv: GPU kernel - copy small pivots H→D, run kernel on device (reverse)
 template <>
 void CudaSolveCtx<double>::applyRowPermVecInv(const int64_t* pivots, int64_t n, double* vec,
                                                int64_t ldVec) {
-  int64_t copySize = ldVec * nRHS;
-  vector<double> hostVec(copySize);
-  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(double), cudaMemcpyDeviceToHost));
+  if (n <= 0) return;
 
-  for (int64_t i = n - 1; i >= 0; i--) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(double), cudaMemcpyHostToDevice));
+  int wgs = std::min((int64_t)256, nRHS);
+  applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
 }
 
 template <>
 void CudaSolveCtx<float>::applyRowPermVecInv(const int64_t* pivots, int64_t n, float* vec,
                                               int64_t ldVec) {
-  int64_t copySize = ldVec * nRHS;
-  vector<float> hostVec(copySize);
-  cuCHECK(cudaMemcpy(hostVec.data(), vec, copySize * sizeof(float), cudaMemcpyDeviceToHost));
+  if (n <= 0) return;
 
-  for (int64_t i = n - 1; i >= 0; i--) {
-    int64_t swapRow = pivots[i];
-    if (swapRow != i) {
-      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        std::swap(hostVec[i + rhs * ldVec], hostVec[swapRow + rhs * ldVec]);
-      }
-    }
-  }
+  devPivotBuf.resizeToAtLeast(n);
+  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
 
-  cuCHECK(cudaMemcpy(vec, hostVec.data(), copySize * sizeof(float), cudaMemcpyHostToDevice));
+  int wgs = std::min((int64_t)256, nRHS);
+  applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
 }
 
 // gemvDirect: result += alpha * M * x, M is row-major (nRows × nCols)

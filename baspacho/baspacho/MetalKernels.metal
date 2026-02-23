@@ -553,3 +553,509 @@ kernel void sparseElim_diagSolveLt_float(
         solveUpper_dev(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
     }
 }
+
+// ============================================================================
+// LU factorization helper functions
+// ============================================================================
+
+// In-place LU factorization with partial pivoting for small blocks
+// A is row-major with stride lda, pivots output array (0-based swap indices)
+template <typename T>
+inline void lu_factor(device T* A, int lda, int n, device int64_t* pivots) {
+    for (int i = 0; i < n; i++) {
+        // Find pivot (max abs in column i, rows i..n-1)
+        int maxRow = i;
+        T maxVal = abs(A[i * lda + i]);
+        for (int k = i + 1; k < n; k++) {
+            T val = abs(A[k * lda + i]);
+            if (val > maxVal) {
+                maxVal = val;
+                maxRow = k;
+            }
+        }
+        pivots[i] = maxRow;
+
+        // Swap rows i and maxRow
+        if (maxRow != i) {
+            for (int j = 0; j < n; j++) {
+                T tmp = A[i * lda + j];
+                A[i * lda + j] = A[maxRow * lda + j];
+                A[maxRow * lda + j] = tmp;
+            }
+        }
+
+        // Eliminate below diagonal
+        T diag = A[i * lda + i];
+        for (int k = i + 1; k < n; k++) {
+            A[k * lda + i] /= diag;
+            for (int j = i + 1; j < n; j++) {
+                A[k * lda + j] -= A[k * lda + i] * A[i * lda + j];
+            }
+        }
+    }
+}
+
+// Forward substitution with unit lower triangular matrix (row-major)
+// Solves L * x = b in-place where L has unit diagonal
+template <typename T>
+inline void solveLowerUnit_rm(device T* L, int ldl, int n, device T* v) {
+    for (int i = 0; i < n; i++) {
+        T x = v[i];
+        for (int j = 0; j < i; j++) {
+            x -= L[i * ldl + j] * v[j];
+        }
+        v[i] = x;  // Unit diagonal, no division
+    }
+}
+
+// Backward substitution for upper triangular matrix (row-major)
+// Solves U * x = b in-place
+template <typename T>
+inline void solveUpperRM(device T* U, int ldu, int n, device T* v) {
+    for (int i = n - 1; i >= 0; i--) {
+        T x = v[i];
+        for (int j = i + 1; j < n; j++) {
+            x -= U[i * ldu + j] * v[j];
+        }
+        v[i] = x / U[i * ldu + i];
+    }
+}
+
+// Solve L * X = B where L is unit lower triangular (row-major), B is m×n col-major with stride ldb
+// This is "left side" triangular solve for multiple RHS
+template <typename T>
+inline void solveLowerUnit_rm_colmaj(device T* L, int ldl, int m,
+                                      device T* B, int ldb, int nRHS) {
+    for (int rhs = 0; rhs < nRHS; rhs++) {
+        solveLowerUnit_rm(L, ldl, m, B + rhs * ldb);
+    }
+}
+
+// Solve U * X = B where U is upper triangular (row-major), B is m×n col-major with stride ldb
+template <typename T>
+inline void solveUpperRM_colmaj(device T* U, int ldu, int m,
+                                 device T* B, int ldb, int nRHS) {
+    for (int rhs = 0; rhs < nRHS; rhs++) {
+        solveUpperRM(U, ldu, m, B + rhs * ldb);
+    }
+}
+
+// Solve L * X = B where L is m×m unit lower triangular (row-major)
+// B is m×n row-major with stride ldb
+template <typename T>
+inline void trsmLowerUnit_rm(device T* L, int ldl, int m,
+                              device T* B, int ldb, int n) {
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            T val = B[i * ldb + j];
+            for (int k = 0; k < i; k++) {
+                val -= L[i * ldl + k] * B[k * ldb + j];
+            }
+            B[i * ldb + j] = val;
+        }
+    }
+}
+
+// Solve X * U = B where U is n×n upper triangular (row-major)
+// B is m×n row-major with stride ldb
+template <typename T>
+inline void trsmUpperRight_rm(device T* U, int ldu, int n,
+                               device T* B, int ldb, int m) {
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < m; i++) {
+            T val = B[i * ldb + j];
+            for (int k = 0; k < j; k++) {
+                val -= B[i * ldb + k] * U[k * ldu + j];
+            }
+            B[i * ldb + j] = val / U[j * ldu + j];
+        }
+    }
+}
+
+// ============================================================================
+// LU Factorization Kernels
+// ============================================================================
+
+// LU factorize diagonal block + apply pivots + TRSM for below-diagonal blocks
+// One thread per lump (matches factor_lumps_kernel_float pattern)
+kernel void lu_factor_lump_kernel_float(
+    constant int64_t* lumpStart [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    constant int64_t* boardColPtr [[buffer(3)]],
+    constant int64_t* boardChainColOrd [[buffer(4)]],
+    constant int64_t* chainRowsTillEnd [[buffer(5)]],
+    device float* data [[buffer(6)]],
+    device int64_t* pivots [[buffer(7)]],
+    constant int64_t* pivotOffsets [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
+    int64_t colStart = chainColPtr[lump];
+    int64_t dataPtr = chainData[colStart];
+
+    // Step 1: In-place LU factorization on diagonal block
+    device float* diagBlockPtr = data + dataPtr;
+    device int64_t* lumpPivots = pivots + pivotOffsets[lump - lumpIndexStart];
+    lu_factor(diagBlockPtr, int(lumpSize), int(lumpSize), lumpPivots);
+
+    // Step 2: Get below-diagonal block info
+    int64_t gatheredStart = boardColPtr[lump];
+    int64_t gatheredEnd = boardColPtr[lump + 1];
+    int64_t rowDataStart = boardChainColOrd[gatheredStart + 1];
+    int64_t rowDataEnd = boardChainColOrd[gatheredEnd - 1];
+    int64_t belowDiagStart = chainData[colStart + rowDataStart];
+    int64_t numRows = chainRowsTillEnd[colStart + rowDataEnd - 1]
+                    - chainRowsTillEnd[colStart + rowDataStart - 1];
+
+    if (numRows <= 0) return;
+
+    device float* belowDiagBlockPtr = data + belowDiagStart;
+
+    // Step 3: Apply row permutation to below-diagonal block (column-major with stride lumpSize)
+    for (int64_t i = 0; i < lumpSize; i++) {
+        int64_t swapRow = lumpPivots[i];
+        if (swapRow != i) {
+            // Swap rows i and swapRow in the below-diagonal block
+            // Below-diagonal is stored as numRows rows × lumpSize cols (row-major)
+            // But we need to apply the permutation to the "column" block below the diagonal
+            // which is stored column-major from the perspective of the LU
+            for (int64_t r = 0; r < numRows; r++) {
+                float tmp = belowDiagBlockPtr[r * lumpSize + i];
+                belowDiagBlockPtr[r * lumpSize + i] = belowDiagBlockPtr[r * lumpSize + swapRow];
+                belowDiagBlockPtr[r * lumpSize + swapRow] = tmp;
+            }
+        }
+    }
+
+    // Step 4: Solve L * X = B for below-diagonal rows (X * U = B for right columns)
+    // Below-diagonal block: numRows × lumpSize (row-major, stride = lumpSize)
+    // U is the upper triangle of diagBlockPtr (lumpSize × lumpSize, row-major)
+    // We need: belowDiag = belowDiag * U^{-1}
+    trsmUpperRight_rm(diagBlockPtr, int(lumpSize), int(lumpSize),
+                      belowDiagBlockPtr, int(lumpSize), int(numRows));
+}
+
+// Apply row permutation to factored matrix columns (for the block above diagonal in LU)
+// pivots[i] indicates row i should be swapped with row pivots[i]
+// Data is column-major with stride ld
+kernel void lu_applyRowPerm_kernel_float(
+    device int64_t* pivots [[buffer(0)]],
+    constant int64_t& n [[buffer(1)]],
+    device float* data [[buffer(2)]],
+    constant int64_t& offData [[buffer(3)]],
+    constant int64_t& ld [[buffer(4)]],
+    constant int64_t& numCols [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    // Single-threaded sequential swaps (data dependency between iterations)
+    if (tid != 0) return;
+
+    device float* d = data + offData;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t swapRow = pivots[i];
+        if (swapRow != i) {
+            for (int64_t c = 0; c < numCols; c++) {
+                float tmp = d[i + c * ld];
+                d[i + c * ld] = d[swapRow + c * ld];
+                d[swapRow + c * ld] = tmp;
+            }
+        }
+    }
+}
+
+// TRSM: Solve L * X = B where L is m×m unit lower triangular (row-major)
+// B is m×n row-major with stride ldb
+kernel void lu_trsmLowerUnit_kernel_float(
+    constant float* L [[buffer(0)]],
+    constant int64_t& offL [[buffer(1)]],
+    device float* B [[buffer(2)]],
+    constant int64_t& offB [[buffer(3)]],
+    constant int64_t& m [[buffer(4)]],
+    constant int64_t& n [[buffer(5)]],
+    constant int64_t& ldb [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    // Single-threaded (sequential data dependencies)
+    if (tid != 0) return;
+
+    device float* Bp = B + offB;
+    // Copy L from constant to work with - we need device pointer for template
+    // Actually L is in the same data buffer, just const. Use direct access.
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+            float val = Bp[i * ldb + j];
+            for (int64_t k = 0; k < i; k++) {
+                val -= L[offL + i * m + k] * Bp[k * ldb + j];
+            }
+            Bp[i * ldb + j] = val;
+        }
+    }
+}
+
+// TRSM: Solve X * U = B where U is n×n upper triangular (row-major)
+// B is m×n row-major with stride ldb
+kernel void lu_trsmUpperRight_kernel_float(
+    constant float* U [[buffer(0)]],
+    constant int64_t& offU [[buffer(1)]],
+    device float* B [[buffer(2)]],
+    constant int64_t& offB [[buffer(3)]],
+    constant int64_t& m [[buffer(4)]],
+    constant int64_t& n [[buffer(5)]],
+    constant int64_t& ldb [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    device float* Bp = B + offB;
+    for (int64_t j = 0; j < n; j++) {
+        for (int64_t i = 0; i < m; i++) {
+            float val = Bp[i * ldb + j];
+            for (int64_t k = 0; k < j; k++) {
+                val -= Bp[i * ldb + k] * U[offU + k * n + j];
+            }
+            Bp[i * ldb + j] = val / U[offU + j * n + j];
+        }
+    }
+}
+
+// saveGemm: C -= L * U (all row-major with strides)
+kernel void lu_saveGemm_kernel_float(
+    constant float* L [[buffer(0)]],
+    constant int64_t& offL [[buffer(1)]],
+    constant int64_t& ldL [[buffer(2)]],
+    constant float* U [[buffer(3)]],
+    constant int64_t& offU [[buffer(4)]],
+    constant int64_t& ldU [[buffer(5)]],
+    device float* C [[buffer(6)]],
+    constant int64_t& offC [[buffer(7)]],
+    constant int64_t& ldC [[buffer(8)]],
+    constant int64_t& m [[buffer(9)]],
+    constant int64_t& n [[buffer(10)]],
+    constant int64_t& k [[buffer(11)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t totalElements = m * n;
+    if (int64_t(tid) >= totalElements) return;
+
+    int64_t row = tid / n;
+    int64_t col = tid % n;
+
+    float sum = 0.0f;
+    for (int64_t p = 0; p < k; p++) {
+        sum += L[offL + row * ldL + p] * U[offU + p * ldU + col];
+    }
+
+    // Use atomic subtract for thread safety
+    device atomic_uint* addr = (device atomic_uint*)&C[offC + row * ldC + col];
+    atomicSubFloat(addr, sum);
+}
+
+// ============================================================================
+// LU Solve Kernels
+// ============================================================================
+
+// Apply forward row permutation to solve vector
+// For each i from 0..n-1: swap vec[i] and vec[pivots[i]] across all RHS
+kernel void lu_applyRowPermVec_kernel_float(
+    constant int64_t* pivots [[buffer(0)]],
+    constant int64_t& n [[buffer(1)]],
+    device float* vec [[buffer(2)]],
+    constant int64_t& ldVec [[buffer(3)]],
+    constant int64_t& nRHS [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    for (int64_t i = 0; i < n; i++) {
+        int64_t swapRow = pivots[i];
+        if (swapRow != i) {
+            for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+                float tmp = vec[i + rhs * ldVec];
+                vec[i + rhs * ldVec] = vec[swapRow + rhs * ldVec];
+                vec[swapRow + rhs * ldVec] = tmp;
+            }
+        }
+    }
+}
+
+// Apply inverse row permutation (reverse order) to solve vector
+kernel void lu_applyRowPermVecInv_kernel_float(
+    constant int64_t* pivots [[buffer(0)]],
+    constant int64_t& n [[buffer(1)]],
+    device float* vec [[buffer(2)]],
+    constant int64_t& ldVec [[buffer(3)]],
+    constant int64_t& nRHS [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    for (int64_t i = n - 1; i >= 0; i--) {
+        int64_t swapRow = pivots[i];
+        if (swapRow != i) {
+            for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+                float tmp = vec[i + rhs * ldVec];
+                vec[i + rhs * ldVec] = vec[swapRow + rhs * ldVec];
+                vec[swapRow + rhs * ldVec] = tmp;
+            }
+        }
+    }
+}
+
+// Solve L * x = b where L is unit lower triangular (row-major), x is col-major
+// One thread per lump
+kernel void lu_solveLUnit_kernel_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    device float* data [[buffer(3)]],
+    device float* v [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    constant int64_t& lumpIndexStart [[buffer(7)]],
+    constant int64_t& lumpIndexEnd [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t diagDataPtr = chainData[colStart];
+
+    device float* diagBlock = data + diagDataPtr;
+
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveLowerUnit_rm(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
+    }
+}
+
+// Solve U * x = b where U is upper triangular (row-major), x is col-major
+// One thread per lump
+kernel void lu_solveU_kernel_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    device float* data [[buffer(3)]],
+    device float* v [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    constant int64_t& lumpIndexStart [[buffer(7)]],
+    constant int64_t& lumpIndexEnd [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t diagDataPtr = chainData[colStart];
+
+    device float* diagBlock = data + diagDataPtr;
+
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveUpperRM(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
+    }
+}
+
+// gemvDirect: result += alpha * M * x where M is row-major (nRows × nCols)
+// x is col-major at vec+srcOff with stride ldVec, result at vec+dstOff
+kernel void lu_gemvDirect_kernel_float(
+    constant float* data [[buffer(0)]],
+    constant int64_t& offset [[buffer(1)]],
+    constant int64_t& nRows [[buffer(2)]],
+    constant int64_t& nCols [[buffer(3)]],
+    device float* vec [[buffer(4)]],
+    constant int64_t& srcOff [[buffer(5)]],
+    constant int64_t& dstOff [[buffer(6)]],
+    constant int64_t& ldVec [[buffer(7)]],
+    constant float& alpha [[buffer(8)]],
+    constant int64_t& nRHS [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    // One thread per output row
+    if (int64_t(tid) >= nRows) return;
+
+    int64_t row = tid;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float sum = 0.0f;
+        for (int64_t col = 0; col < nCols; col++) {
+            sum += data[offset + row * nCols + col] * vec[srcOff + col + rhs * ldVec];
+        }
+        vec[dstOff + row + rhs * ldVec] += alpha * sum;
+    }
+}
+
+// LU getrf kernel: standalone (for when not using fused lump kernel)
+// In-place LU with partial pivoting on a single block
+kernel void lu_getrf_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offA [[buffer(1)]],
+    constant int64_t& m [[buffer(2)]],
+    constant int64_t& n [[buffer(3)]],
+    device int64_t* pivots [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    int64_t minMN = m < n ? m : n;
+    device float* A = data + offA;
+    lu_factor(A, int(n), int(minMN), pivots);
+}
+
+// ============================================================================
+// Direct-offset LU solve kernels (for per-lump calls with explicit offsets)
+// ============================================================================
+
+// Solve L * x = b where L is unit lower triangular (row-major at data+offM, n×n)
+// x is col-major at C+offC with stride ldc
+kernel void lu_solveLUnit_direct_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offM [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant int64_t& offC [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    device float* L = data + offM;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveLowerUnit_rm(L, int(n), int(n), C + offC + rhs * ldc);
+    }
+}
+
+// Solve U * x = b where U is upper triangular (row-major at data+offM, n×n)
+// x is col-major at C+offC with stride ldc
+kernel void lu_solveU_direct_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offM [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant int64_t& offC [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    device float* U = data + offM;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveUpperRM(U, int(n), int(n), C + offC + rhs * ldc);
+    }
+}
