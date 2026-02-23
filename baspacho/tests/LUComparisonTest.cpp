@@ -1060,4 +1060,281 @@ TEST(LUComparison, VsUmfpack_Performance) {
   EXPECT_LT(baspachoResidual, 1e-6) << "BaSpaCho residual too large";
 }
 
+// ============================================================================
+// Helper: Build non-symmetric block-sparse matrix and fill BaSpaCho + UMFPACK data
+// ============================================================================
+
+struct LUTestData {
+  Matrix<double> fullMat;
+  vector<double> data;
+  unique_ptr<CoalescedBlockMatrixSkel> factorSkel;
+  int64_t totalSize;
+  vector<int64_t> spanStart;
+  // UMFPACK CSC format
+  vector<int64_t> colPtr;
+  vector<int64_t> rowIdx;
+  vector<double> val;
+};
+
+// Build a non-symmetric block-sparse test matrix from a sparsity structure.
+// paramSize gives the size of each block, rng is the random generator.
+LUTestData buildNonSymmetricTestData(const SparseStructure& ss, const vector<int64_t>& paramSize,
+                                      mt19937& rng) {
+  LUTestData td;
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+
+  td.totalSize = 0;
+  for (int64_t ps : paramSize) td.totalSize += ps;
+
+  td.spanStart.push_back(0);
+  for (int64_t ps : paramSize) td.spanStart.push_back(td.spanStart.back() + ps);
+
+  td.fullMat = Matrix<double>::Zero(td.totalSize, td.totalSize);
+
+  // Fill lower triangle blocks from sparsity structure
+  for (int64_t rowBlock = 0; rowBlock < (int64_t)ss.ptrs.size() - 1; rowBlock++) {
+    for (int64_t k = ss.ptrs[rowBlock]; k < ss.ptrs[rowBlock + 1]; k++) {
+      int64_t colBlock = ss.inds[k];
+      for (int64_t r = td.spanStart[rowBlock]; r < td.spanStart[rowBlock + 1]; r++)
+        for (int64_t c = td.spanStart[colBlock]; c < td.spanStart[colBlock + 1]; c++)
+          td.fullMat(r, c) = unif(rng);
+    }
+  }
+
+  // Fill upper triangle blocks INDEPENDENTLY (non-symmetric!)
+  // The upper triangle has the transposed sparsity pattern
+  for (int64_t rowBlock = 0; rowBlock < (int64_t)ss.ptrs.size() - 1; rowBlock++) {
+    for (int64_t k = ss.ptrs[rowBlock]; k < ss.ptrs[rowBlock + 1]; k++) {
+      int64_t colBlock = ss.inds[k];
+      if (colBlock != rowBlock) {
+        // Upper entry (colBlock, rowBlock) gets independent random values
+        for (int64_t r = td.spanStart[colBlock]; r < td.spanStart[colBlock + 1]; r++)
+          for (int64_t c = td.spanStart[rowBlock]; c < td.spanStart[rowBlock + 1]; c++)
+            td.fullMat(r, c) = unif(rng);
+      }
+    }
+  }
+
+  // Diagonal dominance
+  for (int64_t i = 0; i < td.totalSize; i++) td.fullMat(i, i) += td.totalSize * 3;
+
+  // Build BaSpaCho skeleton
+  vector<int64_t> lumpToSpan(paramSize.size() + 1);
+  iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
+  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
+  td.factorSkel = make_unique<CoalescedBlockMatrixSkel>(td.spanStart, lumpToSpan, groupedSs.ptrs,
+                                                        groupedSs.inds);
+  td.factorSkel->initUpperTriangle();
+
+  // Fill BaSpaCho data
+  td.data.resize(td.factorSkel->totalDataSize());
+  fillDataFromDenseMatrix(*td.factorSkel, td.data.data(), td.fullMat);
+
+  // Build CSC for UMFPACK
+  td.colPtr.push_back(0);
+  for (int64_t col = 0; col < td.totalSize; col++) {
+    for (int64_t row = 0; row < td.totalSize; row++) {
+      if (td.fullMat(row, col) != 0.0) {
+        td.rowIdx.push_back(row);
+        td.val.push_back(td.fullMat(row, col));
+      }
+    }
+    td.colPtr.push_back(td.rowIdx.size());
+  }
+
+  return td;
+}
+
+// Helper to run BaSpaCho LU solve and return residual
+double solveBaSpaCho(LUTestData& td, const Vector<double>& b, Vector<double>& xOut) {
+  Solver solver(std::move(*td.factorSkel), {}, {}, fastOps());
+  vector<int64_t> pivots(td.totalSize);
+  solver.factorLU(td.data.data(), pivots.data());
+  xOut = b;
+  solver.solveLU(td.data.data(), pivots.data(), xOut.data(), td.totalSize, 1);
+  return (td.fullMat * xOut - b).norm() / b.norm();
+}
+
+// Compare with truly non-symmetric matrices (SPICE-like asymmetric coupling)
+TEST(LUComparison, VsUmfpack_NonSymmetric) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(25, 0.25, 123);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(123);
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xBaspacho;
+  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+
+  cout << "\n=== Non-Symmetric Matrix Comparison ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
+  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+
+  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference: " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
+}
+
+// Larger block-sparse structure with mixed block sizes (2-15)
+TEST(LUComparison, VsUmfpack_LargerMixedBlocks) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(50, 0.08, 77);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  // Mixed block sizes 2-8 (typical of circuit blocks)
+  mt19937 rng(77);
+  uniform_int_distribution<int64_t> sizeDist(2, 8);
+  vector<int64_t> paramSize;
+  for (size_t i = 0; i < gen.columns.size(); i++) paramSize.push_back(sizeDist(rng));
+
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xBaspacho;
+  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+
+  cout << "\n=== Larger Mixed-Block Non-Symmetric Comparison ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
+  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+
+  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference: " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
+}
+
+// Multiple RHS solve
+TEST(LUComparison, VsUmfpack_MultipleRHS) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(20, 0.3, 99);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(99);
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  int nRHS = 5;
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Matrix<double> B(td.totalSize, nRHS);
+  for (int64_t i = 0; i < td.totalSize; i++)
+    for (int j = 0; j < nRHS; j++) B(i, j) = unif(rng);
+
+  // Solve with BaSpaCho (multiple RHS at once)
+  Solver solver(std::move(*td.factorSkel), {}, {}, fastOps());
+  vector<int64_t> pivots(td.totalSize);
+  solver.factorLU(td.data.data(), pivots.data());
+
+  Matrix<double> X = B;
+  solver.solveLU(td.data.data(), pivots.data(), X.data(), td.totalSize, nRHS);
+
+  // Solve each RHS with UMFPACK for comparison
+  cout << "\n=== Multiple RHS Comparison (nRHS=" << nRHS << ") ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+
+  for (int rhs = 0; rhs < nRHS; rhs++) {
+    Vector<double> bCol = B.col(rhs);
+    auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, bCol);
+
+    Vector<double> xCol = X.col(rhs);
+    double baspachoResidual = (td.fullMat * xCol - bCol).norm() / bCol.norm();
+
+    cout << "  RHS " << rhs << ": UMFPACK=" << umfResult.residual
+         << ", BaSpaCho=" << baspachoResidual << endl;
+
+    EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large for RHS " << rhs;
+    EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large for RHS " << rhs;
+
+    double solutionDiff = (xCol - umfResult.solution).norm() / umfResult.solution.norm();
+    EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much for RHS " << rhs;
+  }
+}
+
+// Grid topology (typical of 2D circuit mesh)
+TEST(LUComparison, VsUmfpack_GridTopology) {
+  SparseMatGenerator gen = SparseMatGenerator::genGrid(10, 10, 0.5, 2, 55);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  mt19937 rng(55);
+  uniform_int_distribution<int64_t> sizeDist(2, 5);
+  vector<int64_t> paramSize;
+  for (size_t i = 0; i < gen.columns.size(); i++) paramSize.push_back(sizeDist(rng));
+
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xBaspacho;
+  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+
+  cout << "\n=== Grid Topology (10x10) Non-Symmetric ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
+  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+
+  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference: " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
+}
+
+// Meridian topology
+TEST(LUComparison, VsUmfpack_MeridianTopology) {
+  SparseMatGenerator gen = SparseMatGenerator::genMeridians(4, 10, 0.5, 3, 4, 2, 2, 88);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(88);
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xBaspacho;
+  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+
+  cout << "\n=== Meridian Topology Non-Symmetric ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
+  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+
+  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference: " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
+}
+
 #endif  // BASPACHO_HAVE_UMFPACK

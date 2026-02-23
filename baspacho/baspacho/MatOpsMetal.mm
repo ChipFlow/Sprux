@@ -506,6 +506,145 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
+  // ============ LU factorization methods ============
+
+  virtual int getrf(int64_t m, int64_t n, float* data, int64_t offA, int64_t* pivots) override {
+    @autoreleasepool {
+      if (m <= 0 || n <= 0) return 0;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+      // Same transpose workaround as MatOpsFast: transpose before/after so
+      // Eigen's col-major partial pivot LU operates on the correct data.
+      Eigen::Map<MatRMaj> matA(data + offA, m, n);
+
+      // Transpose in-place (square matrices only, which is the diagonal block case)
+      if (m == n) {
+        for (int64_t i = 0; i < m; i++) {
+          for (int64_t j = i + 1; j < n; j++) {
+            std::swap(data[offA + i * n + j], data[offA + j * n + i]);
+          }
+        }
+      }
+
+      // Use Eigen's partial pivot LU on the (now col-major-compatible) data
+      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+      Eigen::Map<MatCMaj> matCol(data + offA, m, n);
+      Eigen::PartialPivLU<Eigen::Ref<MatCMaj>> lu(matCol);
+
+      // Transpose back
+      if (m == n) {
+        for (int64_t i = 0; i < m; i++) {
+          for (int64_t j = i + 1; j < n; j++) {
+            std::swap(data[offA + i * n + j], data[offA + j * n + i]);
+          }
+        }
+      }
+
+      // Extract pivots from Eigen's permutation (convert to swap-based format)
+      auto perm = lu.permutationP();
+      // Eigen stores permutation as a product of transpositions
+      // We need to convert to LAPACK-style pivots (0-based)
+      auto& indices = perm.indices();
+      // Reconstruct swap sequence from permutation vector
+      std::vector<int64_t> permVec(m);
+      for (int64_t i = 0; i < m; i++) permVec[i] = indices(i);
+
+      for (int64_t i = 0; i < std::min(m, n); i++) {
+        // Find where i ended up in the remaining permutation
+        int64_t j = i;
+        for (int64_t k = i; k < m; k++) {
+          if (permVec[k] == i) {
+            j = k;
+            break;
+          }
+        }
+        pivots[i] = j;
+        if (j != i) {
+          std::swap(permVec[i], permVec[j]);
+        }
+      }
+
+      return 0;
+    }
+  }
+
+  virtual void trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL, float* B,
+                              int64_t offB, int64_t ldb) override {
+    @autoreleasepool {
+      if (m <= 0 || n <= 0) return;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+      // Solve L * X = B where L is m x m unit lower triangular (row-major)
+      // B is m x n with row stride ldb (row-major)
+      Eigen::Map<const MatRMaj> matL(L + offL, m, m);
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
+                 OuterStride>
+          matB(B + offB, m, n, OuterStride(ldb));
+      matL.template triangularView<Eigen::UnitLower>().solveInPlace(matB);
+    }
+  }
+
+  virtual void trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU, float* B,
+                               int64_t offB, int64_t ldb) override {
+    @autoreleasepool {
+      if (m <= 0 || n <= 0) return;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+      // Solve X * U = B where U is n x n upper triangular (row-major)
+      // B is m x n with row stride ldb (row-major)
+      Eigen::Map<const MatRMaj> matU(U + offU, n, n);
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
+                 OuterStride>
+          matB(B + offB, m, n, OuterStride(ldb));
+      matU.template triangularView<Eigen::Upper>()
+          .template solveInPlace<Eigen::OnTheRight>(matB);
+    }
+  }
+
+  virtual void saveGemm(int64_t m, int64_t n, int64_t k, const float* L, int64_t offL,
+                         int64_t ldL, const float* U, int64_t offU, int64_t ldU, float* C,
+                         int64_t offC, int64_t ldC) override {
+    @autoreleasepool {
+      if (m <= 0 || n <= 0 || k <= 0) return;
+
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+
+      // C -= L * U where L is m x k, U is k x n, C is m x n (all row-major with strides)
+      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
+                 OuterStride>
+          matL(L + offL, m, k, OuterStride(ldL));
+      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
+                 OuterStride>
+          matU(U + offU, k, n, OuterStride(ldU));
+      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>, 0,
+                 OuterStride>
+          matC(C + offC, m, n, OuterStride(ldC));
+      matC.noalias() -= matL * matU;
+
+      sym.luGemmCalls++;
+    }
+  }
+
+  virtual void applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData, int64_t ld,
+                             int64_t numCols) override {
+    // Apply row permutation to a portion of the matrix
+    // pivots[i] indicates row i should be swapped with row pivots[i]
+    // Data is stored column-major with stride ld (matching BLAS convention in factorLU)
+    for (int64_t i = 0; i < n; i++) {
+      int64_t swapRow = pivots[i];
+      if (swapRow != i) {
+        for (int64_t c = 0; c < numCols; c++) {
+          std::swap(data[offData + i + c * ld], data[offData + swapRow + c * ld]);
+        }
+      }
+    }
+  }
+
   MetalSymbolicCtx& sym;
   int64_t numSpans_;
   MetalMirror<float> tempBuffer;
@@ -791,6 +930,97 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:8];
           },
           (NSUInteger)numColItems);
+    }
+  }
+
+  // ============ LU solve methods ============
+
+  // Solve L * x = b where L is unit lower triangular (forward substitution)
+  virtual void solveLUnit(const float* data, int64_t offM, int64_t n, float* C, int64_t offC,
+                          int64_t ldc) override {
+    @autoreleasepool {
+      if (n <= 0 || nRHS <= 0) return;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      using OuterStridedCMajMatM =
+          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                     OuterStride>;
+
+      Eigen::Map<const MatRMaj> matA(data + offM, n, n);
+      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
+      matA.template triangularView<Eigen::UnitLower>().solveInPlace(matC);
+    }
+  }
+
+  // Solve U * x = b where U is upper triangular (backward substitution)
+  virtual void solveU(const float* data, int64_t offM, int64_t n, float* C, int64_t offC,
+                      int64_t ldc) override {
+    @autoreleasepool {
+      if (n <= 0 || nRHS <= 0) return;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      using OuterStridedCMajMatM =
+          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                     OuterStride>;
+
+      Eigen::Map<const MatRMaj> matA(data + offM, n, n);
+      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
+      matA.template triangularView<Eigen::Upper>().solveInPlace(matC);
+    }
+  }
+
+  // Apply row permutation P to vector: for each i, swap row i with row pivots[i]
+  virtual void applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
+                                int64_t ldVec) override {
+    for (int64_t i = 0; i < n; i++) {
+      int64_t swapRow = pivots[i];
+      if (swapRow != i) {
+        for (int rhs = 0; rhs < nRHS; rhs++) {
+          std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
+        }
+      }
+    }
+  }
+
+  // Apply inverse row permutation P^T to vector (reverse order)
+  virtual void applyRowPermVecInv(const int64_t* pivots, int64_t n, float* vec,
+                                   int64_t ldVec) override {
+    for (int64_t i = n - 1; i >= 0; i--) {
+      int64_t swapRow = pivots[i];
+      if (swapRow != i) {
+        for (int rhs = 0; rhs < nRHS; rhs++) {
+          std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
+        }
+      }
+    }
+  }
+
+  // Direct gemv for U backward solve: result += alpha * M * x
+  virtual void gemvDirect(const float* data, int64_t offset, int64_t nRows, int64_t nCols,
+                           float* vec, int64_t srcOff, int64_t dstOff, int64_t ldVec,
+                           float alpha) override {
+    @autoreleasepool {
+      if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
+
+      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
+      using OuterStridedCMajMatM =
+          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                     OuterStride>;
+      using OuterStridedCMajMatK =
+          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
+                     OuterStride>;
+
+      // M is row-major (nRows x nCols)
+      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
+      // x is col-major at vec+srcOff, shape (nCols x nRHS) with stride ldVec
+      OuterStridedCMajMatK matX(vec + srcOff, nCols, nRHS, OuterStride(ldVec));
+      // result is col-major at vec+dstOff, shape (nRows x nRHS) with stride ldVec
+      OuterStridedCMajMatM matY(vec + dstOff, nRows, nRHS, OuterStride(ldVec));
+
+      matY.noalias() += alpha * (matM * matX);
     }
   }
 
