@@ -77,7 +77,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
       if (LLVM_AR)
         set(ar_tool "${LLVM_AR}")
       else()
-        message(FATAL_ERROR "llvm-ar not found!")
+        message(STATUS "llvm-ar not found, using ${ar_tool} (CMAKE_AR)")
       endif()
     endif()
 
