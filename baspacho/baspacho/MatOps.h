@@ -55,10 +55,14 @@ struct Ops {
 
 struct NumericCtxBase {
   virtual ~NumericCtxBase() {}
+  // Flush pending GPU operations (no-op for CPU backends)
+  virtual void flush() {}
 };
 
 struct SolveCtxBase {
   virtual ~SolveCtxBase() {}
+  // Flush pending GPU operations (no-op for CPU backends)
+  virtual void flush() {}
 };
 
 // (symbolic) context for factorization, constant indices (and GPU copies)

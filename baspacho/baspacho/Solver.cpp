@@ -695,6 +695,8 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       factorLumpLU(*numCtx, data, pivots, l);
     }
   }
+
+  numCtx->flush();
 }
 
 template <typename T>
@@ -726,6 +728,8 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
 
   // Step 3: Solve U * x = z (backward substitution with U factor)
   internalSolveURange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+
+  slvCtx->flush();
 }
 
 // Forward substitution for LU with unit lower triangular L

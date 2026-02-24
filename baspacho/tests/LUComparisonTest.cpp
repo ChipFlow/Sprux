@@ -11,6 +11,7 @@
 #include <umfpack.h>
 #include <Eigen/Dense>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -1336,5 +1337,511 @@ TEST(LUComparison, VsUmfpack_MeridianTopology) {
   cout << "Solution difference: " << solutionDiff << endl;
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }
+
+// ============================================================================
+// GPU Backend vs UMFPACK comparison tests
+// ============================================================================
+
+#ifdef BASPACHO_USE_METAL
+#include "baspacho/baspacho/MetalDefs.h"
+
+// Build float test data from the same sparsity structure (Metal only supports float)
+struct LUTestDataFloat {
+  Matrix<float> fullMat;
+  vector<float> data;
+  unique_ptr<CoalescedBlockMatrixSkel> factorSkel;
+  int64_t totalSize;
+  vector<int64_t> spanStart;
+};
+
+LUTestDataFloat buildNonSymmetricTestDataFloat(const SparseStructure& ss,
+                                                const vector<int64_t>& paramSize, mt19937& rng) {
+  LUTestDataFloat td;
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+
+  td.totalSize = 0;
+  for (int64_t ps : paramSize) td.totalSize += ps;
+
+  td.spanStart.push_back(0);
+  for (int64_t ps : paramSize) td.spanStart.push_back(td.spanStart.back() + ps);
+
+  td.fullMat = Matrix<float>::Zero(td.totalSize, td.totalSize);
+
+  for (int64_t rowBlock = 0; rowBlock < (int64_t)ss.ptrs.size() - 1; rowBlock++) {
+    for (int64_t k = ss.ptrs[rowBlock]; k < ss.ptrs[rowBlock + 1]; k++) {
+      int64_t colBlock = ss.inds[k];
+      for (int64_t r = td.spanStart[rowBlock]; r < td.spanStart[rowBlock + 1]; r++)
+        for (int64_t c = td.spanStart[colBlock]; c < td.spanStart[colBlock + 1]; c++)
+          td.fullMat(r, c) = unif(rng);
+    }
+  }
+
+  for (int64_t rowBlock = 0; rowBlock < (int64_t)ss.ptrs.size() - 1; rowBlock++) {
+    for (int64_t k = ss.ptrs[rowBlock]; k < ss.ptrs[rowBlock + 1]; k++) {
+      int64_t colBlock = ss.inds[k];
+      if (colBlock != rowBlock) {
+        for (int64_t r = td.spanStart[colBlock]; r < td.spanStart[colBlock + 1]; r++)
+          for (int64_t c = td.spanStart[rowBlock]; c < td.spanStart[rowBlock + 1]; c++)
+            td.fullMat(r, c) = unif(rng);
+      }
+    }
+  }
+
+  for (int64_t i = 0; i < td.totalSize; i++) td.fullMat(i, i) += td.totalSize * 3;
+
+  vector<int64_t> lumpToSpan(paramSize.size() + 1);
+  iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
+  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
+  td.factorSkel = make_unique<CoalescedBlockMatrixSkel>(td.spanStart, lumpToSpan, groupedSs.ptrs,
+                                                        groupedSs.inds);
+  td.factorSkel->initUpperTriangle();
+
+  td.data.resize(td.factorSkel->totalDataSize());
+  fillDataFromDenseMatrix(*td.factorSkel, td.data.data(), td.fullMat);
+
+  return td;
+}
+
+// Helper: solve with Metal backend, return residual
+float solveMetalLU(LUTestDataFloat& td, const Vector<float>& b, Vector<float>& xOut) {
+  Solver solver(std::move(*td.factorSkel), {}, {}, metalOps());
+  vector<int64_t> pivots(td.totalSize);
+
+  // Factor on GPU
+  {
+    MetalMirror<float> dataGpu(td.data);
+    solver.factorLU(dataGpu.ptr(), pivots.data());
+    dataGpu.get(td.data);
+  }
+
+  // Solve on GPU
+  xOut = b;
+  {
+    vector<float> xVec(xOut.data(), xOut.data() + td.totalSize);
+    MetalMirror<float> dataGpu(td.data);
+    MetalMirror<float> xGpu(xVec);
+    solver.solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), td.totalSize, 1);
+    xGpu.get(xVec);
+    for (int64_t i = 0; i < td.totalSize; i++) xOut(i) = xVec[i];
+  }
+
+  return (td.fullMat * xOut - b).norm() / b.norm();
+}
+
+// Helper: build UMFPACK CSC data from float matrix (promoted to double for UMFPACK)
+void buildUmfpackCSC(const Matrix<float>& fullMat, int64_t n, vector<int64_t>& colPtr,
+                     vector<int64_t>& rowIdx, vector<double>& val) {
+  colPtr.clear();
+  rowIdx.clear();
+  val.clear();
+  colPtr.push_back(0);
+  for (int64_t col = 0; col < n; col++) {
+    for (int64_t row = 0; row < n; row++) {
+      if (fullMat(row, col) != 0.0f) {
+        rowIdx.push_back(row);
+        val.push_back(static_cast<double>(fullMat(row, col)));
+      }
+    }
+    colPtr.push_back(rowIdx.size());
+  }
+}
+
+TEST(LUComparison, MetalVsUmfpack_BlockSparse) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(25, 0.25, 456);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(456);
+  auto td = buildNonSymmetricTestDataFloat(ss, paramSize, rng);
+
+  // Build UMFPACK data from the same matrix (promoted to double)
+  vector<int64_t> colPtr;
+  vector<int64_t> rowIdx;
+  vector<double> val;
+  buildUmfpackCSC(td.fullMat, td.totalSize, colPtr, rowIdx, val);
+
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+  Vector<float> bf(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) bf(i) = unif(rng);
+
+  // UMFPACK solve (double precision)
+  Vector<double> bd = bf.cast<double>();
+  auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, td.totalSize, bd);
+
+  // Metal solve (float precision)
+  Vector<float> xMetal;
+  float metalResidual = solveMetalLU(td, bf, xMetal);
+
+  cout << "\n=== Metal vs UMFPACK: Block-Sparse ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "Metal residual: " << metalResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
+  EXPECT_LT(metalResidual, 5e-3) << "Metal residual too large (float precision)";
+
+  // Compare solutions (float vs double, so tolerance is relaxed)
+  double solutionDiff =
+      (xMetal.cast<double>() - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference (float vs double): " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-2) << "Metal and UMFPACK solutions differ too much";
+}
+
+TEST(LUComparison, MetalVsUmfpack_NonSymmetric) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(25, 0.25, 789);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(789);
+  auto td = buildNonSymmetricTestDataFloat(ss, paramSize, rng);
+
+  vector<int64_t> colPtr;
+  vector<int64_t> rowIdx;
+  vector<double> val;
+  buildUmfpackCSC(td.fullMat, td.totalSize, colPtr, rowIdx, val);
+
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+  Vector<float> bf(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) bf(i) = unif(rng);
+
+  Vector<double> bd = bf.cast<double>();
+  auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, td.totalSize, bd);
+
+  Vector<float> xMetal;
+  float metalResidual = solveMetalLU(td, bf, xMetal);
+
+  cout << "\n=== Metal vs UMFPACK: Non-Symmetric ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "Metal residual: " << metalResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(metalResidual, 5e-3);
+}
+
+TEST(LUComparison, MetalVsUmfpack_MixedBlocks) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(40, 0.1, 321);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  mt19937 rng(321);
+  uniform_int_distribution<int64_t> sizeDist(2, 8);
+  vector<int64_t> paramSize;
+  for (size_t i = 0; i < gen.columns.size(); i++) paramSize.push_back(sizeDist(rng));
+
+  auto td = buildNonSymmetricTestDataFloat(ss, paramSize, rng);
+
+  vector<int64_t> colPtr;
+  vector<int64_t> rowIdx;
+  vector<double> val;
+  buildUmfpackCSC(td.fullMat, td.totalSize, colPtr, rowIdx, val);
+
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+  Vector<float> bf(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) bf(i) = unif(rng);
+
+  Vector<double> bd = bf.cast<double>();
+  auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, td.totalSize, bd);
+
+  Vector<float> xMetal;
+  float metalResidual = solveMetalLU(td, bf, xMetal);
+
+  cout << "\n=== Metal vs UMFPACK: Mixed Block Sizes ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "Metal residual: " << metalResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(metalResidual, 5e-3);
+}
+
+TEST(LUComparison, MetalVsUmfpack_GridTopology) {
+  SparseMatGenerator gen = SparseMatGenerator::genGrid(5, 5, 0.5, 2, 654);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(654);
+  auto td = buildNonSymmetricTestDataFloat(ss, paramSize, rng);
+
+  vector<int64_t> colPtr;
+  vector<int64_t> rowIdx;
+  vector<double> val;
+  buildUmfpackCSC(td.fullMat, td.totalSize, colPtr, rowIdx, val);
+
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+  Vector<float> bf(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) bf(i) = unif(rng);
+
+  Vector<double> bd = bf.cast<double>();
+  auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, td.totalSize, bd);
+
+  Vector<float> xMetal;
+  float metalResidual = solveMetalLU(td, bf, xMetal);
+
+  cout << "\n=== Metal vs UMFPACK: Grid Topology ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "Metal residual: " << metalResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(metalResidual, 5e-3);
+}
+
+// Performance comparison: Metal vs UMFPACK at different scales
+TEST(LUComparison, MetalVsUmfpack_Performance) {
+  struct TestCase {
+    string name;
+    int numBlocks;
+    double density;
+    int blockSize;
+    int seed;
+  };
+
+  vector<TestCase> cases = {
+      {"Small (50 blocks)", 50, 0.25, 3, 100},
+      {"Medium (150 blocks)", 150, 0.08, 3, 200},
+      {"Large (300 blocks)", 300, 0.03, 3, 300},
+  };
+
+  cout << "\n=== Metal vs UMFPACK Performance Comparison ===" << endl;
+  cout << left << setw(25) << "Case" << setw(10) << "Size" << setw(15) << "UMFPACK(ms)"
+       << setw(15) << "Metal(ms)" << setw(15) << "Speedup" << setw(15) << "UMF resid"
+       << setw(15) << "MTL resid" << endl;
+  cout << string(100, '-') << endl;
+
+  for (const auto& tc : cases) {
+    SparseMatGenerator gen = SparseMatGenerator::genFlat(tc.numBlocks, tc.density, tc.seed);
+    SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+    vector<int64_t> paramSize(gen.columns.size(), tc.blockSize);
+
+    mt19937 rng(tc.seed);
+
+    // Build float test data for Metal
+    auto tdFloat = buildNonSymmetricTestDataFloat(ss, paramSize, rng);
+
+    // Build double test data for UMFPACK
+    rng.seed(tc.seed);  // Reset rng for identical matrix
+    auto tdDouble = buildNonSymmetricTestData(ss, paramSize, rng);
+
+    // RHS vector
+    rng.seed(tc.seed + 1000);
+    uniform_real_distribution<float> unif(-1.0f, 1.0f);
+    Vector<float> bf(tdFloat.totalSize);
+    for (int64_t i = 0; i < tdFloat.totalSize; i++) bf(i) = unif(rng);
+    Vector<double> bd = bf.cast<double>();
+
+    // UMFPACK timing (includes symbolic + numeric + solve)
+    auto umfResult = solveWithUmfpack(tdDouble.colPtr, tdDouble.rowIdx, tdDouble.val,
+                                      tdDouble.totalSize, bd);
+    double umfFactorMs = (umfResult.analysisTime + umfResult.factorTime) * 1000;
+    double umfSolveMs = umfResult.solveTime * 1000;
+
+    // Metal: separate setup from factor+solve
+    int64_t n = tdFloat.totalSize;
+    Solver metalSolver(std::move(*tdFloat.factorSkel), {}, {}, metalOps());
+    vector<int64_t> pivots(n);
+
+    // Metal factor timing
+    MetalMirror<float> dataGpu(tdFloat.data);
+    auto mtlFactorStart = hrc::now();
+    metalSolver.factorLU(dataGpu.ptr(), pivots.data());
+    double mtlFactorMs = tdelta(hrc::now() - mtlFactorStart).count() * 1000;
+    dataGpu.get(tdFloat.data);
+
+    // Metal solve timing
+    vector<float> xVec(bf.data(), bf.data() + n);
+    MetalMirror<float> dataGpu2(tdFloat.data);
+    MetalMirror<float> xGpu(xVec);
+    auto mtlSolveStart = hrc::now();
+    metalSolver.solveLU(dataGpu2.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+    double mtlSolveMs = tdelta(hrc::now() - mtlSolveStart).count() * 1000;
+    xGpu.get(xVec);
+
+    Vector<float> xMetal(n);
+    for (int64_t i = 0; i < n; i++) xMetal(i) = xVec[i];
+    float metalResidual = (tdFloat.fullMat * xMetal - bf).norm() / bf.norm();
+
+    cout << left << setw(25) << tc.name << setw(10) << n
+         << setw(15) << fixed << setprecision(2) << umfFactorMs + umfSolveMs
+         << setw(15) << mtlFactorMs + mtlSolveMs
+         << setw(15) << setprecision(2) << (umfFactorMs + umfSolveMs) / (mtlFactorMs + mtlSolveMs)
+         << "x" << setw(15) << scientific << setprecision(2) << umfResult.residual
+         << setw(15) << metalResidual << endl;
+
+    // Correctness checks
+    EXPECT_LT(umfResult.residual, 1e-10) << tc.name << ": UMFPACK residual too large";
+    EXPECT_LT(metalResidual, 5e-3) << tc.name << ": Metal residual too large";
+  }
+}
+#endif  // BASPACHO_USE_METAL
+
+#ifdef BASPACHO_USE_CUBLAS
+// CUDA GPU vs UMFPACK comparison
+// CUDA supports both float and double; we test double for direct comparison with UMFPACK
+
+double solveCudaLU(LUTestData& td, const Vector<double>& b, Vector<double>& xOut) {
+  Solver solver(std::move(*td.factorSkel), {}, {}, cudaOps());
+  vector<int64_t> pivots(td.totalSize);
+  solver.factorLU(td.data.data(), pivots.data());
+  xOut = b;
+  solver.solveLU(td.data.data(), pivots.data(), xOut.data(), td.totalSize, 1);
+  return (td.fullMat * xOut - b).norm() / b.norm();
+}
+
+TEST(LUComparison, CudaVsUmfpack_BlockSparse) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(25, 0.25, 456);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(456);
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xCuda;
+  double cudaResidual = solveCudaLU(td, b, xCuda);
+
+  cout << "\n=== CUDA vs UMFPACK: Block-Sparse ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "CUDA residual: " << cudaResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(cudaResidual, 1e-8);
+
+  double solutionDiff = (xCuda - umfResult.solution).norm() / umfResult.solution.norm();
+  cout << "Solution difference: " << solutionDiff << endl;
+  EXPECT_LT(solutionDiff, 1e-6);
+}
+
+TEST(LUComparison, CudaVsUmfpack_NonSymmetric) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(25, 0.25, 789);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+  vector<int64_t> paramSize(gen.columns.size(), 3);
+
+  mt19937 rng(789);
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xCuda;
+  double cudaResidual = solveCudaLU(td, b, xCuda);
+
+  cout << "\n=== CUDA vs UMFPACK: Non-Symmetric ===" << endl;
+  cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "CUDA residual: " << cudaResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(cudaResidual, 1e-8);
+}
+
+TEST(LUComparison, CudaVsUmfpack_MixedBlocks) {
+  SparseMatGenerator gen = SparseMatGenerator::genFlat(40, 0.1, 321);
+  SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+
+  mt19937 rng(321);
+  uniform_int_distribution<int64_t> sizeDist(2, 8);
+  vector<int64_t> paramSize;
+  for (size_t i = 0; i < gen.columns.size(); i++) paramSize.push_back(sizeDist(rng));
+
+  auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+  uniform_real_distribution<double> unif(-1.0, 1.0);
+  Vector<double> b(td.totalSize);
+  for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+  auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+
+  Vector<double> xCuda;
+  double cudaResidual = solveCudaLU(td, b, xCuda);
+
+  cout << "\n=== CUDA vs UMFPACK: Mixed Block Sizes ===" << endl;
+  cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
+       << endl;
+  cout << "UMFPACK residual: " << umfResult.residual << endl;
+  cout << "CUDA residual: " << cudaResidual << endl;
+
+  EXPECT_LT(umfResult.residual, 1e-10);
+  EXPECT_LT(cudaResidual, 1e-8);
+}
+
+TEST(LUComparison, CudaVsUmfpack_Performance) {
+  struct TestCase {
+    string name;
+    int numBlocks;
+    double density;
+    int blockSize;
+    int seed;
+  };
+
+  vector<TestCase> cases = {
+      {"Small (50 blocks)", 50, 0.25, 3, 100},
+      {"Medium (150 blocks)", 150, 0.08, 3, 200},
+      {"Large (300 blocks)", 300, 0.03, 3, 300},
+  };
+
+  cout << "\n=== CUDA vs UMFPACK Performance Comparison ===" << endl;
+  cout << left << setw(25) << "Case" << setw(10) << "Size" << setw(15) << "UMFPACK(ms)"
+       << setw(15) << "CUDA(ms)" << setw(15) << "Speedup" << setw(15) << "UMF resid"
+       << setw(15) << "CUDA resid" << endl;
+  cout << string(100, '-') << endl;
+
+  for (const auto& tc : cases) {
+    SparseMatGenerator gen = SparseMatGenerator::genFlat(tc.numBlocks, tc.density, tc.seed);
+    SparseStructure ss = columnsToCscStruct(gen.columns).transpose().addFullEliminationFill();
+    vector<int64_t> paramSize(gen.columns.size(), tc.blockSize);
+
+    mt19937 rng(tc.seed);
+    auto td = buildNonSymmetricTestData(ss, paramSize, rng);
+
+    rng.seed(tc.seed + 1000);
+    uniform_real_distribution<double> unif(-1.0, 1.0);
+    Vector<double> b(td.totalSize);
+    for (int64_t i = 0; i < td.totalSize; i++) b(i) = unif(rng);
+
+    // UMFPACK timing (includes symbolic + numeric + solve)
+    auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
+    double umfFactorMs = (umfResult.analysisTime + umfResult.factorTime) * 1000;
+    double umfSolveMs = umfResult.solveTime * 1000;
+
+    // CUDA: separate setup from factor+solve
+    int64_t n = td.totalSize;
+    Solver cudaSolver(std::move(*td.factorSkel), {}, {}, cudaOps());
+    vector<int64_t> pivots(n);
+
+    auto cudaFactorStart = hrc::now();
+    cudaSolver.factorLU(td.data.data(), pivots.data());
+    double cudaFactorMs = tdelta(hrc::now() - cudaFactorStart).count() * 1000;
+
+    Vector<double> xCuda = b;
+    auto cudaSolveStart = hrc::now();
+    cudaSolver.solveLU(td.data.data(), pivots.data(), xCuda.data(), n, 1);
+    double cudaSolveMs = tdelta(hrc::now() - cudaSolveStart).count() * 1000;
+
+    double cudaResidual = (td.fullMat * xCuda - b).norm() / b.norm();
+
+    cout << left << setw(25) << tc.name << setw(10) << n
+         << setw(15) << fixed << setprecision(2) << umfFactorMs + umfSolveMs
+         << setw(15) << cudaFactorMs + cudaSolveMs
+         << setw(15) << setprecision(2)
+         << (umfFactorMs + umfSolveMs) / (cudaFactorMs + cudaSolveMs)
+         << "x" << setw(15) << scientific << setprecision(2) << umfResult.residual
+         << setw(15) << cudaResidual << endl;
+
+    EXPECT_LT(umfResult.residual, 1e-10) << tc.name << ": UMFPACK residual too large";
+    EXPECT_LT(cudaResidual, 1e-8) << tc.name << ": CUDA residual too large";
+  }
+}
+#endif  // BASPACHO_USE_CUBLAS
 
 #endif  // BASPACHO_HAVE_UMFPACK

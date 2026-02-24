@@ -167,7 +167,11 @@ static id<MTLComputePipelineState> getProfiledPipeline(const char* name) {
 
 static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
                            void (^encodeBlock)(id<MTLComputeCommandEncoder>),
-                           NSUInteger numThreads, const char* kernelName = nullptr) {
+                           NSUInteger numThreads, bool sync = true,
+                           const char* kernelName = nullptr) {
+  // When profiling, force sync to read GPU timestamps
+  if (metalProfilingEnabled()) sync = true;
+
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -185,9 +189,12 @@ static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState
     [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
     [encoder endEncoding];
     [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
 
-    if (metalProfilingEnabled()) {
+    if (sync) {
+      [cmdBuf waitUntilCompleted];
+    }
+
+    if (sync && metalProfilingEnabled()) {
       double gpuTimeMs = ([cmdBuf GPUEndTime] - [cmdBuf GPUStartTime]) * 1000.0;
       const char* name = kernelName;
       std::string lookupName;
@@ -729,9 +736,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             [encoder setBytes:&ld length:sizeof(int64_t) atIndex:4];
             [encoder setBytes:&numCols length:sizeof(int64_t) atIndex:5];
           },
-          1);  // Single thread (sequential swaps)
+          1);  // Single thread; must sync because devPivots reused across calls
     }
   }
+
+  void flush() override { MetalContext::instance().synchronize(); }
 
   MetalSymbolicCtx& sym;
   int64_t numSpans_;
@@ -1120,7 +1129,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
           },
-          1);
+          1);  // Must sync because devPivots reused across calls
     }
   }
 
@@ -1154,7 +1163,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
           },
-          1);
+          1);  // Must sync because devPivots reused across calls
     }
   }
 
@@ -1196,6 +1205,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (NSUInteger)nRows);
     }
   }
+
+  void flush() override { MetalContext::instance().synchronize(); }
 
   MetalSymbolicCtx& sym;
   int nRHS;
