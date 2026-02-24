@@ -77,7 +77,9 @@ function(bundle_static_library tgt_name bundled_tgt_name)
       if (LLVM_AR)
         set(ar_tool "${LLVM_AR}")
       else()
-        message(STATUS "llvm-ar not found, using ${ar_tool} (CMAKE_AR)")
+        message(FATAL_ERROR
+          "llvm-ar not found! Apple's ar does not support MRI scripts (-M).\n"
+          "Install llvm-ar via: brew install llvm && sudo ln -sf $(brew --prefix llvm)/bin/llvm-ar /usr/local/bin/llvm-ar")
       endif()
     endif()
 
