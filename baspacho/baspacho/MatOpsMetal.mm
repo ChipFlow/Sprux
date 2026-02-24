@@ -293,21 +293,34 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Flush buffered saveGemm work items as a single batched kernel dispatch.
+  // Must commit any pending command buffer first so the GPU finishes reading
+  // from devGemmWorkBuf_ before we overwrite it.
   void flushPendingGemms() {
     if (pendingGemms_.empty()) return;
 
-    int64_t count = (int64_t)pendingGemms_.size();
+    // Commit pending work that may be reading from devGemmWorkBuf_
+    if (gemmWorkBufInFlight_) {
+      if (pendingCmdBuf_) {
+        if (pendingEncoder_) {
+          [pendingEncoder_ endEncoding];
+          pendingEncoder_ = nil;
+        }
+        [pendingCmdBuf_ commit];
+        [pendingCmdBuf_ waitUntilCompleted];
+        pendingCmdBuf_ = nil;
+        pendingDispatchCount_ = 0;
+      }
+      gemmWorkBufInFlight_ = false;
+    }
 
-    // Ensure GPU buffer is large enough (in units of int64_t for MetalMirror compatibility)
+    int64_t count = (int64_t)pendingGemms_.size();
     size_t bytesNeeded = count * sizeof(LUGemmWorkItem);
     size_t int64sNeeded = (bytesNeeded + sizeof(int64_t) - 1) / sizeof(int64_t);
     devGemmWorkBuf_.resizeToAtLeast(int64sNeeded);
 
-    // Copy work items to shared GPU buffer
+    // Copy work items to GPU buffer (safe — GPU is not reading it now)
     memcpy(devGemmWorkBuf_.ptr(), pendingGemms_.data(), bytesNeeded);
 
-    // Dispatch batched kernel — buffer bound at offset 0 since work item offsets
-    // are absolute element offsets from buffer start
     id<MTLComputePipelineState> pipeline = getProfiledPipeline(
             "lu_batchedSaveGemm_kernel_float");
 
@@ -322,6 +335,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         },
         (NSUInteger)count);
 
+    gemmWorkBufInFlight_ = true;
     pendingGemms_.clear();
   }
 
@@ -1007,9 +1021,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       hostPivotsBase_ = nullptr;
       pivotsSize_ = 0;
     }
-    // Reset cached data buffer for next factorization
+    // Reset batched state for next factorization
     cachedDataBuffer_ = nil;
     cachedDataBaseOffset_ = 0;
+    gemmWorkBufInFlight_ = false;
     MetalContext::instance().synchronize();
   }
 
@@ -1026,7 +1041,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   // Batched saveGemm state
   std::vector<LUGemmWorkItem> pendingGemms_;   // CPU-side work item accumulator
-  MetalMirror<int64_t> devGemmWorkBuf_;        // Reusable GPU buffer for work items
+  MetalMirror<int64_t> devGemmWorkBuf_;        // GPU buffer for work items (reused per flush)
+  bool gemmWorkBufInFlight_ = false;           // True if GPU may be reading devGemmWorkBuf_
   id<MTLBuffer> cachedDataBuffer_ = nil;       // Cached MTLBuffer for data
   size_t cachedDataBaseOffset_ = 0;            // Cached byte offset into MTLBuffer
 
