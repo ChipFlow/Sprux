@@ -27,6 +27,14 @@ using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
 
+// Work item struct matching the Metal shader definition
+struct LUGemmWorkItem {
+  int64_t offL, ldL;
+  int64_t offU, ldU;
+  int64_t offC, ldC;
+  int64_t m, n, k;
+};
+
 // Synchronization ops for Metal
 struct MetalSyncOps {
   static void sync() { MetalContext::instance().synchronize(); }
@@ -221,9 +229,101 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       : sym(sym_), numSpans_(numSpans), spanToChainOffset(numSpans) {
     tempBuffer.resizeToAtLeast(tempBufSize);
     devSpanToChainOffset.resizeToAtLeast(numSpans);
+    // Pre-allocate GPU pivot storage for all lumps (used by batched LU)
+    int64_t totalOrder = sym.skel.order();
+    if (totalOrder > 0) {
+      devAllPivots.resizeToAtLeast(totalOrder);
+    }
   }
 
-  virtual ~MetalNumericCtx() override {}
+  virtual ~MetalNumericCtx() override {
+    // Flush any pending work before destruction
+    commitAndWait();
+  }
+
+  // Encode a kernel dispatch onto a persistent compute encoder within the
+  // pending command buffer. Uses a single encoder for all dispatches with
+  // memory barriers between them to ensure correct data ordering.
+  // This avoids the ~4μs overhead of creating/ending a new encoder per dispatch.
+  void encodeKernel(id<MTLComputePipelineState> pipeline,
+                    void (^encodeBlock)(id<MTLComputeCommandEncoder>),
+                    NSUInteger numThreads) {
+    @autoreleasepool {
+      if (!pendingCmdBuf_) {
+        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+        pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
+        pendingDispatchCount_ = 0;
+      }
+
+      // Insert memory barrier so previous dispatches' buffer writes are visible
+      if (pendingDispatchCount_ > 0) {
+        [pendingEncoder_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      }
+
+      [pendingEncoder_ setComputePipelineState:pipeline];
+      encodeBlock(pendingEncoder_);
+
+      NSUInteger threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
+      threadGroupSize = MIN(threadGroupSize, numThreads);
+
+      MTLSize threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+      MTLSize numGroups =
+          MTLSizeMake((numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
+
+      [pendingEncoder_ dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+      pendingDispatchCount_++;
+    }
+  }
+
+  // Commit the pending command buffer and wait for GPU completion.
+  // Ends the persistent encoder first, then commits.
+  // No-op if no dispatches are pending.
+  void commitAndWait() {
+    flushPendingGemms();
+    if (pendingCmdBuf_) {
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      [pendingCmdBuf_ commit];
+      [pendingCmdBuf_ waitUntilCompleted];
+      pendingCmdBuf_ = nil;
+      pendingDispatchCount_ = 0;
+    }
+  }
+
+  // Flush buffered saveGemm work items as a single batched kernel dispatch.
+  void flushPendingGemms() {
+    if (pendingGemms_.empty()) return;
+
+    int64_t count = (int64_t)pendingGemms_.size();
+
+    // Ensure GPU buffer is large enough (in units of int64_t for MetalMirror compatibility)
+    size_t bytesNeeded = count * sizeof(LUGemmWorkItem);
+    size_t int64sNeeded = (bytesNeeded + sizeof(int64_t) - 1) / sizeof(int64_t);
+    devGemmWorkBuf_.resizeToAtLeast(int64sNeeded);
+
+    // Copy work items to shared GPU buffer
+    memcpy(devGemmWorkBuf_.ptr(), pendingGemms_.data(), bytesNeeded);
+
+    // Dispatch batched kernel — buffer bound at offset 0 since work item offsets
+    // are absolute element offsets from buffer start
+    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+            "lu_batchedSaveGemm_kernel_float");
+
+    encodeKernel(
+        pipeline,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:cachedDataBuffer_ offset:0 atIndex:0];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)devGemmWorkBuf_.buffer()
+                      offset:0
+                     atIndex:1];
+          [encoder setBytes:&count length:sizeof(int64_t) atIndex:2];
+        },
+        (NSUInteger)count);
+
+    pendingGemms_.clear();
+  }
 
   virtual void pseudoFactorSpans(float* data, int64_t spanBegin, int64_t spanEnd) override {
     @autoreleasepool {
@@ -372,6 +472,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
+      // Flush pending GPU writes (e.g. assemble) before CPU reads data
+      commitAndWait();
+
       // Use row-major (matches CpuBaseNumericCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
@@ -388,6 +491,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
+      // Flush pending GPU writes (e.g. assemble) before CPU reads data
+      commitAndWait();
+
       // Use row-major for B, column-major for A (matches CpuBaseNumericCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
       using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
@@ -403,6 +509,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                             int64_t offset) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
+
+      // Flush pending assemble work before overwriting tempBuffer
+      commitAndWait();
 
       // Ensure temp buffer is large enough
       tempBuffer.resizeToAtLeast(m * n);
@@ -490,6 +599,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
+    // Only flush if assemble() was actually called since last prepareAssemble.
+    // For LU factorization (isGeneral()==true), eliminateBoardLU only calls
+    // saveGemm — never assemble — so flushing is unnecessary and avoiding it
+    // eliminates a per-lump CPU sync point.
+    if (assembleWasCalled_) {
+      commitAndWait();
+      assembleWasCalled_ = false;
+    }
+
     // Prepare chain offset mapping for assembly (same as CUDA version)
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -508,6 +626,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                         int64_t numBlockCols) override {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
+      assembleWasCalled_ = true;
 
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -527,15 +646,43 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // This matches CPU ref where startRow = pChainRowsTillEnd[-1] after offsetting the pointer
       int64_t startRow = (srcColDataOffset > 0) ? sym.skel.chainRowsTillEnd[srcColDataOffset - 1] : 0;
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      // Profiling fallback: use dispatchKernel for per-kernel GPU timestamps
+      if (metalProfilingEnabled()) {
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBytes:&numBlockRows length:sizeof(int64_t) atIndex:0];
+              [encoder setBytes:&numBlockCols length:sizeof(int64_t) atIndex:1];
+              [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:2];
+              [encoder setBytes:&srcRectWidth length:sizeof(int64_t) atIndex:3];
+              [encoder setBytes:&dstStride length:sizeof(int64_t) atIndex:4];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                          offset:srcColDataOffset * sizeof(int64_t)
+                         atIndex:5];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                          offset:srcColDataOffset * sizeof(int64_t)
+                         atIndex:6];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)devSpanToChainOffset.buffer()
+                          offset:0
+                         atIndex:7];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
+                          offset:0
+                         atIndex:8];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)tempBuffer.buffer() offset:0 atIndex:9];
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:10];
+            },
+            (NSUInteger)numThreads);
+        return;
+      }
+
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBytes:&numBlockRows length:sizeof(int64_t) atIndex:0];
             [encoder setBytes:&numBlockCols length:sizeof(int64_t) atIndex:1];
             [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:2];
             [encoder setBytes:&srcRectWidth length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&dstStride length:sizeof(int64_t) atIndex:4];
-            // pChainRowsTillEnd offset by srcColDataOffset
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:srcColDataOffset * sizeof(int64_t)
                        atIndex:5];
@@ -563,9 +710,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       int64_t minMN = std::min(m, n);
 
-      // Ensure pivot buffer is large enough
-      devPivots.resizeToAtLeast(minMN);
-
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -577,19 +721,49 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_getrf_kernel_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      // Profiling fallback: use sync dispatch for per-kernel GPU timestamps
+      if (metalProfilingEnabled()) {
+        devPivots.resizeToAtLeast(minMN);
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+              [encoder setBytes:&offA length:sizeof(int64_t) atIndex:1];
+              [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
+              [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:4];
+            },
+            1);
+        memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
+        return 0;
+      }
+
+      // Flush pending saveGemm work items before getrf — ensures all Schur
+      // complement updates are dispatched before factorization of this lump.
+      flushPendingGemms();
+
+      // Batched path: write pivots directly to devAllPivots at the correct offset.
+      // On first call, record the base CPU pivots pointer so we can compute
+      // GPU offsets for subsequent calls and copy everything back at flush().
+      if (!hostPivotsBase_) {
+        hostPivotsBase_ = pivots;
+        pivotsSize_ = sym.skel.order();
+      }
+      int64_t pivotGpuOffset = pivots - hostPivotsBase_;
+
+      // Encode onto pending command buffer — no commitAndWait, no memcpy
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
             [encoder setBytes:&offA length:sizeof(int64_t) atIndex:1];
             [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
+                        offset:pivotGpuOffset * sizeof(int64_t)
+                       atIndex:4];
           },
-          1);  // Single thread
-
-      // Copy pivots from GPU buffer to caller's buffer (shared memory = just memcpy)
-      memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
+          1);
 
       return 0;
     }
@@ -600,7 +774,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
-      // Find the MTLBuffer for L (and B, which is in the same data buffer)
       auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!lBufferInfo.first || !bBufferInfo.first) {
@@ -614,8 +787,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_trsmLowerUnit_kernel_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      // Profiling fallback: use dispatchKernel for per-kernel GPU timestamps
+      if (metalProfilingEnabled()) {
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
+              [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
+              [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
+              [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
+              [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
+              [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
+              [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
+            },
+            1);
+        return;
+      }
+
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
             [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
@@ -647,8 +837,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_trsmUpperRight_kernel_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      // Profiling fallback: use dispatchKernel for per-kernel GPU timestamps
+      if (metalProfilingEnabled()) {
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:0];
+              [encoder setBytes:&offU length:sizeof(int64_t) atIndex:1];
+              [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
+              [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
+              [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
+              [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
+              [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
+            },
+            1);
+        return;
+      }
+
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:0];
             [encoder setBytes:&offU length:sizeof(int64_t) atIndex:1];
@@ -668,41 +875,73 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
-      auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
-      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
-      if (!lBufferInfo.first || !uBufferInfo.first || !cBufferInfo.first) {
-        throw std::runtime_error("MetalNumericCtx<float>::saveGemm: buffer not found");
+      // Profiling path: dispatch individually for per-kernel GPU timestamps
+      if (metalProfilingEnabled()) {
+        auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
+        auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
+        auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+        if (!lBufferInfo.first || !uBufferInfo.first || !cBufferInfo.first) {
+          throw std::runtime_error("MetalNumericCtx<float>::saveGemm: buffer not found");
+        }
+        id<MTLBuffer> lBuffer = (__bridge id<MTLBuffer>)lBufferInfo.first;
+        size_t lBaseOffset = lBufferInfo.second;
+        id<MTLBuffer> uBuffer = (__bridge id<MTLBuffer>)uBufferInfo.first;
+        size_t uBaseOffset = uBufferInfo.second;
+        id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+        size_t cBaseOffset = cBufferInfo.second;
+
+        id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+                "lu_saveGemm_kernel_float");
+
+        int64_t numThreads = m * n;
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
+              [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
+              [encoder setBytes:&ldL length:sizeof(int64_t) atIndex:2];
+              [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:3];
+              [encoder setBytes:&offU length:sizeof(int64_t) atIndex:4];
+              [encoder setBytes:&ldU length:sizeof(int64_t) atIndex:5];
+              [encoder setBuffer:cBuffer offset:cBaseOffset atIndex:6];
+              [encoder setBytes:&offC length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&ldC length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&m length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&n length:sizeof(int64_t) atIndex:10];
+              [encoder setBytes:&k length:sizeof(int64_t) atIndex:11];
+            },
+            (NSUInteger)numThreads);
+        sym.luGemmCalls++;
+        return;
       }
-      id<MTLBuffer> lBuffer = (__bridge id<MTLBuffer>)lBufferInfo.first;
-      size_t lBaseOffset = lBufferInfo.second;
-      id<MTLBuffer> uBuffer = (__bridge id<MTLBuffer>)uBufferInfo.first;
-      size_t uBaseOffset = uBufferInfo.second;
-      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
-      size_t cBaseOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
-              "lu_saveGemm_kernel_float");
+      // Batched path: buffer work items, flush later in flushPendingGemms()
+      // On first call, cache the data buffer info (L, U, C all share the same buffer)
+      if (!cachedDataBuffer_) {
+        auto bufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+        if (!bufferInfo.first) {
+          throw std::runtime_error("MetalNumericCtx<float>::saveGemm: buffer not found");
+        }
+        cachedDataBuffer_ = (__bridge id<MTLBuffer>)bufferInfo.first;
+        cachedDataBaseOffset_ = bufferInfo.second;
+      }
 
-      int64_t numThreads = m * n;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
-            [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
-            [encoder setBytes:&ldL length:sizeof(int64_t) atIndex:2];
-            [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:3];
-            [encoder setBytes:&offU length:sizeof(int64_t) atIndex:4];
-            [encoder setBytes:&ldU length:sizeof(int64_t) atIndex:5];
-            [encoder setBuffer:cBuffer offset:cBaseOffset atIndex:6];
-            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&ldC length:sizeof(int64_t) atIndex:8];
-            [encoder setBytes:&m length:sizeof(int64_t) atIndex:9];
-            [encoder setBytes:&n length:sizeof(int64_t) atIndex:10];
-            [encoder setBytes:&k length:sizeof(int64_t) atIndex:11];
-          },
-          (NSUInteger)numThreads);
+      // L, U, C all point into the same MTLBuffer. Compute absolute element
+      // offsets from the buffer start using pointer arithmetic relative to C.
+      int64_t cElemFromBufStart = (int64_t)(cachedDataBaseOffset_ / sizeof(float));
 
+      LUGemmWorkItem item;
+      item.offL = cElemFromBufStart + (int64_t)(L - C) + offL;
+      item.ldL = ldL;
+      item.offU = cElemFromBufStart + (int64_t)(U - (const float*)C) + offU;
+      item.ldU = ldU;
+      item.offC = cElemFromBufStart + offC;
+      item.ldC = ldC;
+      item.m = m;
+      item.n = n;
+      item.k = k;
+
+      pendingGemms_.push_back(item);
       sym.luGemmCalls++;
     }
   }
@@ -711,10 +950,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                              int64_t numCols) override {
     @autoreleasepool {
       if (n <= 0 || numCols <= 0) return;
-
-      // Copy pivots to GPU buffer
-      devPivots.resizeToAtLeast(n);
-      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -726,28 +961,79 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_applyRowPerm_kernel_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      // Profiling fallback: sync dispatch with CPU↔GPU pivot copy
+      if (metalProfilingEnabled()) {
+        devPivots.resizeToAtLeast(n);
+        memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+              [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
+              [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
+              [encoder setBytes:&ld length:sizeof(int64_t) atIndex:4];
+              [encoder setBytes:&numCols length:sizeof(int64_t) atIndex:5];
+            },
+            1);
+        return;
+      }
+
+      // Batched path: read pivots directly from devAllPivots (written by getrf).
+      // No CPU→GPU memcpy needed — pivots stay on GPU the entire time.
+      int64_t pivotGpuOffset = hostPivotsBase_ ? (pivots - hostPivotsBase_) : 0;
+
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
+                        offset:pivotGpuOffset * sizeof(int64_t)
+                       atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
             [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
             [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&ld length:sizeof(int64_t) atIndex:4];
             [encoder setBytes:&numCols length:sizeof(int64_t) atIndex:5];
           },
-          1);  // Single thread; must sync because devPivots reused across calls
+          1);
     }
   }
 
-  void flush() override { MetalContext::instance().synchronize(); }
+  void flush() override {
+    commitAndWait();
+    // Copy all GPU pivots back to CPU for the solve path
+    if (hostPivotsBase_ && pivotsSize_ > 0) {
+      memcpy(hostPivotsBase_, devAllPivots.ptr(), pivotsSize_ * sizeof(int64_t));
+      hostPivotsBase_ = nullptr;
+      pivotsSize_ = 0;
+    }
+    // Reset cached data buffer for next factorization
+    cachedDataBuffer_ = nil;
+    cachedDataBaseOffset_ = 0;
+    MetalContext::instance().synchronize();
+  }
 
   MetalSymbolicCtx& sym;
   int64_t numSpans_;
   MetalMirror<float> tempBuffer;
   MetalMirror<int64_t> devSpanToChainOffset;
   std::vector<int64_t> spanToChainOffset;
-  MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
+  MetalMirror<int64_t> devPivots;       // GPU buffer for LU pivots (profiling path)
+  MetalMirror<int64_t> devAllPivots;    // GPU pivot storage for all lumps (batched path)
+  int64_t* hostPivotsBase_ = nullptr;   // CPU pivots base pointer (set on first getrf)
+  int64_t pivotsSize_ = 0;             // Total size of pivots array
+  bool assembleWasCalled_ = false;      // Track whether assemble() was called
+
+  // Batched saveGemm state
+  std::vector<LUGemmWorkItem> pendingGemms_;   // CPU-side work item accumulator
+  MetalMirror<int64_t> devGemmWorkBuf_;        // Reusable GPU buffer for work items
+  id<MTLBuffer> cachedDataBuffer_ = nil;       // Cached MTLBuffer for data
+  size_t cachedDataBaseOffset_ = 0;            // Cached byte offset into MTLBuffer
+
+  // Command buffer batching state
+  id<MTLCommandBuffer> pendingCmdBuf_ = nil;
+  id<MTLComputeCommandEncoder> pendingEncoder_ = nil;
+  int pendingDispatchCount_ = 0;
 };
 
 // Solve context for float - Metal implementation

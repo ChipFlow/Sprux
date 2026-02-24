@@ -826,6 +826,38 @@ kernel void lu_trsmUpperRight_kernel_float(
     }
 }
 
+// Work item for batched saveGemm: one thread computes one full C -= L * U block
+struct LUGemmWorkItem {
+    int64_t offL, ldL;   // L block element offset and row stride
+    int64_t offU, ldU;   // U block element offset and row stride
+    int64_t offC, ldC;   // C block element offset and row stride
+    int64_t m, n, k;     // rows of C, cols of C, inner dimension
+};
+
+// Batched saveGemm: one thread per work item, each computing a full m×n GEMM
+kernel void lu_batchedSaveGemm_kernel_float(
+    device float* data [[buffer(0)]],
+    constant LUGemmWorkItem* workItems [[buffer(1)]],
+    constant int64_t& workCount [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= workCount) return;
+
+    LUGemmWorkItem item = workItems[tid];
+    for (int64_t row = 0; row < item.m; row++) {
+        for (int64_t col = 0; col < item.n; col++) {
+            float sum = 0.0f;
+            for (int64_t p = 0; p < item.k; p++) {
+                sum += data[item.offL + row * item.ldL + p]
+                     * data[item.offU + p * item.ldU + col];
+            }
+            device atomic_uint* addr =
+                (device atomic_uint*)&data[item.offC + row * item.ldC + col];
+            atomicSubFloat(addr, sum);
+        }
+    }
+}
+
 // saveGemm: C -= L * U (all row-major with strides)
 kernel void lu_saveGemm_kernel_float(
     constant float* L [[buffer(0)]],
