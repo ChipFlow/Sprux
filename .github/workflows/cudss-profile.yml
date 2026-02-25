@@ -15,7 +15,7 @@ env:
 
 jobs:
   profile:
-    runs-on: [self-hosted, nvidia-runner-1]
+    runs-on: [nvidia-runner-1]
 
     steps:
     - uses: actions/checkout@v4

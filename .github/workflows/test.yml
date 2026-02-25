@@ -106,7 +106,7 @@ jobs:
 
   # CUDA GPU tests on self-hosted NVIDIA runner
   cuda-gpu:
-    runs-on: [self-hosted, nvidia-runner-1]
+    runs-on: [nvidia-runner-1]
 
     steps:
     - uses: actions/checkout@v4
