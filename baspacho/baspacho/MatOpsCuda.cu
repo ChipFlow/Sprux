@@ -819,7 +819,7 @@ void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, 
 // Row-major → col-major: CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit
 template <>
 void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
-                                             double* B, int64_t offB, int64_t ldb) {
+                                             double* B, int64_t offB, int64_t /*ldb*/) {
   double alpha(1.0);
   cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
@@ -827,7 +827,7 @@ void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* 
 
 template <>
 void CudaNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
-                                            float* B, int64_t offB, int64_t ldb) {
+                                            float* B, int64_t offB, int64_t /*ldb*/) {
   float alpha(1.0);
   cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
