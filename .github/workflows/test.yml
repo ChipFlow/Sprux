@@ -111,10 +111,17 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential libopenblas-dev
+
     - name: System info
       run: |
         echo "=== GPU Info ==="
         nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CMake ==="
+        cmake --version
 
     - name: Configure CMake
       run: |
