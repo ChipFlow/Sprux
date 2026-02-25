@@ -477,8 +477,9 @@ TEST(CudssBenchmark, CuDSS_LU) {
       &cudssA, nRows64, nCols64, nnz64,
       d_rowPtr, nullptr,  // row end offsets (null = derive from rowPtr)
       d_colInd, d_values,
-      CUDA_R_32I, CUDA_R_32I, CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL,
-      CUDA_R_64F));
+      CUDA_R_32I, CUDA_R_64F,
+      CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL,
+      CUDSS_BASE_ZERO));
 
   // Create dense RHS and solution vectors
   cudssMatrix_t cudssB = nullptr;
