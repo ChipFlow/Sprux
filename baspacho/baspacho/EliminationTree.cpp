@@ -378,7 +378,11 @@ void EliminationTree::computeAggregateStruct(bool fillOnlyForElims) {
       tperm = tperm.addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
     }
   } else {
+#ifdef BASPACHO_HAVE_CHOLMOD
+    tperm = tperm.addFullEliminationFillCholmod();
+#else
     tperm = tperm.addFullEliminationFill();
+#endif
   }
   tperm = tperm.transpose();
 
