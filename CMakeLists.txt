@@ -233,6 +233,22 @@ if(BASPACHO_BUILD_EXAMPLES)
     include_directories(${CHOLMOD_INCLUDE_DIR})
   endif()
 
+  # cuDSS (for GPU sparse direct solver comparison)
+  if(BASPACHO_USE_CUBLAS)
+    message("${Cyan}==============================[ cuDSS ]=================================${ColourReset}")
+    find_package(cuDSS)
+
+    if(cuDSS_FOUND)
+      set(HAVE_CUDSS 1)
+      message("* cuDSS Include = " ${CUDSS_INCLUDE_DIRS})
+      message("* cuDSS Libraries = " ${CUDSS_LIBRARIES})
+      add_compile_definitions(BASPACHO_HAVE_CUDSS)
+    else()
+      set(HAVE_CUDSS 0)
+      message("* cuDSS not found! cuDSS benchmarking comparison will not be available")
+    endif()
+  endif()
+
   # UMFPACK (for LU benchmarking comparison)
   message("${Cyan}============================[ UMFPACK ]=================================${ColourReset}")
   find_path(UMFPACK_INCLUDE_DIR NAMES umfpack.h

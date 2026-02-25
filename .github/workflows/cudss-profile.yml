@@ -1,0 +1,126 @@
+name: cuDSS vs BaSpaCho Profiling
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsys_args:
+        description: 'Extra nsys arguments (e.g. --trace=cuda,nvtx,cublas)'
+        default: ''
+      cudss_version:
+        description: 'cuDSS version to install'
+        default: '0.5.0.5'
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  profile:
+    runs-on: [self-hosted, nvidia-runner-1]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA Version ==="
+        nvcc --version || echo "nvcc not available"
+        echo "=== nsys Version ==="
+        nsys --version || echo "nsys not available"
+
+    - name: Install cuDSS
+      run: |
+        CUDSS_VERSION="${{ inputs.cudss_version }}"
+        CUDSS_DIR="/opt/cudss-${CUDSS_VERSION}"
+
+        if [ -d "${CUDSS_DIR}" ] && [ -f "${CUDSS_DIR}/include/cudss.h" ]; then
+          echo "cuDSS ${CUDSS_VERSION} already installed at ${CUDSS_DIR}"
+        else
+          echo "Installing cuDSS ${CUDSS_VERSION}..."
+          # Determine CUDA major version for download URL
+          CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+          CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
+
+          TARBALL="libcudss-linux-x86_64-${CUDSS_VERSION}_cuda${CUDA_MAJOR}-archive.tar.xz"
+          URL="https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-x86_64/${TARBALL}"
+
+          echo "Downloading from: ${URL}"
+          wget -q "${URL}" -O /tmp/cudss.tar.xz || {
+            echo "::error::Failed to download cuDSS. Check version and URL."
+            echo "Tried: ${URL}"
+            exit 1
+          }
+
+          sudo mkdir -p "${CUDSS_DIR}"
+          sudo tar xf /tmp/cudss.tar.xz -C "${CUDSS_DIR}" --strip-components=1
+          rm /tmp/cudss.tar.xz
+        fi
+
+        echo "CUDSS_DIR=${CUDSS_DIR}" >> "$GITHUB_ENV"
+
+        # Verify installation
+        ls -la "${CUDSS_DIR}/include/cudss.h"
+        ls -la "${CUDSS_DIR}/lib/"
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DBASPACHO_USE_CUBLAS=ON \
+          -DBASPACHO_USE_METAL=OFF \
+          -DBASPACHO_USE_OPENCL=OFF \
+          -DBASPACHO_BUILD_TESTS=ON \
+          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DCUDSS_DIR="${CUDSS_DIR}"
+
+    - name: Build CudssBenchmarkTest
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} --target CudssBenchmarkTest -j"$(nproc)"
+
+    - name: Run nsys profile
+      run: |
+        cd ${{ github.workspace }}
+
+        export BASPACHO_MTX_DIR=test_data/c6288_jacobian
+
+        nsys profile \
+          --trace=cuda,nvtx,osrt \
+          --stats=true \
+          --output /tmp/cudss_vs_baspacho \
+          ${{ inputs.nsys_args }} \
+          ./build/baspacho/tests/CudssBenchmarkTest
+
+    - name: Generate stats summary
+      run: |
+        echo "## cuDSS vs BaSpaCho Profiling Results" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### NVTX Range Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report nvtxsum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### CUDA Kernel Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudakernsum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### CUDA API Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudaapisum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### Memory Transfer Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudamemcpysum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload nsys report
+      uses: actions/upload-artifact@v4
+      with:
+        name: nsys-profile-cudss-vs-baspacho
+        path: /tmp/cudss_vs_baspacho.nsys-rep
+        retention-days: 30

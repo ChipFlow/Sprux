@@ -36,6 +36,14 @@ add_baspacho_test(MetalLUTest MetalLUTest.cpp)
 # add_baspacho_test(MetalPartialTest MetalPartialTest.cpp)
 endif()
 
+if(HAVE_CUDSS)
+add_executable(CudssBenchmarkTest CudssBenchmarkTest.cpp)
+target_link_libraries(CudssBenchmarkTest
+  ${BASPACHO_LIBRARY} testing gtest_main gmock
+  cuDSS::cuDSS CUDA::cudart CUDA::nvToolsExt)
+gtest_discover_tests(CudssBenchmarkTest)
+endif()
+
 if(BASPACHO_USE_OPENCL)
 add_baspacho_test(OpenCLFactorTest OpenCLFactorTest.cpp)
 # add_baspacho_test(OpenCLSolveTest OpenCLSolveTest.cpp)
