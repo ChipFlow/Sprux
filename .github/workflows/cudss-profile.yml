@@ -52,8 +52,6 @@ jobs:
 
     - name: Run nsys profile
       run: |
-        cd ${{ github.workspace }}
-
         export BASPACHO_MTX_DIR=test_data/c6288_jacobian
 
         nsys profile \
