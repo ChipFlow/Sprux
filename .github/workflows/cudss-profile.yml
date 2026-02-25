@@ -17,7 +17,7 @@ jobs:
   profile:
     runs-on: [nvidia-runner-1]
     container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
       options: --gpus all
 
     steps:
