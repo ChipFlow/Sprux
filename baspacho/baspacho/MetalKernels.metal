@@ -333,18 +333,23 @@ kernel void sparse_elim_straight_kernel_float(
     // Find target block in factored matrix
     int64_t iLump = spanToLump[iSpan];
     int64_t iSpanOff = spanOffsetInLump[iSpan];
-    int64_t jSpanOff = spanOffsetInLump[jSpan];
     int64_t targetLumpSize = lumpStart[iLump + 1] - lumpStart[iLump];
 
-    // Target chain lookup would go here...
-    // For now, this is a skeleton - full implementation requires chain lookup
+    // Find target chain entry: bisect chainRowSpan in iLump's chain to find jSpan
+    int64_t targetStartPtr = chainColPtr[iLump];
+    int64_t targetEndPtr = chainColPtr[iLump + 1];
+    int64_t targetPos = bisect(chainRowSpan + targetStartPtr, targetEndPtr - targetStartPtr, jSpan);
+    int64_t jiDataPtr = chainData[targetStartPtr + targetPos];
 
-    // Perform elimination: target -= src_i * src_j^T (with atomics)
+    // Target block pointer: offset by iSpanOff within the lump
+    device float* target = data + jiDataPtr + iSpanOff;
+
+    // Perform elimination: target -= srcJ * srcI^T (with atomics)
     device float* srcI = data + iDataPtr;
     device float* srcJ = data + jDataPtr;
-
-    // This is simplified - actual implementation needs target pointer lookup
-    // locked_sub_product(target, targetStride, srcI, iSize, lumpSize, lumpSize, srcJ, jSize, lumpSize);
+    locked_sub_product_float(target, int(targetLumpSize),
+                             srcJ, int(jSize), int(lumpSize), int(lumpSize),
+                             srcI, int(iSize), int(lumpSize));
 }
 
 // ============================================================================
@@ -746,6 +751,8 @@ kernel void lu_factor_lump_kernel_float(
 // Apply row permutation to factored matrix columns (for the block above diagonal in LU)
 // pivots[i] indicates row i should be swapped with row pivots[i]
 // Data is column-major with stride ld
+// Parallelized across columns: each thread handles a subset of columns.
+// Must dispatch as a SINGLE threadgroup (threadgroup_barrier only syncs within one group).
 kernel void lu_applyRowPerm_kernel_float(
     device int64_t* pivots [[buffer(0)]],
     constant int64_t& n [[buffer(1)]],
@@ -753,21 +760,20 @@ kernel void lu_applyRowPerm_kernel_float(
     constant int64_t& offData [[buffer(3)]],
     constant int64_t& ld [[buffer(4)]],
     constant int64_t& numCols [[buffer(5)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint tcount [[threads_per_threadgroup]])
 {
-    // Single-threaded sequential swaps (data dependency between iterations)
-    if (tid != 0) return;
-
     device float* d = data + offData;
     for (int64_t i = 0; i < n; i++) {
         int64_t swapRow = pivots[i];
         if (swapRow != i) {
-            for (int64_t c = 0; c < numCols; c++) {
+            for (int64_t c = tid; c < numCols; c += tcount) {
                 float tmp = d[i + c * ld];
                 d[i + c * ld] = d[swapRow + c * ld];
                 d[swapRow + c * ld] = tmp;
             }
         }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
@@ -1090,4 +1096,134 @@ kernel void lu_solveU_direct_kernel_float(
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
         solveUpperRM(U, int(n), int(n), C + offC + rhs * ldc);
     }
+}
+
+// ============================================================================
+// Sparse elimination solve kernels: below-diagonal block multiply
+// ============================================================================
+
+// Forward solve: matQ -= block * matC for below-diagonal blocks
+// One thread per lump. For each lump, iterates over below-diagonal rows.
+kernel void sparseElim_subDiagMult_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* chainColPtr [[buffer(2)]],
+    constant int64_t* chainRowSpan [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t colEnd = chainColPtr[lump + 1];
+
+    // matC is at v + lumpStart, col-major with stride ldc
+    for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = chainRowSpan[colPtr];
+        int64_t rowSpanStart = spanStarts[rowSpan];
+        int64_t rowSpanSize = spanStarts[rowSpan + 1] - rowSpanStart;
+        int64_t blockPtr = chainData[colPtr];
+
+        // block is rowSpanSize × lumpSize (row-major)
+        // matQ -= block * matC
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t r = 0; r < rowSpanSize; r++) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < lumpSize; k++) {
+                    sum += data[blockPtr + r * lumpSize + k] * v[lumpStart + k + rhs * ldc];
+                }
+                v[rowSpanStart + r + rhs * ldc] -= sum;
+            }
+        }
+    }
+}
+
+// Backward solve: matC -= block^T * matQ for below-diagonal blocks
+// One thread per lump.
+kernel void sparseElim_subDiagMultT_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* chainColPtr [[buffer(2)]],
+    constant int64_t* chainRowSpan [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t colEnd = chainColPtr[lump + 1];
+
+    // matC is at v + lumpStart, col-major with stride ldc
+    for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = chainRowSpan[colPtr];
+        int64_t rowSpanStart = spanStarts[rowSpan];
+        int64_t rowSpanSize = spanStarts[rowSpan + 1] - rowSpanStart;
+        int64_t blockPtr = chainData[colPtr];
+
+        // block is rowSpanSize × lumpSize (row-major)
+        // matC -= block^T * matQ
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t c = 0; c < lumpSize; c++) {
+                float sum = 0.0f;
+                for (int64_t r = 0; r < rowSpanSize; r++) {
+                    sum += data[blockPtr + r * lumpSize + c] * v[rowSpanStart + r + rhs * ldc];
+                }
+                v[lumpStart + c + rhs * ldc] -= sum;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Utility kernel: transpose square matrix in-place
+// ============================================================================
+
+// One thread per off-diagonal pair (i, j) where j > i.
+// Swaps mat[i*n+j] with mat[j*n+i].
+kernel void transposeSquareInPlace_kernel_float(
+    device float* mat [[buffer(0)]],
+    constant int64_t& n [[buffer(1)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t total = n * (n - 1) / 2;
+    if (int64_t(tid) >= total) return;
+
+    // Map linear index to upper triangle (i, j) where j > i
+    int64_t idx = int64_t(tid);
+    int64_t i = 0;
+    int64_t count = 0;
+    for (i = 0; i < n - 1; i++) {
+        int64_t rowElems = n - 1 - i;
+        if (count + rowElems > idx) {
+            break;
+        }
+        count += rowElems;
+    }
+    int64_t j = i + 1 + (idx - count);
+
+    float tmp = mat[i * n + j];
+    mat[i * n + j] = mat[j * n + i];
+    mat[j * n + i] = tmp;
 }

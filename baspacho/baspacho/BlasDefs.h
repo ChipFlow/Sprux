@@ -113,7 +113,7 @@ inline void cblas_dsymm(const CBLAS_LAYOUT /* Layout */, const CBLAS_SIDE side,
   dsymm_(&side, &uplo, &m, &n, &alpha, a, &lda, b, &ldb, &beta, c, &ldc);
 }
 
-BLAS_INT LAPACKE_dpotrf(int /* matrix_layout */, char uplo, BLAS_INT n, double* a, BLAS_INT lda) {
+inline BLAS_INT LAPACKE_dpotrf(int /* matrix_layout */, char uplo, BLAS_INT n, double* a, BLAS_INT lda) {
   BLAS_INT info;
   dpotrf_(&uplo, &n, a, &lda, &info);
   return info;
@@ -148,7 +148,7 @@ inline void cblas_ssymm(const CBLAS_LAYOUT /* Layout */, const CBLAS_SIDE side,
   ssymm_(&side, &uplo, &m, &n, &alpha, a, &lda, b, &ldb, &beta, c, &ldc);
 }
 
-BLAS_INT LAPACKE_spotrf(int /* matrix_layout */, char uplo, BLAS_INT n, float* a, BLAS_INT lda) {
+inline BLAS_INT LAPACKE_spotrf(int /* matrix_layout */, char uplo, BLAS_INT n, float* a, BLAS_INT lda) {
   BLAS_INT info;
   spotrf_(&uplo, &n, a, &lda, &info);
   return info;

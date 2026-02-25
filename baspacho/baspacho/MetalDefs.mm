@@ -79,6 +79,15 @@ class MetalContextImpl {
       NSError* error = nil;
       NSString* nsName = [NSString stringWithUTF8String:functionName];
       id<MTLFunction> function = [library newFunctionWithName:nsName];
+      if (function == nil) {
+        NSLog(@"Failed to find Metal function: %@", nsName);
+        // List available functions for debugging
+        NSArray<NSString*>* names = [library functionNames];
+        NSLog(@"Available functions in library (%lu):", (unsigned long)[names count]);
+        for (NSString* n in names) {
+          NSLog(@"  %@", n);
+        }
+      }
       mtlCHECK(function != nil, "Failed to find Metal function");
 
       id<MTLComputePipelineState> pipeline =
@@ -261,6 +270,7 @@ template class MetalMirror<float>;
 template class MetalMirror<double>;
 template class MetalMirror<int64_t>;
 template class MetalMirror<int32_t>;
+template class MetalMirror<uint32_t>;
 
 template class MetalPtrMirror<float>;
 template class MetalPtrMirror<double>;

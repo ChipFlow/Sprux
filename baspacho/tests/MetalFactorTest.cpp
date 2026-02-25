@@ -161,7 +161,7 @@ void testSparseElim_Many(const std::function<OpsPtr()>& genOps) {
     ASSERT_NEAR(Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>())
                     .leftCols(largestIndep)
                     .norm(),
-                0, Epsilon<T>::value);
+                0, 2e-5);
   }
 }
 

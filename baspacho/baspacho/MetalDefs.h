@@ -197,6 +197,7 @@ extern template class MetalMirror<float>;
 extern template class MetalMirror<double>;
 extern template class MetalMirror<int64_t>;
 extern template class MetalMirror<int32_t>;
+extern template class MetalMirror<uint32_t>;
 
 extern template class MetalPtrMirror<float>;
 extern template class MetalPtrMirror<double>;
