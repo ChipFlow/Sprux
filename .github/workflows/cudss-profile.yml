@@ -8,7 +8,7 @@ on:
         default: ''
       cudss_version:
         description: 'cuDSS version to install'
-        default: '0.5.0.5'
+        default: '0.7.1.4'
 
 env:
   BUILD_TYPE: Release
@@ -26,7 +26,7 @@ jobs:
     - name: Install build dependencies
       run: |
         apt-get update
-        apt-get install -y cmake build-essential libopenblas-dev wget
+        apt-get install -y cmake build-essential libopenblas-dev wget nsight-systems
 
     - name: System info
       run: |
