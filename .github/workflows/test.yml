@@ -2,9 +2,9 @@ name: Build and Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, metal-backend]
   pull_request:
-    branches: [main]
+    branches: [main, metal-backend]
 
 env:
   BUILD_TYPE: Release
@@ -107,19 +107,24 @@ jobs:
   # CUDA GPU tests on self-hosted NVIDIA runner
   cuda-gpu:
     runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+      options: --gpus all
 
     steps:
     - uses: actions/checkout@v4
 
     - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential libopenblas-dev
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev
 
     - name: System info
       run: |
         echo "=== GPU Info ==="
         nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA ==="
+        nvcc --version
         echo "=== CMake ==="
         cmake --version
 

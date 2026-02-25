@@ -16,9 +16,17 @@ env:
 jobs:
   profile:
     runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+      options: --gpus all
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev wget
 
     - name: System info
       run: |
@@ -33,14 +41,12 @@ jobs:
       run: |
         CUDSS_VERSION="${{ inputs.cudss_version }}"
         CUDSS_DIR="/opt/cudss-${CUDSS_VERSION}"
+        CUDA_MAJOR=12
 
         if [ -d "${CUDSS_DIR}" ] && [ -f "${CUDSS_DIR}/include/cudss.h" ]; then
           echo "cuDSS ${CUDSS_VERSION} already installed at ${CUDSS_DIR}"
         else
           echo "Installing cuDSS ${CUDSS_VERSION}..."
-          # Determine CUDA major version for download URL
-          CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
-          CUDA_MAJOR=$(echo "$CUDA_VERSION" | cut -d. -f1)
 
           TARBALL="libcudss-linux-x86_64-${CUDSS_VERSION}_cuda${CUDA_MAJOR}-archive.tar.xz"
           URL="https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-x86_64/${TARBALL}"
@@ -52,8 +58,8 @@ jobs:
             exit 1
           }
 
-          sudo mkdir -p "${CUDSS_DIR}"
-          sudo tar xf /tmp/cudss.tar.xz -C "${CUDSS_DIR}" --strip-components=1
+          mkdir -p "${CUDSS_DIR}"
+          tar xf /tmp/cudss.tar.xz -C "${CUDSS_DIR}" --strip-components=1
           rm /tmp/cudss.tar.xz
         fi
 
