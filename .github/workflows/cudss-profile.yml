@@ -7,7 +7,7 @@ on:
         description: 'Extra nsys arguments (e.g. --trace=cuda,nvtx,cublas)'
         default: ''
       cudss_version:
-        description: 'cuDSS version to install'
+        description: 'cuDSS version to install (check redist index for available versions)'
         default: '0.7.1.4'
 
 env:
@@ -26,7 +26,7 @@ jobs:
     - name: Install build dependencies
       run: |
         apt-get update
-        apt-get install -y cmake build-essential libopenblas-dev wget nsight-systems
+        apt-get install -y cmake build-essential libopenblas-dev wget nsight-systems-2025.5.2
 
     - name: System info
       run: |
