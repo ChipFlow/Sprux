@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -12,6 +13,7 @@
 #include <map>
 #include <random>
 #include <regex>
+#include <sstream>
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/testing/TestingMatGen.h"
@@ -40,11 +42,98 @@ struct SparseProblem {
   vector<int64_t> paramSize;
 };
 
+struct BenchRecord {
+  string problem;
+  string solver;
+  string operation;
+  vector<double> times_sec;
+  double median_sec;
+};
+
 struct BenchResults {
   double analysisTime;
   double factorTime;
   map<int64_t, double> solveTimes;
 };
+
+// ============================================================================
+// Matrix Market parser (adapted from CudssBenchmarkTest.cpp)
+// ============================================================================
+
+SparseProblem loadMtxAsSymmetric(const string& path) {
+  ifstream f(path);
+  if (!f.is_open()) {
+    throw runtime_error("Cannot open MTX file: " + path);
+  }
+
+  string line;
+  getline(f, line);
+  if (line.find("%%MatrixMarket") == string::npos) {
+    throw runtime_error("Not a MatrixMarket file: " + path);
+  }
+  if (line.find("coordinate") == string::npos) {
+    throw runtime_error("Only coordinate format supported: " + path);
+  }
+
+  bool isSymmetric = (line.find("symmetric") != string::npos);
+
+  // Skip comment lines
+  while (getline(f, line)) {
+    if (line.empty() || line[0] == '%') continue;
+    break;
+  }
+
+  // Parse dimensions
+  int64_t nRows, nCols, nnz;
+  {
+    istringstream iss(line);
+    iss >> nRows >> nCols >> nnz;
+  }
+
+  // Read COO triplets, collect unique lower-triangle entries (row >= col)
+  set<pair<int64_t, int64_t>> lowerEntries;
+
+  for (int64_t i = 0; i < nnz; i++) {
+    int64_t r, c;
+    double val;
+    f >> r >> c >> val;
+    r--;
+    c--;
+    int64_t lo = max(r, c);
+    int64_t hi = min(r, c);
+    lowerEntries.insert({lo, hi});
+  }
+
+  int64_t n = max(nRows, nCols);
+
+  // Ensure diagonal entries exist (needed for Cholesky)
+  for (int64_t i = 0; i < n; i++) {
+    lowerEntries.insert({i, i});
+  }
+
+  // Build CSR (lower triangle: row >= col)
+  vector<int64_t> rowPtr(n + 1, 0);
+  for (auto& [lo, hi] : lowerEntries) {
+    rowPtr[lo + 1]++;
+  }
+  for (int64_t i = 0; i < n; i++) {
+    rowPtr[i + 1] += rowPtr[i];
+  }
+
+  vector<int64_t> colInd(rowPtr[n]);
+  vector<int64_t> cursor = rowPtr;
+  for (auto& [lo, hi] : lowerEntries) {
+    colInd[cursor[lo]++] = hi;
+  }
+
+  SparseStructure ss(std::move(rowPtr), std::move(colInd));
+  ss.sortIndices();
+
+  SparseProblem prob;
+  prob.sparseStruct = std::move(ss);
+  prob.paramSize.assign(n, 1);  // scalar blocks
+  return prob;
+}
 
 // first access to Cuda/Cublas takes a long time
 #ifdef BASPACHO_USE_CUBLAS
@@ -472,6 +561,8 @@ struct BenchmarkSettings {
   vector<int64_t> nRHSs;
   set<string> operations = {"factor"};
   bool collectStats = false;
+  bool jsonOutput = false;
+  vector<BenchRecord>* jsonRecords = nullptr;
 };
 
 static string ANALYSIS = "analysis";
@@ -506,7 +597,9 @@ void runBenchmarks(const BenchmarkSettings& settings, int seed = 37) {
       continue;
     }
 
-    cout << "\nProblem type: " << probName << endl;
+    if (!settings.jsonOutput) {
+      cout << "\nProblem type: " << probName << endl;
+    }
 
     map<string, map<string, vector<double>>> timingSets;
     int prevLen = 0;
@@ -520,26 +613,31 @@ void runBenchmarks(const BenchmarkSettings& settings, int seed = 37) {
           continue;
         }
 
-        if (settings.verbose) {
-          cout << endl;
+        if (!settings.jsonOutput) {
+          if (settings.verbose) {
+            cout << endl;
+          }
+
+          stringstream ss;
+          ss << setfill('.') << setw(it + 1) << ""
+             << "(" << it + 1 << "/" << settings.numIterations << ", " << solvName << " " << solvIdx
+             << "/" << numSolversToTest << ")";
+          solvIdx++;
+          string str = ss.str();
+          int clearSize = max(0, prevLen - (int)str.size());
+          prevLen = str.size();
+          cout << "\r" << str << setfill(' ') << setw(clearSize) << "" << flush;
+          if (settings.verbose) {
+            cout << endl;
+          }
+        } else {
+          solvIdx++;
         }
 
-        stringstream ss;
-        ss << setfill('.') << setw(it + 1) << ""
-           << "(" << it + 1 << "/" << settings.numIterations << ", " << solvName << " " << solvIdx
-           << "/" << numSolversToTest << ")";
-        solvIdx++;
-        string str = ss.str();
-        int clearSize = max(0, prevLen - (int)str.size());
-        prevLen = str.size();
-        cout << "\r" << str << setfill(' ') << setw(clearSize) << "" << flush;
-        if (settings.verbose) {
-          cout << endl;
-        }
+        bool verboseRun = settings.verbose && !settings.jsonOutput;
+        auto benchResults = solv(prob, settings.nRHSs, verboseRun, settings.collectStats);
 
-        auto benchResults = solv(prob, settings.nRHSs, settings.verbose, settings.collectStats);
-
-        if (settings.verbose) {
+        if (verboseRun) {
           stringstream ss;
           ss << "analysis: " << benchResults.analysisTime
              << "s, factor: " << benchResults.factorTime << "s";
@@ -556,65 +654,145 @@ void runBenchmarks(const BenchmarkSettings& settings, int seed = 37) {
         }
       }
     }
-    stringstream ss;
-    ss << setfill('.') << setw(settings.numIterations) << ""
-       << "(" << settings.numIterations << "/" << settings.numIterations << ", done!)";
-    string str = ss.str();
-    int clearSize = max(0, prevLen - (int)str.size());
-    cout << "\r" << str << setfill(' ') << setw(clearSize) << "" << endl;
+    if (!settings.jsonOutput) {
+      stringstream ss;
+      ss << setfill('.') << setw(settings.numIterations) << ""
+         << "(" << settings.numIterations << "/" << settings.numIterations << ", done!)";
+      string str = ss.str();
+      int clearSize = max(0, prevLen - (int)str.size());
+      cout << "\r" << str << setfill(' ') << setw(clearSize) << "" << endl;
+    }
 
-    for (auto [label, solverTimings] : timingSets) {
-      if (settings.operations.find(label) == settings.operations.end()) {
-        continue;
-      }
-      cout << "Operation: " << label << endl;
-      auto it = solverTimings.find(settings.referenceSolver);
-      const vector<double>* refTimings = (it != solverTimings.end()) ? &it->second : nullptr;
-      if (refTimings) {
-        auto& timings = *refTimings;
-        stringstream ss;
-        ss << "- " << settings.referenceSolver << " (basis for comparison):\n    ";
-        for (size_t i = 0; i < timings.size(); i++) {
-          stringstream tss;
-          if (timings[i] > 0.1) {
-            tss << fixed << setprecision(3) << timings[i] << "s";
-          } else {
-            tss << fixed << setprecision(1) << timings[i] * 1000 << "ms";
-          }
-          tss << (i == timings.size() - 1 ? "" : ", ");
-          ss << left << setfill(' ') << setw(20) << tss.str();
-        }
-        cout << ss.str() << endl;
-      }
-      for (auto [solvName, timings] : solverTimings) {
-        if (solvName == settings.referenceSolver) {
+    // Collect JSON records
+    if (settings.jsonRecords) {
+      for (auto& [label, solverTimings] : timingSets) {
+        if (settings.operations.find(label) == settings.operations.end()) {
           continue;
         }
+        for (auto& [solvName, timings] : solverTimings) {
+          BenchRecord rec;
+          rec.problem = probName;
+          rec.solver = solvName;
+          rec.operation = label;
+          rec.times_sec = timings;
+          auto sorted = timings;
+          sort(sorted.begin(), sorted.end());
+          rec.median_sec = sorted[sorted.size() / 2];
+          settings.jsonRecords->push_back(std::move(rec));
+        }
+      }
+    }
 
-        stringstream ss;
-        ss << "- " << solvName;
+    if (!settings.jsonOutput) {
+      for (auto [label, solverTimings] : timingSets) {
+        if (settings.operations.find(label) == settings.operations.end()) {
+          continue;
+        }
+        cout << "Operation: " << label << endl;
+        auto it = solverTimings.find(settings.referenceSolver);
+        const vector<double>* refTimings = (it != solverTimings.end()) ? &it->second : nullptr;
         if (refTimings) {
-          ss << " (vs. " << settings.referenceSolver << ")";
-        }
-        ss << ":\n    ";
-        for (size_t i = 0; i < timings.size(); i++) {
-          stringstream tss;
-          if (timings[i] > 0.1) {
-            tss << fixed << setprecision(3) << timings[i] << "s";
-          } else {
-            tss << fixed << setprecision(1) << timings[i] * 1000 << "ms";
+          auto& timings = *refTimings;
+          stringstream ss;
+          ss << "- " << settings.referenceSolver << " (basis for comparison):\n    ";
+          for (size_t i = 0; i < timings.size(); i++) {
+            stringstream tss;
+            if (timings[i] > 0.1) {
+              tss << fixed << setprecision(3) << timings[i] << "s";
+            } else {
+              tss << fixed << setprecision(1) << timings[i] * 1000 << "ms";
+            }
+            tss << (i == timings.size() - 1 ? "" : ", ");
+            ss << left << setfill(' ') << setw(20) << tss.str();
           }
+          cout << ss.str() << endl;
+        }
+        for (auto [solvName, timings] : solverTimings) {
+          if (solvName == settings.referenceSolver) {
+            continue;
+          }
+
+          stringstream ss;
+          ss << "- " << solvName;
           if (refTimings) {
-            double percent = (timings[i] / (*refTimings)[i] - 1.0) * 100.0;
-            tss << " (" << (percent > 0 ? "+" : "") << fixed << setprecision(2) << percent << "%)";
+            ss << " (vs. " << settings.referenceSolver << ")";
           }
-          tss << (i == timings.size() - 1 ? "" : ", ");
-          ss << left << setfill(' ') << setw(20) << tss.str();
+          ss << ":\n    ";
+          for (size_t i = 0; i < timings.size(); i++) {
+            stringstream tss;
+            if (timings[i] > 0.1) {
+              tss << fixed << setprecision(3) << timings[i] << "s";
+            } else {
+              tss << fixed << setprecision(1) << timings[i] * 1000 << "ms";
+            }
+            if (refTimings) {
+              double percent = (timings[i] / (*refTimings)[i] - 1.0) * 100.0;
+              tss << " (" << (percent > 0 ? "+" : "") << fixed << setprecision(2) << percent
+                  << "%)";
+            }
+            tss << (i == timings.size() - 1 ? "" : ", ");
+            ss << left << setfill(' ') << setw(20) << tss.str();
+          }
+          cout << ss.str() << endl;
         }
-        cout << ss.str() << endl;
       }
     }
   }
+}
+
+// Escape a string for JSON output
+static string jsonEscape(const string& s) {
+  string out;
+  for (char c : s) {
+    switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      default:
+        out += c;
+    }
+  }
+  return out;
+}
+
+void writeJson(ostream& os, const vector<BenchRecord>& records) {
+  os << "{\n";
+  os << "  \"meta\": {\n";
+
+  // Timestamp in ISO 8601
+  auto now = chrono::system_clock::now();
+  auto time_t_now = chrono::system_clock::to_time_t(now);
+  struct tm tm_buf;
+  gmtime_r(&time_t_now, &tm_buf);
+  char timeBuf[64];
+  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+  os << "    \"timestamp\": \"" << timeBuf << "\"\n";
+
+  os << "  },\n";
+  os << "  \"results\": [\n";
+  for (size_t i = 0; i < records.size(); i++) {
+    const auto& r = records[i];
+    os << "    {\n";
+    os << "      \"problem\": \"" << jsonEscape(r.problem) << "\",\n";
+    os << "      \"solver\": \"" << jsonEscape(r.solver) << "\",\n";
+    os << "      \"operation\": \"" << jsonEscape(r.operation) << "\",\n";
+    os << "      \"times_sec\": [";
+    for (size_t j = 0; j < r.times_sec.size(); j++) {
+      if (j > 0) os << ", ";
+      os << fixed << setprecision(6) << r.times_sec[j];
+    }
+    os << "],\n";
+    os << "      \"median_sec\": " << fixed << setprecision(6) << r.median_sec << "\n";
+    os << "    }" << (i + 1 < records.size() ? "," : "") << "\n";
+  }
+  os << "  ]\n";
+  os << "}\n";
 }
 
 void help() {
@@ -629,7 +807,9 @@ void help() {
        << "\n -X regex     regex for e[X]cluding problem types"
        << "\n -B solver    solver selected as [B]baseline"
        << "\n -O ops       comma-sep list of operations (default: factor)"
-       << "\n -Z           save stats on blas operations in CVS files" << endl;
+       << "\n -Z           save stats on blas operations in CVS files"
+       << "\n -J           output results as JSON (suppresses text output)"
+       << "\n -i mtx_file  load Matrix Market file as additional problem" << endl;
 
   cout << "\nOperations:" << endl;
   for (const auto& [label, desc] : timingLabels) {
@@ -647,6 +827,7 @@ void help() {
 
 int main(int argc, char* argv[]) {
   BenchmarkSettings settings;
+  vector<string> mtxFiles;
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-h")) {
@@ -655,10 +836,14 @@ int main(int argc, char* argv[]) {
     }
     if (!strcmp(argv[i], "-v")) {
       settings.verbose = true;
+    } else if (!strcmp(argv[i], "-J")) {
+      settings.jsonOutput = true;
     } else if (!strcmp(argv[i], "-Z")) {
       settings.collectStats = true;
     } else if (!strcmp(argv[i], "-n") && i < argc - 1) {
       settings.numIterations = stoi(argv[++i]);
+    } else if (!strcmp(argv[i], "-i") && i < argc - 1) {
+      mtxFiles.push_back(argv[++i]);
     } else if (!strcmp(argv[i], "-R") && i < argc - 1) {
       settings.selectProblems = regex(argv[++i]);
     } else if (!strcmp(argv[i], "-X") && i < argc - 1) {
@@ -705,7 +890,38 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Register MTX file problems
+  for (const auto& mtxPath : mtxFiles) {
+    // Extract filename without path and extension for problem name
+    string basename = mtxPath;
+    auto lastSlash = basename.rfind('/');
+    if (lastSlash != string::npos) {
+      basename = basename.substr(lastSlash + 1);
+    }
+    auto lastDot = basename.rfind('.');
+    if (lastDot != string::npos) {
+      basename = basename.substr(0, lastDot);
+    }
+    string probName = "MTX_" + basename;
+
+    // Capture mtxPath by value for the lambda
+    string capturedPath = mtxPath;
+    problemGenerators[probName] = [capturedPath](int64_t /* seed */) -> SparseProblem {
+      return loadMtxAsSymmetric(capturedPath);
+    };
+  }
+
+  // Set up JSON collection if requested
+  vector<BenchRecord> jsonRecords;
+  if (settings.jsonOutput) {
+    settings.jsonRecords = &jsonRecords;
+  }
+
   runBenchmarks(settings);
+
+  if (settings.jsonOutput) {
+    writeJson(cout, jsonRecords);
+  }
 
   if (settings.collectStats) {
     saveAllStats();

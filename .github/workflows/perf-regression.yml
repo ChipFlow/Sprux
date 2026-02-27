@@ -1,0 +1,269 @@
+name: Performance Regression Detection
+
+on:
+  push:
+    branches: [main, metal-backend]
+  pull_request:
+    branches: [main, metal-backend]
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Regression threshold (e.g. 0.20 for 20%)'
+        required: false
+        default: '0.20'
+      iterations:
+        description: 'Benchmark iterations per problem'
+        required: false
+        default: '5'
+
+env:
+  BUILD_TYPE: Release
+  THRESHOLD: ${{ inputs.threshold || '0.20' }}
+  ITERATIONS: ${{ inputs.iterations || '5' }}
+
+jobs:
+  perf-macos-metal:
+    runs-on: macos-latest-xlarge
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: System info
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        sysctl -n machdep.cpu.brand_string || true
+        system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores" || true
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+
+    - name: Configure CMake
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        OPENBLAS_PREFIX="$(brew --prefix openblas)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        export LDFLAGS="-L${OPENBLAS_PREFIX}/lib"
+        export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DBASPACHO_USE_CUBLAS=OFF \
+          -DBASPACHO_USE_METAL=ON \
+          -DBASPACHO_BUILD_TESTS=OFF \
+          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
+
+    - name: Build
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(sysctl -n hw.ncpu)"
+
+    - name: Restore baseline
+      id: baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: baseline.json
+        key: perf-baseline-macOS-ARM64-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-baseline-macOS-ARM64-
+
+    - name: Run benchmarks
+      run: |
+        ./build/baspacho/benchmarking/bench -J \
+          -S "Metal|BLAS" \
+          -R "10_FLAT|30_GRID|40_MERI|MTX" \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -O "factor" -n "$ITERATIONS" > results.json
+        echo "=== Results ==="
+        python3 -c "
+        import json
+        with open('results.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare with baseline
+      if: steps.baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py baseline.json results.json --threshold "$THRESHOLD"
+
+    - name: First run notice
+      if: steps.baseline.outputs.cache-hit != 'true'
+      run: |
+        echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Upload results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-macos-metal-${{ github.sha }}
+        path: |
+          results.json
+          comparison_summary.json
+        retention-days: 30
+
+    - name: Save baseline
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: results.json
+        key: perf-baseline-macOS-ARM64-${{ github.sha }}
+
+  perf-cuda:
+    runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      options: --gpus all
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-cuda-
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev python3
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA Version ==="
+        nvcc --version || echo "nvcc not available"
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DBASPACHO_USE_CUBLAS=ON \
+          -DBASPACHO_USE_METAL=OFF \
+          -DBASPACHO_USE_OPENCL=OFF \
+          -DBASPACHO_BUILD_TESTS=OFF \
+          -DBASPACHO_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Restore baseline
+      id: baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: baseline.json
+        key: perf-baseline-Linux-X64-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-baseline-Linux-X64-cuda-
+
+    - name: Run benchmarks
+      run: |
+        ./build/baspacho/benchmarking/bench -J \
+          -S "CUDA|BLAS" \
+          -R "10_FLAT|30_GRID|40_MERI|MTX" \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -O "factor" -n "$ITERATIONS" > results.json
+        echo "=== Results ==="
+        python3 -c "
+        import json
+        with open('results.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare with baseline
+      if: steps.baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py baseline.json results.json --threshold "$THRESHOLD"
+
+    - name: First run notice
+      if: steps.baseline.outputs.cache-hit != 'true'
+      run: |
+        echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Upload results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-cuda-${{ github.sha }}
+        path: |
+          results.json
+          comparison_summary.json
+        retention-days: 30
+
+    - name: Save baseline
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: results.json
+        key: perf-baseline-Linux-X64-cuda-${{ github.sha }}
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [perf-macos-metal, perf-cuda]
+    if: always()
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: perf-results-*
+        merge-multiple: true
+        path: results/
+
+    - name: Post summary
+      run: |
+        {
+          echo "## Performance Regression Results"
+          echo ""
+          echo "| Platform | Status |"
+          echo "|----------|--------|"
+
+          metal_status="${{ needs.perf-macos-metal.result }}"
+          cuda_status="${{ needs.perf-cuda.result }}"
+
+          if [ "$metal_status" = "success" ]; then
+            echo "| macOS Metal | :white_check_mark: Pass |"
+          elif [ "$metal_status" = "skipped" ]; then
+            echo "| macOS Metal | :next_track_button: Skipped |"
+          else
+            echo "| macOS Metal | :x: Fail |"
+          fi
+
+          if [ "$cuda_status" = "success" ]; then
+            echo "| CUDA | :white_check_mark: Pass |"
+          elif [ "$cuda_status" = "skipped" ]; then
+            echo "| CUDA | :next_track_button: Skipped |"
+          else
+            echo "| CUDA | :x: Fail |"
+          fi
+
+          echo ""
+          echo "Threshold: ${THRESHOLD:-0.20} (20% slowdown)"
+          echo ""
+
+          # Print result details if available
+          for f in results/*.json; do
+            if [ -f "$f" ] && echo "$f" | grep -q "comparison_summary"; then
+              echo "### Comparison Details"
+              echo '```json'
+              cat "$f"
+              echo '```'
+            fi
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
