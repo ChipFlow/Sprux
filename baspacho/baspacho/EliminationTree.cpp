@@ -11,6 +11,7 @@
 #include <tuple>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
+#include "baspacho/baspacho/SupernodeMerger.h"
 #include "baspacho/baspacho/Utils.h"
 
 namespace BaSpaCho {
@@ -309,7 +310,8 @@ void EliminationTree::collapseMergePointers() {
 }
 
 void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int64_t>& noCrossPoints,
-                                  bool findOnlyElims) {
+                                  bool findOnlyElims, double relaxedFillTol,
+                                  int64_t maxSupernodeSize) {
   int64_t ord = ss.order();
 
   computeNodeHeights(noCrossPoints);
@@ -326,6 +328,9 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
     numMerges = 0;
   } else {
     computeMerges();
+    if (relaxedFillTol > 0.0 && maxSupernodeSize > 0) {
+      computeRelaxedMerges(*this, relaxedFillTol, maxSupernodeSize);
+    }
     collapseMergePointers();
   }
 

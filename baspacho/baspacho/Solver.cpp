@@ -22,11 +22,13 @@ using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
 
 Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sparseElimRanges_,
-               std::vector<int64_t>&& permutation_, OpsPtr&& ops_, int64_t canFactorUpTo_)
+               std::vector<int64_t>&& permutation_, OpsPtr&& ops_, int64_t canFactorUpTo_,
+               LevelSetSchedule&& levelSetSchedule)
     : factorSkel(std::move(factorSkel_)),
       sparseElimRanges(std::move(sparseElimRanges_)),
       permutation(std::move(permutation_)),
       canFactorUpTo(canFactorUpTo_),
+      levelSetSchedule_(std::move(levelSetSchedule)),
       ops(std::move(ops_)) {
   if (canFactorUpTo < 0) {
     canFactorUpTo = factorSkel.numSpans();
@@ -1362,7 +1364,13 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   EliminationTree et(sortedBottomParamSize, sortedSsBottom, compModel);
   et.buildTree();
   et.processTree(settings.findSparseEliminationRanges, noCrossPoints,
-                 settings.addFillPolicy == AddFillForAutoElims);
+                 settings.addFillPolicy == AddFillForAutoElims,
+                 settings.supernodeMergeFillTolerance, settings.maxSupernodeSize);
+
+  // Compute level-set schedule for parallel factorization
+  auto lumpParent = computeLumpParent(et);
+  auto levelSetSchedule = LevelSetSchedule::build(lumpParent);
+
   et.computeAggregateStruct(settings.addFillPolicy == AddFillForAutoElims);
 
   // ss last rows are to be permuted according to etTotalInvPerm
@@ -1424,7 +1432,8 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   return SolverPtr(new Solver(
       std::move(factorSkel), std::move(fullSparseElimRanges), std::move(fullInvPerm),
       getBackend(settings),
-      settings.addFillPolicy == AddFillForAutoElims ? fullSparseElimEnd : paramSize.size()));
+      settings.addFillPolicy == AddFillForAutoElims ? fullSparseElimEnd : paramSize.size(),
+      std::move(levelSetSchedule)));
 }
 
 template <typename T>

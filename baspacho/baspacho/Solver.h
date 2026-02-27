@@ -13,6 +13,7 @@
 #include "baspacho/baspacho/CsrTypes.h"
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/SparseStructure.h"
+#include "baspacho/baspacho/SupernodeMerger.h"
 
 namespace BaSpaCho {
 
@@ -36,7 +37,8 @@ class Solver {
  public:
   // constructor, from RAW factor skeleton (do not call directly, use createSolver)
   Solver(CoalescedBlockMatrixSkel&& factorSkel, std::vector<int64_t>&& sparseElimRanges,
-         std::vector<int64_t>&& permutation, OpsPtr&& ops, int64_t canFactorUpTo = -1);
+         std::vector<int64_t>&& permutation, OpsPtr&& ops, int64_t canFactorUpTo = -1,
+         LevelSetSchedule&& levelSetSchedule = {});
 
   // return a (permuted) accessor to access factor's block (re-ordering is auto-applied)
   PermutedCoalescedAccessor accessor() const {
@@ -200,6 +202,9 @@ class Solver {
   // return the reordering applied to parameters (i's position is perm[i] in the factor)
   const std::vector<int64_t>& paramToSpan() const { return permutation; }
 
+  // return the level-set schedule for parallel factorization
+  const LevelSetSchedule& levelSetSchedule() const { return levelSetSchedule_; }
+
   // TESTING: return
   SymbolicCtx& internalSymbolicContext() { return *symCtx; }
 
@@ -310,6 +315,7 @@ class Solver {
   std::vector<int64_t> sparseElimRanges;
   std::vector<int64_t> permutation;  // *on indices*: v'[p[i]] = v[i];
   int64_t canFactorUpTo;
+  LevelSetSchedule levelSetSchedule_;
 
   OpsPtr ops;
   SymbolicCtxPtr symCtx;
@@ -370,6 +376,8 @@ struct Settings {
   BackendType backend = BackendFast;
   AddFillPolicy addFillPolicy = AddFillComplete;
   const ComputationModel* computationModel = nullptr;
+  double supernodeMergeFillTolerance = 0.0;  // 0 = disabled, 0.25 = 25% fill allowed
+  int64_t maxSupernodeSize = 0;              // 0 = disabled, 256 = typical
 };
 
 /**

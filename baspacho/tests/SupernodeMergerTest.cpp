@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <Eigen/Dense>
 #include <algorithm>
 #include <numeric>
 #include <random>
@@ -14,10 +15,13 @@
 #include <vector>
 
 #include "baspacho/baspacho/EliminationTree.h"
+#include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
 #include "baspacho/baspacho/SupernodeMerger.h"
+#include "baspacho/testing/TestingUtils.h"
 
 using namespace BaSpaCho;
+using namespace ::BaSpaCho::testing_utils;
 
 // Build an EliminationTree and run through processTree (standard merges).
 // Returns the tree ready for computeRelaxedMerges() or computeLumpParent().
@@ -330,4 +334,114 @@ TEST(SupernodeMerger, EndToEndSchedule) {
           << ") must be at a higher level than child " << l << " (level " << lumpToLevel[l] << ")";
     }
   }
+}
+
+// ======================== Solver integration tests ========================
+
+template <typename T>
+using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
+
+template <typename T>
+using Vector = Eigen::Vector<T, Eigen::Dynamic>;
+
+// Test that createSolver with relaxed merging produces correct Cholesky factorization.
+// Uses the same approach as CreateSolverTest: compare factored data against Eigen LLT.
+template <typename T>
+void testSolverWithMerging(int seed) {
+  int numParams = 100;
+  auto colBlocks = randomCols(numParams, 0.05, 57 + seed);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  std::vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 1, 3, 47 + seed);
+
+  // Create solver WITHOUT relaxed merging (default)
+  Settings settingsDefault;
+  settingsDefault.backend = BackendFast;
+  settingsDefault.addFillPolicy = AddFillComplete;
+  auto solverDefault = createSolver(settingsDefault, paramSize, ss);
+
+  // Create solver WITH relaxed merging
+  Settings settingsMerged;
+  settingsMerged.backend = BackendFast;
+  settingsMerged.addFillPolicy = AddFillComplete;
+  settingsMerged.supernodeMergeFillTolerance = 0.25;
+  settingsMerged.maxSupernodeSize = 256;
+  auto solverMerged = createSolver(settingsMerged, paramSize, ss);
+
+  // Verify merging reduced lump count
+  EXPECT_LE(solverMerged->skel().numLumps(), solverDefault->skel().numLumps())
+      << "Relaxed merging should not increase lump count";
+
+  // Verify level-set schedule was computed
+  EXPECT_GT(solverMerged->levelSetSchedule().numLevels(), 0)
+      << "Level-set schedule should have at least one level";
+  EXPECT_EQ(solverMerged->levelSetSchedule().numLumps(), solverMerged->skel().numLumps())
+      << "Schedule should contain all lumps";
+
+  // Generate random SPD data and verify factorization
+  std::vector<T> data = randomData<T>(solverMerged->dataSize(), -1.0, 1.0, 9 + seed);
+  solverMerged->skel().damp(data, T(0.0), T(solverMerged->order() * 2.0));
+
+  // Densify to get the full matrix, then factor with Eigen LLT for reference
+  Matrix<T> verifyMat = solverMerged->skel().densify(data);
+  Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(verifyMat);
+
+  // Factor with BaSpaCho
+  solverMerged->factor(data.data());
+
+  // Compare: densify the factored result and check vs Eigen
+  Matrix<T> computedMat = solverMerged->skel().densify(data);
+
+  T relativeError =
+      Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>()).norm() /
+      Matrix<T>(verifyMat.template triangularView<Eigen::Lower>()).norm();
+  T epsilon = std::is_same<T, double>::value ? T(1e-9) : T(1e-6);
+  EXPECT_NEAR(relativeError, 0, epsilon)
+      << "Factorization mismatch with relaxed merging (seed=" << seed << ")";
+}
+
+TEST(SupernodeMergerSolver, CholeskyWithMerging_double) {
+  for (int seed = 0; seed < 5; seed++) {
+    testSolverWithMerging<double>(seed);
+  }
+}
+
+TEST(SupernodeMergerSolver, CholeskyWithMerging_float) {
+  for (int seed = 0; seed < 5; seed++) {
+    testSolverWithMerging<float>(seed);
+  }
+}
+
+// Test that default settings (no merging) still produce an empty schedule for the simple path.
+TEST(SupernodeMergerSolver, DefaultSettingsNoMerging) {
+  int numParams = 50;
+  auto colBlocks = randomCols(numParams, 0.05, 42);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  std::vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 1, 3, 42);
+
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.addFillPolicy = AddFillComplete;
+  auto solver = createSolver(settings, paramSize, ss);
+
+  // Default settings should still compute a level-set schedule
+  // (it's always computed now, just without relaxed merging)
+  EXPECT_GT(solver->levelSetSchedule().numLevels(), 0);
+  EXPECT_EQ(solver->levelSetSchedule().numLumps(), solver->skel().numLumps());
+}
+
+// Test the AddFillNone path produces an empty schedule
+// (this path doesn't use EliminationTree).
+TEST(SupernodeMergerSolver, AddFillNoneEmptySchedule) {
+  int numParams = 20;
+  auto colBlocks = randomCols(numParams, 0.1, 99);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  std::vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 1, 3, 99);
+
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.addFillPolicy = AddFillNone;
+  auto solver = createSolver(settings, paramSize, ss);
+
+  // AddFillNone path skips EliminationTree entirely, so no schedule
+  EXPECT_EQ(solver->levelSetSchedule().numLevels(), 0);
 }

@@ -33,7 +33,8 @@ struct EliminationTree {
 
   // executed the processing
   void processTree(bool detectSparseElimRanges, const std::vector<int64_t>& noCrossPoints = {},
-                   bool findOnlyElims = false);
+                   bool findOnlyElims = false, double relaxedFillTol = 0.0,
+                   int64_t maxSupernodeSize = 0);
 
   // computes the aggregate struct (where nodes have been merged)
   void computeAggregateStruct(bool fillOnlyForElims = false);
