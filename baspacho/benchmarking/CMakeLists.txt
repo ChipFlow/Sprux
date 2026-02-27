@@ -27,8 +27,8 @@ add_executable(bench ${bench_sources})
 target_link_libraries (bench ${BASPACHO_LIBRARY} testing)
 
 if(HAVE_CHOLMOD)
-  target_link_libraries (BAL_bench ${CHOLMOD_LIBRARIES})
-  target_link_libraries (bench ${CHOLMOD_LIBRARIES})
+  target_link_libraries (BAL_bench ${SUITESPARSE_CHOLMOD_TARGET})
+  target_link_libraries (bench ${SUITESPARSE_CHOLMOD_TARGET})
 endif()
 
 if(HAVE_UMFPACK)

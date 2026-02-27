@@ -11,6 +11,7 @@ add_baspacho_test(MathUtilsTest MathUtilsTest.cpp)
 add_baspacho_test(PartialFactorSolveTest PartialFactorSolveTest.cpp)
 add_baspacho_test(LUFactorTest LUFactorTest.cpp)
 add_baspacho_test(LDLTFactorTest LDLTFactorTest.cpp)
+add_baspacho_test(FastSymbolicTest FastSymbolicTest.cpp)
 
 if(HAVE_UMFPACK)
 add_baspacho_test(LUComparisonTest LUComparisonTest.cpp)

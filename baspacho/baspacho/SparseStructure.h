@@ -49,6 +49,11 @@ struct SparseStructure {
 
   SparseStructure addFullEliminationFill() const;
 
+  // Fast elimination fill using CHOLMOD's symbolic Cholesky on A+A^T pattern.
+  // Uses reach-set algorithm with path compression: amortized O(nnz) vs
+  // O(nnz * tree_path_length) for the basic algorithm above.
+  SparseStructure addFullEliminationFillCholmod() const;
+
   // return `perm`: `perm[i]` is old index that should move in `i`-th position
   std::vector<int64_t> fillReducingPermutation() const;
 

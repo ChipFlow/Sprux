@@ -189,12 +189,27 @@ if(BASPACHO_USE_BLAS)
   add_compile_definitions(BASPACHO_USE_BLAS)
 endif()
 
-# amd, if using amd from SuiteSparse
-message("${Cyan}===============[ minimum degree reordering algorithm ]==================${ColourReset}")
-set(BASPACHO_USE_SUITESPARSE_AMD OFF CACHE BOOL "If on, will use AMD algorithm in SuiteSparse (must be installed)")
+# use fetchcontent to download dependencies (needed by SuiteSparse and others below)
+include(FetchContent)
+cmake_policy(SET CMP0077 NEW)
 
-if(BASPACHO_USE_SUITESPARSE_AMD)
-  set(HAVE_SUITESPARSE_AMD 1)
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.30")
+  cmake_policy(SET CMP0169 OLD) # do not complain about FetchContent_Populate
+endif()
+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
+# SuiteSparse (vendored via FetchContent)
+# Provides: AMD (fill-reducing ordering), CHOLMOD (symbolic analysis),
+#           BTF (block triangular form for static pivoting)
+message("${Cyan}===========================[ SuiteSparse ]==============================${ColourReset}")
+set(BASPACHO_USE_SYSTEM_SUITESPARSE OFF CACHE BOOL
+  "If on, use system-installed SuiteSparse instead of vendored")
+
+if(BASPACHO_USE_SYSTEM_SUITESPARSE)
+  # System SuiteSparse: find AMD, CHOLMOD, BTF via pkg-config or cmake
   find_path(SUITESPARSE_AMD_INCLUDE_DIR NAMES amd.h
     PATHS $ENV{AMDDIR} ${INCLUDE_INSTALL_DIR}
     PATH_SUFFIXES suitesparse ufsparse
@@ -202,36 +217,77 @@ if(BASPACHO_USE_SUITESPARSE_AMD)
   find_library(SUITESPARSE_AMD_LIBRARIES amd
     PATHS $ENV{AMDDIR} ${LIB_INSTALL_DIR}
     REQUIRED)
-  include_directories(${SUITESPARSE_AMD_INCLUDE_DIR})
-  message("* Using Approximate Minimum Degree (AMD) algorithm from SuiteSparse")
-  message("* Amd Source = " ${SUITESPARSE_AMD_INCLUDE_DIR})
-  message("* Amd Libraries = " ${SUITESPARSE_AMD_LIBRARIES})
-  add_compile_definitions(BASPACHO_USE_SUITESPARSE_AMD)
-else()
-  set(HAVE_SUITESPARSE_AMD 0)
-  message("* Using Approximate Minimum Degree (AMD) algorithm from Eigen")
-endif()
-
-# cholmod (only needed for benchmarking comparison)
-if(BASPACHO_BUILD_EXAMPLES)
-  message("${Cyan}============================[ CHOLMOD ]=================================${ColourReset}")
   find_path(CHOLMOD_INCLUDE_DIR NAMES cholmod.h
     PATHS ${INCLUDE_INSTALL_DIR}
-    PATH_SUFFIXES suitesparse ufsparse)
+    PATH_SUFFIXES suitesparse ufsparse
+    REQUIRED)
   find_library(CHOLMOD_LIBRARIES cholmod
-    PATHS ${LIB_INSTALL_DIR})
+    PATHS ${LIB_INSTALL_DIR}
+    REQUIRED)
+  include_directories(${SUITESPARSE_AMD_INCLUDE_DIR} ${CHOLMOD_INCLUDE_DIR})
+  message("* Using system SuiteSparse")
+  message("* AMD Include = " ${SUITESPARSE_AMD_INCLUDE_DIR})
+  message("* CHOLMOD Include = " ${CHOLMOD_INCLUDE_DIR})
 
-  if((CHOLMOD_INCLUDE_DIR STREQUAL "CHOLMOD_INCLUDE_DIR-NOTFOUND")
-    OR(CHOLMOD_LIBRARIES STREQUAL "CHOLMOD_LIBRARIES-NOTFOUND"))
-    set(HAVE_CHOLMOD 0)
-    message("* Cholmod not found! Benchmarking tools will not support it")
+  set(SUITESPARSE_AMD_TARGET ${SUITESPARSE_AMD_LIBRARIES})
+  set(SUITESPARSE_CHOLMOD_TARGET ${CHOLMOD_LIBRARIES})
+else()
+  # Vendored SuiteSparse via FetchContent - build only what we need
+  if(NOT DEFINED suitesparse_SOURCE_DIR)
+    set(SUITESPARSE_ENABLE_PROJECTS "suitesparse_config;amd;colamd;camd;ccolamd;cholmod;btf" CACHE STRING "" FORCE)
+    set(CHOLMOD_SUPERNODAL OFF CACHE BOOL "" FORCE)  # No BLAS needed for symbolic-only
+    set(CHOLMOD_CAMD ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)  # Build SuiteSparse as static
+    set(SUITESPARSE_USE_OPENMP OFF CACHE BOOL "" FORCE)
+    set(SUITESPARSE_USE_CUDA OFF CACHE BOOL "" FORCE)
+    set(SUITESPARSE_DEMOS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+      suitesparse
+      URL https://github.com/DrTimothyAldenDavis/SuiteSparse/archive/refs/tags/v7.8.3.zip
+    )
+    FetchContent_MakeAvailable(suitesparse)
+    set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
   else()
-    set(HAVE_CHOLMOD 1)
-    message("* Cholmod Source = " ${CHOLMOD_INCLUDE_DIR})
-    message("* Cholmod Libraries = " ${CHOLMOD_LIBRARIES})
-    add_compile_definitions(BASPACHO_HAVE_CHOLMOD)
-    include_directories(${CHOLMOD_INCLUDE_DIR})
+    message("${Cyan}Using SuiteSparse from parent project:${ColourReset}")
   endif()
+
+  message("* SuiteSparse Source = " ${suitesparse_SOURCE_DIR})
+
+  # SuiteSparse creates targets like SuiteSparse::AMD, SuiteSparse::CHOLMOD, etc.
+  # For static builds, the targets may be AMD_static, CHOLMOD_static, etc.
+  if(TARGET SuiteSparse::AMD)
+    set(SUITESPARSE_AMD_TARGET SuiteSparse::AMD)
+  elseif(TARGET AMD_static)
+    set(SUITESPARSE_AMD_TARGET AMD_static)
+  elseif(TARGET AMD)
+    set(SUITESPARSE_AMD_TARGET AMD)
+  else()
+    message(FATAL_ERROR "Could not find AMD target from SuiteSparse")
+  endif()
+
+  if(TARGET SuiteSparse::CHOLMOD)
+    set(SUITESPARSE_CHOLMOD_TARGET SuiteSparse::CHOLMOD)
+  elseif(TARGET CHOLMOD_static)
+    set(SUITESPARSE_CHOLMOD_TARGET CHOLMOD_static)
+  elseif(TARGET CHOLMOD)
+    set(SUITESPARSE_CHOLMOD_TARGET CHOLMOD)
+  else()
+    message(FATAL_ERROR "Could not find CHOLMOD target from SuiteSparse")
+  endif()
+endif()
+
+# AMD from SuiteSparse is now always available (vendored or system)
+set(HAVE_SUITESPARSE_AMD 1)
+add_compile_definitions(BASPACHO_USE_SUITESPARSE_AMD)
+message("* Using SuiteSparse AMD for fill-reducing ordering")
+
+# CHOLMOD is now always available
+set(HAVE_CHOLMOD 1)
+add_compile_definitions(BASPACHO_HAVE_CHOLMOD)
+message("* Using CHOLMOD for fast symbolic analysis")
+
+if(BASPACHO_BUILD_EXAMPLES)
 
   # cuDSS (for GPU sparse direct solver comparison)
   if(BASPACHO_USE_CUBLAS)
@@ -268,18 +324,6 @@ if(BASPACHO_BUILD_EXAMPLES)
     add_compile_definitions(BASPACHO_HAVE_UMFPACK)
     include_directories(${UMFPACK_INCLUDE_DIR})
   endif()
-endif()
-
-# use fetchcontent to download dependencies
-include(FetchContent)
-cmake_policy(SET CMP0077 NEW)
-
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.30")
-  cmake_policy(SET CMP0169 OLD) # do not complain about FetchContent_Populate
-endif()
-
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-  cmake_policy(SET CMP0135 NEW)
 endif()
 
 # dispenso for multithreading
