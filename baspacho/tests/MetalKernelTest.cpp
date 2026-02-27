@@ -486,3 +486,112 @@ TEST(MetalKernel, LUFactorSolve2Block) {
   float residual = (fullMat * x - b).norm() / b.norm();
   ASSERT_LT(residual, 5e-3) << "2-block LU solve residual too large";
 }
+
+// ============================================================================
+// MPS potrf/trsm threshold-crossing tests
+// ============================================================================
+
+// Test potrf at various sizes that cross the MPS threshold boundary (default 32)
+class MetalPotrfSizeTest : public ::testing::TestWithParam<int64_t> {};
+
+TEST_P(MetalPotrfSizeTest, PotrfVsCpuReference) {
+  int64_t n = GetParam();
+  auto skel = make1LumpSkel(n);
+
+  // Create SPD matrix: A = R^T * R + n*I
+  mt19937 rng(42 + n);
+  uniform_real_distribution<float> unif(-1.0f, 1.0f);
+
+  vector<float> dataCpu(skel.dataSize()), dataMetal(skel.dataSize());
+  // Fill with random values, then make SPD via damping
+  for (size_t i = 0; i < dataCpu.size(); i++) {
+    float v = unif(rng);
+    dataCpu[i] = dataMetal[i] = v;
+  }
+
+  // Make SPD: set diagonal to be dominant
+  for (int64_t i = 0; i < n; i++) {
+    dataCpu[i * n + i] = dataMetal[i * n + i] = float(n) * 2.0f + 1.0f;
+  }
+
+  // CPU reference
+  Solver solverCpu(CoalescedBlockMatrixSkel(skel), {}, {}, fastOps());
+  NumericCtxPtr<float> cpuCtx =
+      solverCpu.internalSymbolicContext().createNumericCtx<float>(0, nullptr);
+  cpuCtx->potrf(n, dataCpu.data(), 0);
+
+  // Metal
+  Solver solverMetal(CoalescedBlockMatrixSkel(skel), {}, {}, metalOps());
+  NumericCtxPtr<float> metalCtx =
+      solverMetal.internalSymbolicContext().createNumericCtx<float>(0, nullptr);
+  {
+    MetalMirror<float> dataGpu(dataMetal);
+    metalCtx->potrf(n, dataGpu.ptr(), 0);
+    dataGpu.get(dataMetal);
+  }
+
+  // Compare lower triangle only (Cholesky output)
+  float diff = 0;
+  for (int64_t r = 0; r < n; r++)
+    for (int64_t c = 0; c <= r; c++) {
+      float d = dataCpu[r * n + c] - dataMetal[r * n + c];
+      diff += d * d;
+    }
+  ASSERT_NEAR(sqrt(diff), 0, kEps * n)
+      << "potrf (n=" << n << "): Metal vs CPU mismatch";
+}
+
+INSTANTIATE_TEST_SUITE_P(MetalKernel, MetalPotrfSizeTest,
+                         ::testing::Values(4, 16, 31, 32, 33, 64, 128));
+
+// Test trsm at various sizes that cross the MPS threshold boundary
+class MetalTrsmSizeTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {};
+
+TEST_P(MetalTrsmSizeTest, TrsmVsCpuReference) {
+  auto [n, k] = GetParam();
+
+  auto skel = make2LumpSkel(n, k);
+
+  // Random data in [-1,1] with damping proportional to order (same as factor tests)
+  vector<float> data = randomData<float>(skel.dataSize(), -1.0f, 1.0f, 77 + n);
+  skel.damp(data, 0.0f, float(skel.order()) * 1.5f);
+
+  vector<float> dataCpu = data, dataMetal = data;
+
+  // CPU: potrf diagonal, then trsm
+  Solver solverCpu(CoalescedBlockMatrixSkel(skel), {}, {}, fastOps());
+  NumericCtxPtr<float> cpuCtx =
+      solverCpu.internalSymbolicContext().createNumericCtx<float>(n * k, nullptr);
+  cpuCtx->potrf(n, dataCpu.data(), skel.chainData[0]);
+  cpuCtx->trsm(n, k, dataCpu.data(), skel.chainData[0], skel.chainData[1]);
+
+  // Metal: same operations
+  Solver solverMetal(CoalescedBlockMatrixSkel(skel), {}, {}, metalOps());
+  NumericCtxPtr<float> metalCtx =
+      solverMetal.internalSymbolicContext().createNumericCtx<float>(n * k, nullptr);
+  {
+    MetalMirror<float> dataGpu(dataMetal);
+    metalCtx->potrf(n, dataGpu.ptr(), skel.chainData[0]);
+    metalCtx->trsm(n, k, dataGpu.ptr(), skel.chainData[0], skel.chainData[1]);
+    dataGpu.get(dataMetal);
+  }
+
+  // Compare the B region (after potrf+trsm)
+  int64_t offB = skel.chainData[1];
+  float diff = 0;
+  for (int64_t i = offB; i < offB + k * n; i++) {
+    float d = dataCpu[i] - dataMetal[i];
+    diff += d * d;
+  }
+  float tolerance = kEps * max(n, k);
+  ASSERT_NEAR(sqrt(diff), 0, tolerance)
+      << "trsm (n=" << n << ", k=" << k << "): Metal vs CPU mismatch";
+}
+
+INSTANTIATE_TEST_SUITE_P(MetalKernel, MetalTrsmSizeTest,
+                         ::testing::Values(std::make_tuple(4, 2),
+                                           std::make_tuple(16, 8),
+                                           std::make_tuple(32, 16),
+                                           std::make_tuple(64, 32),
+                                           std::make_tuple(64, 64),
+                                           std::make_tuple(128, 64)));

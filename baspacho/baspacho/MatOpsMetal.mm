@@ -9,7 +9,9 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <typeindex>
 #include <unordered_map>
@@ -26,6 +28,21 @@ namespace BaSpaCho {
 using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
+
+// Read an MPS operation threshold from an environment variable, returning
+// defaultVal if the variable is unset or not a valid non-negative integer.
+static int64_t getMpsThreshold(const char* envVar, int64_t defaultVal) {
+  const char* val = std::getenv(envVar);
+  if (val) {
+    char* end;
+    errno = 0;
+    long long parsed = std::strtoll(val, &end, 10);
+    if (end != val && *end == '\0' && parsed >= 0 && errno == 0) {
+      return static_cast<int64_t>(parsed);
+    }
+  }
+  return defaultVal;
+}
 
 // Work item struct matching the Metal shader definition
 struct LUGemmWorkItem {
@@ -246,6 +263,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (!pendingCmdBuf_) {
         pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+      }
+      if (!pendingEncoder_) {
         pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
         pendingDispatchCount_ = 0;
       }
@@ -481,17 +500,67 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Flush pending GPU writes (e.g. assemble) before CPU reads data
-      commitAndWait();
+      static const int64_t kMpsPotrfMinN =
+          getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 32);
 
-      // Use row-major (matches CpuBaseNumericCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+      if (n < kMpsPotrfMinN) {
+        // Small matrix — CPU Eigen is faster than MPS dispatch overhead
+        commitAndWait();
+        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        Eigen::Map<MatRMaj> matA(data + offA, n, n);
+        Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
+        if (llt.info() != Eigen::Success) {
+          fprintf(stderr, "Metal potrf: Cholesky failed\n");
+        }
+        return;
+      }
 
-      Eigen::Map<MatRMaj> matA(data + offA, n, n);
-      Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
+      // Flush pending work, end compute encoder (MPS needs its own encoding)
+      flushPendingGemms();
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      if (!pendingCmdBuf_) {
+        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+      }
 
-      if (llt.info() != Eigen::Success) {
-        fprintf(stderr, "Metal potrf: Cholesky failed\n");
+      // Look up MTLBuffer for data pointer
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      BASPACHO_CHECK_WHAT1(bufferInfo.first, "potrf: data buffer not registered");
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t baseOffset = bufferInfo.second;
+
+      // Row-major n×n matrix descriptor
+      MPSMatrixDescriptor* descA = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:n columns:n
+          rowBytes:n * sizeof(float) dataType:MPSDataTypeFloat32];
+      MPSMatrix* mpsA = [[MPSMatrix alloc]
+          initWithBuffer:dataBuffer
+          offset:baseOffset + offA * sizeof(float)
+          descriptor:descA];
+
+      // MPS Cholesky: lower:YES — data is lower-triangular in row-major layout
+      MPSMatrixDecompositionCholesky* mpsChol = [[MPSMatrixDecompositionCholesky alloc]
+          initWithDevice:sym.device lower:YES order:n];
+
+      // Allocate status buffer to detect non-SPD matrices (matches CPU path error reporting)
+      id<MTLBuffer> statusBuf = [sym.device newBufferWithLength:sizeof(MPSMatrixDecompositionStatus)
+          options:MTLResourceStorageModeShared];
+      [mpsChol encodeToCommandBuffer:pendingCmdBuf_
+          sourceMatrix:mpsA resultMatrix:mpsA status:statusBuf];
+
+      // Commit+wait — data is CPU-coherent (shared memory on Apple Silicon)
+      [pendingCmdBuf_ commit];
+      [pendingCmdBuf_ waitUntilCompleted];
+      pendingCmdBuf_ = nil;
+      pendingDispatchCount_ = 0;
+
+      // Check decomposition status (matches CPU path's fprintf)
+      auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>([statusBuf contents]);
+      if (status != MPSMatrixDecompositionStatusSuccess) {
+        fprintf(stderr, "Metal potrf: MPS Cholesky failed (status=%d, n=%lld)\n",
+                (int)status, (long long)n);
       }
     }
   }
@@ -500,17 +569,76 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
-      // Flush pending GPU writes (e.g. assemble) before CPU reads data
-      commitAndWait();
+      static const int64_t kMpsTrsmThreshold =
+          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 64 * 64 * 64);
 
-      // Use row-major for B, column-major for A (matches CpuBaseNumericCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+      if ((int64_t)n * n * k < kMpsTrsmThreshold) {
+        // Small — CPU Eigen is faster than MPS dispatch overhead
+        commitAndWait();
+        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+        using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+        // col-major's upper = (row-major's lower).transpose()
+        Eigen::Map<const MatCMaj> matA(data + offA, n, n);
+        Eigen::Map<MatRMaj> matB(data + offB, k, n);
+        matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
+        return;
+      }
 
-      // col-major's upper = (row-major's lower).transpose()
-      Eigen::Map<const MatCMaj> matA(data + offA, n, n);
-      Eigen::Map<MatRMaj> matB(data + offB, k, n);
-      matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
+      // Flush pending work, end compute encoder (MPS needs its own encoding)
+      flushPendingGemms();
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      if (!pendingCmdBuf_) {
+        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+      }
+
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      BASPACHO_CHECK_WHAT1(bufferInfo.first, "trsm: data buffer not registered");
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t baseOffset = bufferInfo.second;
+
+      // L: n×n lower-triangular, row-major
+      MPSMatrixDescriptor* descA = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:n columns:n
+          rowBytes:n * sizeof(float) dataType:MPSDataTypeFloat32];
+      MPSMatrix* mpsA = [[MPSMatrix alloc]
+          initWithBuffer:dataBuffer
+          offset:baseOffset + offA * sizeof(float)
+          descriptor:descA];
+
+      // B: k×n, row-major
+      MPSMatrixDescriptor* descB = [MPSMatrixDescriptor
+          matrixDescriptorWithRows:k columns:n
+          rowBytes:n * sizeof(float) dataType:MPSDataTypeFloat32];
+      MPSMatrix* mpsB = [[MPSMatrix alloc]
+          initWithBuffer:dataBuffer
+          offset:baseOffset + offB * sizeof(float)
+          descriptor:descB];
+
+      // Solve X * L^T = B in-place on B
+      // right:YES (triangular matrix on the right), upper:NO (L is lower),
+      // transpose:YES (using L^T), unit:NO (diagonal is not unit)
+      MPSMatrixSolveTriangular* solve = [[MPSMatrixSolveTriangular alloc]
+          initWithDevice:sym.device
+                   right:YES
+                   upper:NO
+               transpose:YES
+                    unit:NO
+                   order:n
+  numberOfRightHandSides:k
+                   alpha:1.0];
+      [solve encodeToCommandBuffer:pendingCmdBuf_
+                sourceMatrix:mpsA
+         rightHandSideMatrix:mpsB
+              solutionMatrix:mpsB];
+
+      // Commit+wait — data is CPU-coherent (shared memory on Apple Silicon)
+      [pendingCmdBuf_ commit];
+      [pendingCmdBuf_ waitUntilCompleted];
+      pendingCmdBuf_ = nil;
+      pendingDispatchCount_ = 0;
     }
   }
 
@@ -527,7 +655,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       // Use MPS for larger matrices (threshold based on empirical testing)
       // MPS dispatch overhead makes it slower for small matrices
-      static constexpr int64_t kMpsThreshold = 64 * 64 * 64;  // ~262k ops
+      static const int64_t kMpsThreshold =
+          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 64 * 64 * 64);
       bool useMps = (m * n * k >= kMpsThreshold);
 
       if (useMps) {
