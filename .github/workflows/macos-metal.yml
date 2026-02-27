@@ -26,6 +26,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
     - name: Print system info
       run: |
         echo "=== System Info ==="
@@ -68,6 +76,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Print system info
       run: |
