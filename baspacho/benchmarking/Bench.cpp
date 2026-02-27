@@ -373,6 +373,76 @@ BenchResults benchmarkSolverBatched(const SparseProblem& prob, const Settings& s
 }
 #endif  // BASPACHO_USE_CUBLAS
 
+#ifdef BASPACHO_USE_METAL
+BenchResults benchmarkSolverBatchedMetal(const SparseProblem& prob, int batchSize,
+                                         const vector<int64_t> nRHSs = {}, bool verbose = true,
+                                         bool collectStats = false) {
+  Settings settings = {.findSparseEliminationRanges = true, .backend = BackendMetal};
+  auto startAnalysis = hrc::now();
+  SolverPtr solver = createSolver(settings, prob.paramSize, prob.sparseStruct);
+  double analysisTime = tdelta(hrc::now() - startAnalysis).count();
+
+  if (collectStats) {
+    registerCallbacks(*solver, "metal_batch" + to_string(batchSize) + "_f32");
+  }
+  if (verbose || collectStats) {
+    solver->enableStats();
+  }
+
+  // generate mock float data, make positive def
+  int order = solver->order();
+  vector<vector<float>> datas(batchSize);
+  vector<MetalMirror<float>> datasGpu(batchSize);
+  vector<float*> datasPtr(batchSize);
+  for (int q = 0; q < batchSize; q++) {
+    datas[q] = randomData<float>(solver->dataSize(), -1.0f, 1.0f, 37 + q);
+    solver->skel().damp(datas[q], float(0), float(order * 1.3f));
+    datasGpu[q].load(datas[q]);
+    datasPtr[q] = datasGpu[q].ptr();
+  }
+
+  double factorTime;
+  map<int64_t, double> solveTimes;
+
+  auto startFactor = hrc::now();
+  solver->factor(&datasPtr);
+  factorTime = tdelta(hrc::now() - startFactor).count() / batchSize;
+
+  for (int64_t nRHS : nRHSs) {
+    vector<vector<float>> rhsDatas(batchSize);
+    vector<MetalMirror<float>> rhsDatasGpu(batchSize);
+    vector<float*> rhsDatasPtr(batchSize);
+    for (int q = 0; q < batchSize; q++) {
+      rhsDatas[q] = randomData<float>(nRHS * order, -1.0f, 1.0f, 37 + q + nRHS);
+      rhsDatasGpu[q].load(rhsDatas[q]);
+      rhsDatasPtr[q] = rhsDatasGpu[q].ptr();
+    }
+
+    // heat up
+    solver->solve(&datasPtr, &rhsDatasPtr, solver->order(), nRHS);
+    for (int q = 0; q < batchSize; q++) {
+      rhsDatasGpu[q].load(rhsDatas[q]);
+      rhsDatasPtr[q] = rhsDatasGpu[q].ptr();
+    }
+
+    auto startSolve = hrc::now();
+    solver->solve(&datasPtr, &rhsDatasPtr, solver->order(), nRHS);
+    solveTimes[nRHS] = tdelta(hrc::now() - startSolve).count() / batchSize;
+  }
+
+  if (verbose) {
+    solver->printStats();
+    cout << "sparse elim ranges: " << printVec(solver->sparseEliminationRanges()) << endl;
+  }
+
+  BenchResults retv;
+  retv.analysisTime = analysisTime;
+  retv.factorTime = factorTime;
+  retv.solveTimes = solveTimes;
+  return retv;
+}
+#endif  // BASPACHO_USE_METAL
+
 SparseProblem matGenToSparseProblem(SparseMatGenerator& gen, int64_t pSizeMin, int64_t pSizeMax) {
   SparseProblem retv;
   retv.sparseStruct = columnsToCscStruct(gen.columns).transpose();
@@ -563,6 +633,24 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            retv.factorTime = factorTime;
            retv.solveTimes = solveTimes;
            return retv;
+         }},
+        {"4_BaSpaCho_Metal_batchsize=4",
+         [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
+            bool collectStats) -> BenchResults {
+           return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 4, nRHSs, verbose,
+                                              collectStats);
+         }},
+        {"5_BaSpaCho_Metal_batchsize=8",
+         [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
+            bool collectStats) -> BenchResults {
+           return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 8, nRHSs, verbose,
+                                              collectStats);
+         }},
+        {"6_BaSpaCho_Metal_batchsize=16",
+         [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
+            bool collectStats) -> BenchResults {
+           return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 16, nRHSs, verbose,
+                                              collectStats);
          }},
 #endif  // BASPACHO_USE_METAL
 };

@@ -1227,3 +1227,4 @@ kernel void transposeSquareInPlace_kernel_float(
     mat[i * n + j] = mat[j * n + i];
     mat[j * n + i] = tmp;
 }
+
