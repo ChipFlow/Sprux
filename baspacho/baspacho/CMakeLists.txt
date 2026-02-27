@@ -8,6 +8,7 @@ set(BaSpaCho_sources
     MatOpsRef.cpp
     Solver.cpp
     SparseStructure.cpp
+    SupernodeMerger.cpp
     Utils.cpp)
 
 if(BASPACHO_USE_CUBLAS)
