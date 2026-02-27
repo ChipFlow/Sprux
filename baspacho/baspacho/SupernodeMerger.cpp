@@ -28,6 +28,11 @@ int64_t LevelSetSchedule::numLumps() const {
 
 LevelSetSchedule LevelSetSchedule::build(const vector<int64_t>& lumpParent) {
   int64_t numLumps = (int64_t)lumpParent.size();
+  LevelSetSchedule schedule;
+
+  if (numLumps == 0) {
+    return schedule;
+  }
 
   // Count children per lump (for bottom-up traversal)
   vector<int64_t> childCount(numLumps, 0);
@@ -63,7 +68,6 @@ LevelSetSchedule LevelSetSchedule::build(const vector<int64_t>& lumpParent) {
   }
 
   // Group lumps by level
-  LevelSetSchedule schedule;
   schedule.levels.resize(maxLevel + 1);
   for (int64_t l = 0; l < numLumps; l++) {
     schedule.levels[lumpLevel[l]].push_back(l);
@@ -158,8 +162,10 @@ void computeRelaxedMerges(EliminationTree& et, double fillTolerance,
     // fillRatio = nodeRows[k] / (nodeRows[p] + nodeSize[p])
     // extraZeros = 1 - fillRatio
     // Merge if extraZeros <= fillTolerance
+    // Note: nodeRows uses original structural counts (not updated by prior merges),
+    // consistent with computeMerges() in EliminationTree.cpp.
     double denom = et.nodeRows[p] + et.nodeSize[p];
-    if (denom > 0) {
+    if (denom > 0) {  // denom==0 only for degenerate root; merge unconditionally
       double fillRatio = (double)et.nodeRows[k] / denom;
       if (1.0 - fillRatio > fillTolerance) {
         continue;

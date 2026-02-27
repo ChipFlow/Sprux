@@ -295,6 +295,9 @@ SparseStructure SparseStructure::addFullEliminationFill() const {
 #ifdef BASPACHO_HAVE_CHOLMOD
 
 SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
+  static_assert(sizeof(SuiteSparse_long) == sizeof(int64_t),
+                "CHOLMOD long type must match int64_t");
+
   int64_t ord = order();
   int64_t nnz = inds.size();
 
@@ -307,6 +310,14 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   // (matching the original function's output format).
   cholmod_common c;
   cholmod_l_start(&c);
+
+  // RAII-style cleanup to prevent resource leaks if BASPACHO_CHECK throws
+  auto cleanup = [&](cholmod_factor** Lptr) {
+    if (Lptr && *Lptr) {
+      cholmod_l_free_factor(Lptr, &c);
+    }
+    cholmod_l_finish(&c);
+  };
 
   // Don't print anything
   c.print = 0;
@@ -331,6 +342,7 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   }
 
   // Create CHOLMOD sparse matrix (views our data directly, no copy).
+  // CHOLMOD does not modify the input matrix during analyze/factorize.
   // Our CSR lower triangle data is CSC upper triangle, so use stype=+1.
   cholmod_sparse A;
   memset(&A, 0, sizeof(A));
@@ -351,12 +363,18 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   // Symbolic analysis using natural ordering (no additional reordering —
   // the input is already permuted by the fill-reducing permutation).
   cholmod_factor* L = cholmod_l_analyze(&A, &c);
-  BASPACHO_CHECK_NOTNULL(L);
+  if (!L) {
+    cleanup(&L);
+    BASPACHO_CHECK_NOTNULL(L);
+  }
 
   // Numeric factorization populates L->p and L->i with the actual fill pattern
   int ok = cholmod_l_factorize(&A, L, &c);
-  BASPACHO_CHECK(ok);
-  BASPACHO_CHECK(c.status == CHOLMOD_OK);
+  if (!ok || c.status != CHOLMOD_OK) {
+    cleanup(&L);
+    BASPACHO_CHECK(ok);
+    BASPACHO_CHECK(c.status == CHOLMOD_OK);
+  }
 
   // For simplicial LDL'/LL', L->p[k] gives start of column k, L->nz[k] gives count.
   // The pattern is stored in L->i with L->nz entries per column (not L->p[k+1]-L->p[k]).
@@ -383,8 +401,7 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
     }
   }
 
-  cholmod_l_free_factor(&L, &c);
-  cholmod_l_finish(&c);
+  cleanup(&L);
 
   // Transpose CSC lower → CSR lower (matching original output format)
   SparseStructure retv = cholmodL.transpose();

@@ -32,10 +32,11 @@ struct LevelSetSchedule {
 // Must be called after processTree().
 std::vector<int64_t> computeLumpParent(const EliminationTree& et);
 
-// Perform additional aggressive merging on an EliminationTree that has already
-// had computeMerges() called. Uses fill tolerance instead of cost model.
-//
-// Call between computeMerges() and collapseMergePointers() in processTree().
+// Perform aggressive fill-tolerance-based merging on an EliminationTree.
+// Can be called either:
+//   1. Between computeMerges() and collapseMergePointers() (additive merging), or
+//   2. Standalone with initialized merge state (mergeWith=-1, numMergedNodes=1, numMerges=0)
+// Requires buildTree() and computeNodeHeights() to have been called.
 //
 // - fillTolerance: maximum fraction of extra zeros allowed (0.25 = 25%)
 // - maxSupernodeSize: maximum merged node size (sum of parameter sizes)

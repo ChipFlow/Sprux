@@ -51,21 +51,25 @@ TEST(FastSymbolic, CholmodMatchesOriginal_Random) {
   int64_t n = 100;
   std::mt19937 rng(42);
 
-  // Build random lower-triangular CSC
+  // Build random lower-triangular CSR with unique indices per row
   std::vector<int64_t> ptrs(n + 1, 0);
   std::vector<int64_t> inds;
 
   for (int64_t k = 0; k < n; k++) {
-    inds.push_back(k);  // diagonal always present
-    ptrs[k]++;
+    std::set<int64_t> rowEntries;
+    rowEntries.insert(k);  // diagonal always present
 
-    // Add ~5 random entries below diagonal
+    // Add ~5 random entries below diagonal (deduplicated)
     for (int64_t attempt = 0; attempt < 5; attempt++) {
       int64_t row = k + 1 + (rng() % (n - k));
       if (row < n) {
-        inds.push_back(row);
-        ptrs[k]++;
+        rowEntries.insert(row);
       }
+    }
+
+    ptrs[k] = (int64_t)rowEntries.size();
+    for (int64_t idx : rowEntries) {
+      inds.push_back(idx);
     }
   }
 

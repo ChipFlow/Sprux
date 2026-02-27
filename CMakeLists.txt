@@ -202,8 +202,7 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
 endif()
 
 # SuiteSparse (vendored via FetchContent)
-# Provides: AMD (fill-reducing ordering), CHOLMOD (symbolic analysis),
-#           BTF (block triangular form for static pivoting)
+# Provides: AMD (fill-reducing ordering), CHOLMOD (fast symbolic analysis)
 message("${Cyan}===========================[ SuiteSparse ]==============================${ColourReset}")
 set(BASPACHO_USE_SYSTEM_SUITESPARSE OFF CACHE BOOL
   "If on, use system-installed SuiteSparse instead of vendored")
@@ -234,7 +233,7 @@ if(BASPACHO_USE_SYSTEM_SUITESPARSE)
 else()
   # Vendored SuiteSparse via FetchContent - build only what we need
   if(NOT DEFINED suitesparse_SOURCE_DIR)
-    set(SUITESPARSE_ENABLE_PROJECTS "suitesparse_config;amd;colamd;camd;ccolamd;cholmod;btf" CACHE STRING "" FORCE)
+    set(SUITESPARSE_ENABLE_PROJECTS "suitesparse_config;amd;colamd;camd;ccolamd;cholmod" CACHE STRING "" FORCE)
     set(CHOLMOD_SUPERNODAL OFF CACHE BOOL "" FORCE)  # No BLAS needed for symbolic-only
     set(CHOLMOD_CAMD ON CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})

@@ -105,6 +105,13 @@ TEST(LevelSetSchedule, Forest) {
   EXPECT_EQ(roots, (std::set<int64_t>{2, 4}));
 }
 
+TEST(LevelSetSchedule, EmptyInput) {
+  std::vector<int64_t> lumpParent;
+  auto schedule = LevelSetSchedule::build(lumpParent);
+  EXPECT_EQ(schedule.numLevels(), 0);
+  EXPECT_EQ(schedule.numLumps(), 0);
+}
+
 TEST(LevelSetSchedule, AllLumpsAppearExactlyOnce) {
   // Random-ish tree
   std::vector<int64_t> lumpParent = {3, 3, 4, 5, 5, 7, 7, -1};
