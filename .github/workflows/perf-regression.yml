@@ -83,11 +83,11 @@ jobs:
           -S "Metal|BLAS" \
           -R "10_FLAT|30_GRID|40_MERI|MTX" \
           -i test_data/c6288_jacobian/jacobian.mtx \
-          -O "factor" -n "$ITERATIONS" > results.json
+          -O "factor" -n "$ITERATIONS" > results-metal.json
         echo "=== Results ==="
         python3 -c "
         import json
-        with open('results.json') as f:
+        with open('results-metal.json') as f:
             data = json.load(f)
         for r in data['results']:
             print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
@@ -96,12 +96,27 @@ jobs:
     - name: Compare with baseline
       if: steps.baseline.outputs.cache-hit == 'true'
       run: |
-        python3 scripts/compare_bench.py baseline.json results.json --threshold "$THRESHOLD"
+        python3 scripts/compare_bench.py baseline.json results-metal.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-metal.json
 
     - name: First run notice
       if: steps.baseline.outputs.cache-hit != 'true'
       run: |
         echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Job summary
+      if: always()
+      run: |
+        if [ -f comparison-metal.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-metal.json \
+            --comparison comparison-metal.json \
+            --title "macOS Metal Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-metal.json \
+            --title "macOS Metal Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Upload results artifact
       uses: actions/upload-artifact@v4
@@ -109,15 +124,19 @@ jobs:
       with:
         name: perf-results-macos-metal-${{ github.sha }}
         path: |
-          results.json
-          comparison_summary.json
+          results-metal.json
+          comparison-metal.json
         retention-days: 30
 
     - name: Save baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-metal.json baseline.json
+
+    - name: Save baseline cache
       uses: actions/cache/save@v4
       if: github.ref == 'refs/heads/main'
       with:
-        path: results.json
+        path: baseline.json
         key: perf-baseline-macOS-ARM64-${{ github.sha }}
 
   perf-cuda:
@@ -140,7 +159,7 @@ jobs:
     - name: Install build dependencies
       run: |
         apt-get update
-        apt-get install -y cmake build-essential libopenblas-dev python3
+        apt-get install -y cmake build-essential libopenblas-dev python3 cudss-cuda-12
 
     - name: System info
       run: |
@@ -173,14 +192,14 @@ jobs:
     - name: Run benchmarks
       run: |
         ./build/baspacho/benchmarking/bench -J \
-          -S "CUDA|BLAS" \
+          -S "CUDA|BLAS|cuDSS" \
           -R "10_FLAT|30_GRID|40_MERI|MTX" \
           -i test_data/c6288_jacobian/jacobian.mtx \
-          -O "factor" -n "$ITERATIONS" > results.json
+          -O "factor" -n "$ITERATIONS" > results-cuda.json
         echo "=== Results ==="
         python3 -c "
         import json
-        with open('results.json') as f:
+        with open('results-cuda.json') as f:
             data = json.load(f)
         for r in data['results']:
             print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
@@ -189,12 +208,27 @@ jobs:
     - name: Compare with baseline
       if: steps.baseline.outputs.cache-hit == 'true'
       run: |
-        python3 scripts/compare_bench.py baseline.json results.json --threshold "$THRESHOLD"
+        python3 scripts/compare_bench.py baseline.json results-cuda.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-cuda.json
 
     - name: First run notice
       if: steps.baseline.outputs.cache-hit != 'true'
       run: |
         echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Job summary
+      if: always()
+      run: |
+        if [ -f comparison-cuda.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-cuda.json \
+            --comparison comparison-cuda.json \
+            --title "CUDA Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-cuda.json \
+            --title "CUDA Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Upload results artifact
       uses: actions/upload-artifact@v4
@@ -202,15 +236,19 @@ jobs:
       with:
         name: perf-results-cuda-${{ github.sha }}
         path: |
-          results.json
-          comparison_summary.json
+          results-cuda.json
+          comparison-cuda.json
         retention-days: 30
 
     - name: Save baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-cuda.json baseline.json
+
+    - name: Save baseline cache
       uses: actions/cache/save@v4
       if: github.ref == 'refs/heads/main'
       with:
-        path: results.json
+        path: baseline.json
         key: perf-baseline-Linux-X64-cuda-${{ github.sha }}
 
   summary:
@@ -219,6 +257,11 @@ jobs:
     if: always()
 
     steps:
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: scripts/summarize_bench.py
+        sparse-checkout-cone-mode: false
+
     - name: Download all artifacts
       uses: actions/download-artifact@v4
       with:
@@ -227,43 +270,42 @@ jobs:
         path: results/
 
     - name: Post summary
+      env:
+        METAL_STATUS: ${{ needs.perf-macos-metal.result }}
+        CUDA_STATUS: ${{ needs.perf-cuda.result }}
       run: |
-        {
-          echo "## Performance Regression Results"
-          echo ""
-          echo "| Platform | Status |"
-          echo "|----------|--------|"
+        python3 -c "
+        import glob, subprocess, sys, os
 
-          metal_status="${{ needs.perf-macos-metal.result }}"
-          cuda_status="${{ needs.perf-cuda.result }}"
+        metal = os.environ.get('METAL_STATUS', 'skipped')
+        cuda = os.environ.get('CUDA_STATUS', 'skipped')
+        threshold = os.environ.get('THRESHOLD', '0.20')
 
-          if [ "$metal_status" = "success" ]; then
-            echo "| macOS Metal | :white_check_mark: Pass |"
-          elif [ "$metal_status" = "skipped" ]; then
-            echo "| macOS Metal | :next_track_button: Skipped |"
-          else
-            echo "| macOS Metal | :x: Fail |"
-          fi
+        icons = {'success': ':white_check_mark: Pass', 'skipped': ':next_track_button: Skipped'}
 
-          if [ "$cuda_status" = "success" ]; then
-            echo "| CUDA | :white_check_mark: Pass |"
-          elif [ "$cuda_status" = "skipped" ]; then
-            echo "| CUDA | :next_track_button: Skipped |"
-          else
-            echo "| CUDA | :x: Fail |"
-          fi
+        lines = [
+            '## Performance Regression Summary', '',
+            '| Platform | Status |',
+            '|----------|--------|',
+            f'| macOS Metal | {icons.get(metal, \":x: Fail\")} |',
+            f'| CUDA | {icons.get(cuda, \":x: Fail\")} |',
+            '', f'Threshold: {threshold} ({float(threshold)*100:.0f}% slowdown)', '',
+        ]
 
-          echo ""
-          echo "Threshold: ${THRESHOLD:-0.20} (20% slowdown)"
-          echo ""
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write('\n'.join(lines) + '\n')
 
-          # Print result details if available
-          for f in results/*.json; do
-            if [ -f "$f" ] && echo "$f" | grep -q "comparison_summary"; then
-              echo "### Comparison Details"
-              echo '```json'
-              cat "$f"
-              echo '```'
-            fi
-          done
-        } >> "$GITHUB_STEP_SUMMARY"
+        # Collect result and comparison files
+        results = sorted(glob.glob('results/results-*.json'))
+        comparisons = sorted(glob.glob('results/comparison-*.json'))
+
+        if results or comparisons:
+            cmd = [sys.executable, 'scripts/summarize_bench.py', '--title', 'Detailed Results']
+            if results:
+                cmd += ['--results'] + results
+            if comparisons:
+                cmd += ['--comparison'] + comparisons
+            output = subprocess.check_output(cmd, text=True)
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                f.write(output)
+        "

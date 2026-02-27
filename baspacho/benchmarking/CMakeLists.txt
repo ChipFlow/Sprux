@@ -17,6 +17,11 @@ if(HAVE_UMFPACK)
          BenchUmfpack.cpp)
 endif()
 
+if(HAVE_CUDSS)
+    list(APPEND bench_sources
+         BenchCudss.cpp)
+endif()
+
 add_executable(BAL_bench ${BAL_bench_sources})
 target_link_libraries (BAL_bench ${BASPACHO_LIBRARY} testing BAL_utils)
 
@@ -33,4 +38,8 @@ endif()
 
 if(HAVE_UMFPACK)
   target_link_libraries (bench ${UMFPACK_LIBRARIES})
+endif()
+
+if(HAVE_CUDSS)
+  target_link_libraries (bench cuDSS::cuDSS CUDA::cudart)
 endif()

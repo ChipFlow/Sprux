@@ -31,6 +31,10 @@
 #include "BenchCholmod.h"
 #endif
 
+#ifdef BASPACHO_HAVE_CUDSS
+#include "BenchCudss.h"
+#endif
+
 using namespace BaSpaCho;
 using namespace testing_utils;
 using namespace std;
@@ -498,6 +502,19 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
                prob, {.findSparseEliminationRanges = true, .backend = BackendCuda},
                /* batchsize = */ 16, nRHSs, verbose, collectStats);
          }},
+#ifdef BASPACHO_HAVE_CUDSS
+        {"7_cuDSS_Cholesky",
+         [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
+            bool /* collectStats */) -> BenchResults {
+           auto result =
+               benchmarkCudssSolve(prob.paramSize, prob.sparseStruct, nRHSs, verbose);
+           BenchResults retv;
+           retv.analysisTime = result.analysisTime;
+           retv.factorTime = result.factorTime;
+           retv.solveTimes = result.solveTimes;
+           return retv;
+         }},
+#endif  // BASPACHO_HAVE_CUDSS
 #endif  // BASPACHO_USE_CUBLAS
 #ifdef BASPACHO_USE_METAL
         {"3_BaSpaCho_Metal",
