@@ -411,7 +411,7 @@ TEST(SupernodeMergerSolver, CholeskyWithMerging_float) {
   }
 }
 
-// Test that default settings (no merging) still produce an empty schedule for the simple path.
+// Test that default settings (no relaxed merging) still produce a valid level-set schedule.
 TEST(SupernodeMergerSolver, DefaultSettingsNoMerging) {
   int numParams = 50;
   auto colBlocks = randomCols(numParams, 0.05, 42);
@@ -444,4 +444,63 @@ TEST(SupernodeMergerSolver, AddFillNoneEmptySchedule) {
 
   // AddFillNone path skips EliminationTree entirely, so no schedule
   EXPECT_EQ(solver->levelSetSchedule().numLevels(), 0);
+}
+
+// Test AddFillForAutoElims path with merging settings.
+// This path calls processTree(findOnlyElims=true), which skips merging,
+// but the schedule should still be valid and cover all lumps.
+TEST(SupernodeMergerSolver, AddFillForAutoElimsSchedule) {
+  int numParams = 100;
+  auto colBlocks = randomCols(numParams, 0.03, 77);
+  colBlocks = makeIndependentElimSet(colBlocks, 0, 60);
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  std::vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 1, 3, 77);
+
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.addFillPolicy = AddFillForAutoElims;
+  settings.supernodeMergeFillTolerance = 0.25;
+  settings.maxSupernodeSize = 256;
+  auto solver = createSolver(settings, paramSize, ss);
+
+  // Schedule should be valid even though merging was skipped
+  EXPECT_GT(solver->levelSetSchedule().numLevels(), 0);
+  EXPECT_EQ(solver->levelSetSchedule().numLumps(), solver->skel().numLumps());
+}
+
+// Test that schedule lump indices are correctly shifted when sparseElimRanges are provided.
+// The first givenSparseElimEnd lumps are identity (one lump per span), then ET lumps follow.
+TEST(SupernodeMergerSolver, SparseElimRangesScheduleAlignment) {
+  int numParams = 150;
+  auto colBlocks = randomCols(numParams, 0.03, 88);
+  colBlocks = makeIndependentElimSet(colBlocks, 0, 90);
+  std::vector<int64_t> sparseElimRanges = {0, 90};
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  std::vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 1, 3, 88);
+
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.addFillPolicy = AddFillComplete;
+  settings.supernodeMergeFillTolerance = 0.25;
+  settings.maxSupernodeSize = 256;
+  auto solver = createSolver(settings, paramSize, ss, sparseElimRanges);
+
+  const auto& schedule = solver->levelSetSchedule();
+  int64_t totalLumps = solver->skel().numLumps();
+
+  // Schedule must cover all lumps in the final solver
+  EXPECT_EQ(schedule.numLumps(), totalLumps)
+      << "Schedule must cover all " << totalLumps << " lumps (including sparse-elim lumps)";
+  EXPECT_GT(schedule.numLevels(), 0);
+
+  // Verify all lump indices are in [0, totalLumps) and each appears exactly once
+  std::set<int64_t> seen;
+  for (const auto& level : schedule.levels) {
+    for (int64_t l : level) {
+      EXPECT_GE(l, 0);
+      EXPECT_LT(l, totalLumps);
+      EXPECT_TRUE(seen.insert(l).second) << "Lump " << l << " appears in multiple levels";
+    }
+  }
+  EXPECT_EQ((int64_t)seen.size(), totalLumps);
 }

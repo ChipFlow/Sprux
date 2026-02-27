@@ -1292,6 +1292,11 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   // no point in providing "elim last" ids if not allowing solve up to such set
   BASPACHO_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
 
+  // validate supernode merging settings
+  BASPACHO_CHECK_GE(settings.supernodeMergeFillTolerance, 0.0);
+  BASPACHO_CHECK_LE(settings.supernodeMergeFillTolerance, 1.0);
+  BASPACHO_CHECK_GE(settings.maxSupernodeSize, (int64_t)0);
+
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
   if (!sparseElimRanges.empty()) {
@@ -1370,6 +1375,20 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   // Compute level-set schedule for parallel factorization
   auto lumpParent = computeLumpParent(et);
   auto levelSetSchedule = LevelSetSchedule::build(lumpParent);
+
+  // The ET lumps are numbered 0..N-1, but in the final solver the first
+  // givenSparseElimEnd lumps are identity (one lump per sparse-elim span).
+  // Shift ET lump indices and prepend the sparse-elim lumps as leaf level.
+  if (givenSparseElimEnd > 0) {
+    for (auto& level : levelSetSchedule.levels) {
+      for (auto& l : level) {
+        l += givenSparseElimEnd;
+      }
+    }
+    std::vector<int64_t> elimLumps(givenSparseElimEnd);
+    std::iota(elimLumps.begin(), elimLumps.end(), 0);
+    levelSetSchedule.levels.insert(levelSetSchedule.levels.begin(), std::move(elimLumps));
+  }
 
   et.computeAggregateStruct(settings.addFillPolicy == AddFillForAutoElims);
 

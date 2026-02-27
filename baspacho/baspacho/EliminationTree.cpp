@@ -328,7 +328,7 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
     numMerges = 0;
   } else {
     computeMerges();
-    if (relaxedFillTol > 0.0 && maxSupernodeSize > 0) {
+    if (relaxedFillTol >= 0.0 && maxSupernodeSize > 0) {
       computeRelaxedMerges(*this, relaxedFillTol, maxSupernodeSize);
     }
     collapseMergePointers();

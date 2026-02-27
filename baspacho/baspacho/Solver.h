@@ -376,8 +376,8 @@ struct Settings {
   BackendType backend = BackendFast;
   AddFillPolicy addFillPolicy = AddFillComplete;
   const ComputationModel* computationModel = nullptr;
-  double supernodeMergeFillTolerance = 0.0;  // 0 = disabled, 0.25 = 25% fill allowed
-  int64_t maxSupernodeSize = 0;              // 0 = disabled, 256 = typical
+  double supernodeMergeFillTolerance = 0.0;  // max extra-zero fraction: 0.0 = exact only, 0.25 = 25%
+  int64_t maxSupernodeSize = 0;              // 0 = merging disabled, 256 = typical max size
 };
 
 /**
