@@ -235,9 +235,9 @@ TEST(RelaxedMerge, RandomScalarMatrix) {
     ptrs[k]++;
 
     // Add ~3 random off-diagonal entries per row (below diagonal)
-    for (int64_t attempt = 0; attempt < 3; attempt++) {
-      int64_t col = rng() % k;  // column < k (below diagonal in CSR)
-      if (k > 0) {
+    if (k > 0) {
+      for (int64_t attempt = 0; attempt < 3; attempt++) {
+        int64_t col = rng() % k;  // column < k (below diagonal in CSR)
         inds.push_back(col);
         ptrs[k]++;
       }
