@@ -161,6 +161,8 @@ void testBatchedSolveL_SparseElimAndFactor_Many(const std::function<OpsPtr()>& g
 
     vector<int64_t> permutation = ss.fillReducingPermutation();
     vector<int64_t> invPerm = inversePermutation(permutation);
+    (void)permutation;
+    (void)invPerm;
     SparseStructure sortedSs = ss;
 
     vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 2, 5, 47 + i);
@@ -173,7 +175,6 @@ void testBatchedSolveL_SparseElimAndFactor_Many(const std::function<OpsPtr()>& g
                                         et.rowParam);
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    int64_t largestIndep = et.sparseElimRanges[1];
     Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
 
     // generate a batch of data
@@ -234,6 +235,8 @@ void testBatchedSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& 
 
     vector<int64_t> permutation = ss.fillReducingPermutation();
     vector<int64_t> invPerm = inversePermutation(permutation);
+    (void)permutation;
+    (void)invPerm;
     SparseStructure sortedSs = ss;
 
     vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 2, 5, 47 + i);
@@ -246,7 +249,6 @@ void testBatchedSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& 
                                         et.rowParam);
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
-    int64_t largestIndep = et.sparseElimRanges[1];
     Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
 
     // generate a batch of data
@@ -272,7 +274,7 @@ void testBatchedSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& 
         datasPtr[q] = datasGpu[q].ptr();
         rhsDatasPtr[q] = rhsDatasGpu[q].ptr();
       }
-      solver.solveL(&datasPtr, &rhsDatasPtr, order, nRHS);
+      solver.solveLt(&datasPtr, &rhsDatasPtr, order, nRHS);
       for (int q = 0; q < batchSize; q++) {
         rhsDatasGpu[q].get(rhsDatas[q]);
       }
@@ -282,7 +284,7 @@ void testBatchedSolveLt_SparseElimAndFactor_Many(const std::function<OpsPtr()>& 
       vector<T> rhsVerif(order * nRHS);
       Matrix<T> verifyMat = solver.skel().densify(datas[q]);
       Eigen::Map<Matrix<T>>(rhsVerif.data(), order, nRHS) =
-          verifyMat.template triangularView<Eigen::Lower>().solve(
+          verifyMat.template triangularView<Eigen::Lower>().adjoint().solve(
               Eigen::Map<Matrix<T>>(rhsDatasBackup[q].data(), order, nRHS));
 
       ASSERT_NEAR((Eigen::Map<Matrix<T>>(rhsVerif.data(), order, nRHS) -

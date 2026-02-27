@@ -157,6 +157,8 @@ void testBatchedSparseElim_Many(const std::function<OpsPtr()>& genOps) {
 
     vector<int64_t> permutation = ss.fillReducingPermutation();
     vector<int64_t> invPerm = inversePermutation(permutation);
+    (void)permutation;
+    (void)invPerm;
     SparseStructure sortedSs = ss;
 
     vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 2, 5, 47);
@@ -170,6 +172,7 @@ void testBatchedSparseElim_Many(const std::function<OpsPtr()>& genOps) {
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
     int64_t largestIndep = et.sparseElimRanges[1];
+    (void)largestIndep;
     Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
 
     // generate a batch of data
@@ -226,6 +229,8 @@ void testBatchedSparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps) 
 
     vector<int64_t> permutation = ss.fillReducingPermutation();
     vector<int64_t> invPerm = inversePermutation(permutation);
+    (void)permutation;
+    (void)invPerm;
     SparseStructure sortedSs = ss;
 
     vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 2, 5, 47);
@@ -239,6 +244,7 @@ void testBatchedSparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps) 
 
     ASSERT_GE(et.sparseElimRanges.size(), 2);
     int64_t largestIndep = et.sparseElimRanges[1];
+    (void)largestIndep;
     Solver solver(move(factorSkel), move(et.sparseElimRanges), {}, genOps());
 
     // generate a batch of data

@@ -1881,6 +1881,8 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
 
       // MPS path: encode all batch items into one command buffer
       id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
+      NSMutableArray<id<MTLBuffer>>* statusBufs =
+          [NSMutableArray arrayWithCapacity:batchSize];
 
       for (int b = 0; b < batchSize; b++) {
         auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
@@ -1897,13 +1899,31 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
                                        offset:baseOffset + offA * sizeof(float)
                                    descriptor:descA];
 
+        id<MTLBuffer> statusBuf = [sym.device
+            newBufferWithLength:sizeof(MPSMatrixDecompositionStatus)
+                       options:MTLResourceStorageModeShared];
+        [statusBufs addObject:statusBuf];
+
         MPSMatrixDecompositionCholesky* mpsChol =
             [[MPSMatrixDecompositionCholesky alloc] initWithDevice:sym.device lower:YES order:n];
-        [mpsChol encodeToCommandBuffer:cmdBuf sourceMatrix:mpsA resultMatrix:mpsA status:nil];
+        [mpsChol encodeToCommandBuffer:cmdBuf
+                          sourceMatrix:mpsA
+                          resultMatrix:mpsA
+                                status:statusBuf];
       }
 
       [cmdBuf commit];
       [cmdBuf waitUntilCompleted];
+
+      for (int b = 0; b < batchSize; b++) {
+        auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>(
+            [statusBufs[b] contents]);
+        if (status != MPSMatrixDecompositionStatusSuccess) {
+          fprintf(stderr,
+                  "Metal batched potrf: MPS Cholesky failed (batch %d, status=%d, n=%lld)\n",
+                  b, (int)status, (long long)n);
+        }
+      }
     }
   }
 
@@ -2141,7 +2161,6 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
   MetalMirror<int64_t> devSpanToChainOffset;
   std::vector<int64_t> spanToChainOffset;
   bool assembleWasCalled_ = false;
-  id<MTLBuffer> potrfStatusBuf_ = nil;
 };
 
 // Batched solve context for float
