@@ -542,7 +542,7 @@ TEST_P(MetalPotrfSizeTest, PotrfVsCpuReference) {
 }
 
 INSTANTIATE_TEST_SUITE_P(MetalKernel, MetalPotrfSizeTest,
-                         ::testing::Values(4, 16, 31, 32, 33, 64, 128));
+                         ::testing::Values(1, 4, 16, 31, 32, 33, 64, 128));
 
 // Test trsm at various sizes that cross the MPS threshold boundary
 class MetalTrsmSizeTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {};
@@ -589,7 +589,8 @@ TEST_P(MetalTrsmSizeTest, TrsmVsCpuReference) {
 }
 
 INSTANTIATE_TEST_SUITE_P(MetalKernel, MetalTrsmSizeTest,
-                         ::testing::Values(std::make_tuple(4, 2),
+                         ::testing::Values(std::make_tuple(2, 1),
+                                           std::make_tuple(4, 2),
                                            std::make_tuple(16, 8),
                                            std::make_tuple(32, 16),
                                            std::make_tuple(64, 32),

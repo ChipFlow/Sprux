@@ -544,11 +544,14 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       MPSMatrixDecompositionCholesky* mpsChol = [[MPSMatrixDecompositionCholesky alloc]
           initWithDevice:sym.device lower:YES order:n];
 
-      // Allocate status buffer to detect non-SPD matrices (matches CPU path error reporting)
-      id<MTLBuffer> statusBuf = [sym.device newBufferWithLength:sizeof(MPSMatrixDecompositionStatus)
-          options:MTLResourceStorageModeShared];
+      // Reuse cached status buffer for detecting non-SPD matrices
+      if (!potrfStatusBuf_) {
+        potrfStatusBuf_ = [sym.device
+            newBufferWithLength:sizeof(MPSMatrixDecompositionStatus)
+                       options:MTLResourceStorageModeShared];
+      }
       [mpsChol encodeToCommandBuffer:pendingCmdBuf_
-          sourceMatrix:mpsA resultMatrix:mpsA status:statusBuf];
+          sourceMatrix:mpsA resultMatrix:mpsA status:potrfStatusBuf_];
 
       // Commit+wait — data is CPU-coherent (shared memory on Apple Silicon)
       [pendingCmdBuf_ commit];
@@ -557,7 +560,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       pendingDispatchCount_ = 0;
 
       // Check decomposition status (matches CPU path's fprintf)
-      auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>([statusBuf contents]);
+      auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>([potrfStatusBuf_ contents]);
       if (status != MPSMatrixDecompositionStatusSuccess) {
         fprintf(stderr, "Metal potrf: MPS Cholesky failed (status=%d, n=%lld)\n",
                 (int)status, (long long)n);
@@ -1177,6 +1180,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   std::vector<int64_t> spanToChainOffset;
   MetalMirror<int64_t> devPivots;        // GPU buffer for LU pivots (profiling path)
   MetalMirror<uint32_t> devPivotBuf32;  // GPU buffer for MPS LU pivot output (uint32_t format)
+  id<MTLBuffer> potrfStatusBuf_ = nil;  // Cached status buffer for MPS Cholesky
   bool assembleWasCalled_ = false;      // Track whether assemble() was called
 
   // Batched saveGemm state
