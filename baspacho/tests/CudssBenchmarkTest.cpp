@@ -33,6 +33,7 @@
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
 #include "baspacho/baspacho/Utils.h"
+#include "baspacho/testing/MatrixMarketReader.h"
 #include "baspacho/testing/TestingUtils.h"
 
 using namespace BaSpaCho;
@@ -46,137 +47,6 @@ using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
 
 template <typename T>
 using Vector = Eigen::Vector<T, Eigen::Dynamic>;
-
-// ============================================================================
-// Matrix Market parser
-// ============================================================================
-
-struct CsrMatrix {
-  int64_t nRows;
-  int64_t nCols;
-  int64_t nnz;
-  vector<int64_t> rowPtr;  // size nRows+1
-  vector<int64_t> colInd;  // size nnz
-  vector<double> values;   // size nnz
-};
-
-// Parse a Matrix Market coordinate file into CSR format.
-// Handles: %%MatrixMarket matrix coordinate real general
-CsrMatrix readMatrixMarket(const string& path) {
-  ifstream f(path);
-  EXPECT_TRUE(f.is_open()) << "Cannot open: " << path;
-
-  string line;
-  // Read header line
-  getline(f, line);
-  EXPECT_TRUE(line.find("%%MatrixMarket") != string::npos) << "Not a MatrixMarket file: " << path;
-  EXPECT_TRUE(line.find("coordinate") != string::npos) << "Only coordinate format supported";
-
-  // Skip comment lines
-  while (getline(f, line)) {
-    if (line.empty() || line[0] == '%') continue;
-    break;
-  }
-
-  // Parse dimensions: rows cols nnz
-  int64_t nRows, nCols, nnz;
-  {
-    istringstream iss(line);
-    iss >> nRows >> nCols >> nnz;
-  }
-
-  // Read COO triplets
-  struct Triplet {
-    int64_t row, col;
-    double val;
-  };
-  vector<Triplet> triplets;
-  triplets.reserve(nnz);
-
-  for (int64_t i = 0; i < nnz; i++) {
-    Triplet t;
-    f >> t.row >> t.col >> t.val;
-    t.row--;  // 1-indexed -> 0-indexed
-    t.col--;
-    triplets.push_back(t);
-  }
-
-  EXPECT_EQ((int64_t)triplets.size(), nnz) << "Triplet count mismatch";
-
-  // Sort by (row, col) for CSR construction
-  sort(triplets.begin(), triplets.end(), [](const Triplet& a, const Triplet& b) {
-    return a.row < b.row || (a.row == b.row && a.col < b.col);
-  });
-
-  // Build CSR
-  CsrMatrix csr;
-  csr.nRows = nRows;
-  csr.nCols = nCols;
-  csr.nnz = nnz;
-  csr.rowPtr.resize(nRows + 1, 0);
-  csr.colInd.resize(nnz);
-  csr.values.resize(nnz);
-
-  for (int64_t i = 0; i < nnz; i++) {
-    csr.rowPtr[triplets[i].row + 1]++;
-  }
-  for (int64_t i = 0; i < nRows; i++) {
-    csr.rowPtr[i + 1] += csr.rowPtr[i];
-  }
-
-  for (int64_t i = 0; i < nnz; i++) {
-    csr.colInd[i] = triplets[i].col;
-    csr.values[i] = triplets[i].val;
-  }
-
-  return csr;
-}
-
-// Read a dense vector from Matrix Market format (Nx1 coordinate or array)
-Vector<double> readRhsVector(const string& path) {
-  ifstream f(path);
-  EXPECT_TRUE(f.is_open()) << "Cannot open: " << path;
-
-  string line;
-  getline(f, line);
-  EXPECT_TRUE(line.find("%%MatrixMarket") != string::npos) << "Not a MatrixMarket file";
-
-  bool isCoordinate = line.find("coordinate") != string::npos;
-
-  // Skip comments
-  while (getline(f, line)) {
-    if (line.empty() || line[0] == '%') continue;
-    break;
-  }
-
-  int64_t nRows, nCols;
-  if (isCoordinate) {
-    int64_t nnz;
-    istringstream iss(line);
-    iss >> nRows >> nCols >> nnz;
-    EXPECT_EQ(nCols, 1) << "RHS must be a column vector";
-
-    Vector<double> rhs = Vector<double>::Zero(nRows);
-    for (int64_t i = 0; i < nnz; i++) {
-      int64_t row, col;
-      double val;
-      f >> row >> col >> val;
-      rhs(row - 1) = val;
-    }
-    return rhs;
-  } else {
-    // Array format
-    istringstream iss(line);
-    iss >> nRows >> nCols;
-    EXPECT_EQ(nCols, 1) << "RHS must be a column vector";
-
-    Vector<double> rhs(nRows);
-    for (int64_t i = 0; i < nRows; i++) {
-      f >> rhs(i);
-    }
-    return rhs;
-  }
-}
 
 // ============================================================================
 // Get the test data directory
@@ -244,20 +114,6 @@ CscMatrix csrToCsc(const CsrMatrix& csr) {
   }
 
   return csc;
-}
-
-// ============================================================================
-// Sparse residual computation: ||Ax - b|| / ||b|| using CSR
-// ============================================================================
-
-double computeResidual(const CsrMatrix& A, const Vector<double>& x, const Vector<double>& b) {
-  Vector<double> Ax = Vector<double>::Zero(A.nRows);
-  for (int64_t i = 0; i < A.nRows; i++) {
-    for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
-      Ax(i) += A.values[k] * x(A.colInd[k]);
-    }
-  }
-  return (Ax - b).norm() / b.norm();
 }
 
 // ============================================================================

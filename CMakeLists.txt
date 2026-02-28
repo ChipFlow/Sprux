@@ -345,8 +345,11 @@ message("* Dispenso Source = " ${dispenso_SOURCE_DIR})
 message("* Dispenso Library Dir = " ${dispenso_BINARY_DIR})
 
 # gtest
+# NOTE: Check for target existence, not just gtest_SOURCE_DIR variable.
+# SuiteSparse FetchContent can set gtest_SOURCE_DIR as a cache variable
+# without actually creating the gtest targets.
 if(BASPACHO_BUILD_TESTS)
-  if(NOT DEFINED gtest_SOURCE_DIR)
+  if(NOT TARGET gtest_main)
     message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
     FetchContent_Declare(
       googletest
