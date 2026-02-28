@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -23,12 +22,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include "baspacho/baspacho/CoalescedBlockMatrix.h"
-#include "baspacho/baspacho/EliminationTree.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
-#include "baspacho/baspacho/Utils.h"
 #include "baspacho/testing/MatrixMarketReader.h"
 #include "baspacho/testing/TestingUtils.h"
 
@@ -64,89 +60,21 @@ static vector<pair<string, string>> discoverSequenceFiles(const string& dir) {
   return pairs;
 }
 
-static CoalescedBlockMatrixSkel buildSkeletonFromCsr(const CsrMatrix& A) {
+// Build CSR lower-triangle SparseStructure from CSR matrix.
+// createSolver expects lower-triangle CSR (matching randomCols/columnsToCscStruct convention).
+// Ensures diagonal entries are present (required by CHOLMOD symbolic analysis).
+static SparseStructure csrToSparseStructure(const CsrMatrix& A) {
   int64_t n = A.nRows;
   vector<set<int64_t>> colBlocks(n);
   for (int64_t i = 0; i < n; i++) {
+    colBlocks[i].insert(i);  // ensure diagonal is present
     for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
-      colBlocks[A.colInd[k]].insert(i);
+      int64_t j = A.colInd[k];
+      // CSC lower triangle: column min(i,j) has row max(i,j)
+      colBlocks[min(i, j)].insert(max(i, j));
     }
   }
-
-  SparseStructure ss = columnsToCscStruct(colBlocks).transpose().addFullEliminationFill();
-  vector<int64_t> spanStart(n + 1);
-  iota(spanStart.begin(), spanStart.end(), 0);
-  vector<int64_t> lumpToSpan(n + 1);
-  iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
-
-  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
-  CoalescedBlockMatrixSkel skel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
-  skel.initUpperTriangle();
-  return skel;
-}
-
-template <typename T>
-static void fillDataFromCsr(const CoalescedBlockMatrixSkel& skel, const CsrMatrix& A,
-                            vector<T>& data) {
-  fill(data.begin(), data.end(), T(0));
-  int64_t numLumps = skel.numLumps();
-
-  for (int64_t l = 0; l < numLumps; l++) {
-    int64_t chainStart = skel.chainColPtr[l];
-    int64_t chainEnd = skel.chainColPtr[l + 1];
-    int64_t lumpStartCol = skel.lumpStart[l];
-    int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartCol;
-
-    for (int64_t c = chainStart; c < chainEnd; c++) {
-      int64_t rowSpan = skel.chainRowSpan[c];
-      int64_t rowStart = skel.spanStart[rowSpan];
-      int64_t rowSize = skel.spanStart[rowSpan + 1] - rowStart;
-      int64_t dataOffset = skel.chainData[c];
-
-      for (int64_t r = 0; r < rowSize; r++) {
-        int64_t globalRow = rowStart + r;
-        for (int64_t col = 0; col < lumpSize; col++) {
-          int64_t globalCol = lumpStartCol + col;
-          for (int64_t k = A.rowPtr[globalRow]; k < A.rowPtr[globalRow + 1]; k++) {
-            if (A.colInd[k] == globalCol) {
-              data[dataOffset + r * lumpSize + col] = T(A.values[k]);
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (!skel.upperChainData.empty()) {
-    int64_t upperDataBase = skel.dataSize();
-    for (int64_t l = 0; l < numLumps; l++) {
-      int64_t upperRowStart = skel.upperChainRowPtr[l];
-      int64_t upperRowEnd = skel.upperChainRowPtr[l + 1];
-      int64_t lumpStartRow = skel.lumpStart[l];
-      int64_t lumpSize = skel.lumpStart[l + 1] - lumpStartRow;
-
-      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
-        int64_t colSpan = skel.upperChainColSpan[i];
-        int64_t colStart = skel.spanStart[colSpan];
-        int64_t colSize = skel.spanStart[colSpan + 1] - colStart;
-        int64_t upperDataOffset = upperDataBase + skel.upperChainData[i];
-
-        for (int64_t r = 0; r < lumpSize; r++) {
-          int64_t globalRow = lumpStartRow + r;
-          for (int64_t c = 0; c < colSize; c++) {
-            int64_t globalCol = colStart + c;
-            for (int64_t k = A.rowPtr[globalRow]; k < A.rowPtr[globalRow + 1]; k++) {
-              if (A.colInd[k] == globalCol) {
-                data[upperDataOffset + r * colSize + c] = T(A.values[k]);
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  return columnsToCscStruct(colBlocks).transpose();
 }
 
 // Float-only residual computation for Metal (CSR values are double, solution is float)
@@ -182,19 +110,38 @@ TEST(MetalSequenceSolve, RingOscillator) {
 
   int64_t n = A0.nRows;
 
-  CoalescedBlockMatrixSkel skel = buildSkeletonFromCsr(A0);
-  vector<float> data(skel.totalDataSize());
-  Solver solver(std::move(skel), {}, {}, metalOps());
-  const auto& solverSkel = solver.skel();
+  // Build solver once via CHOLMOD-based symbolic analysis
+  SparseStructure ss = csrToSparseStructure(A0);
+  vector<int64_t> paramSizes(n, 1);
+  vector<int64_t> blockSizes(n, 1);
+
+  // Metal GPU solver
+  Settings metalSettings;
+  metalSettings.backend = BackendMetal;
+  metalSettings.matrixType = MTYPE_GENERAL;
+  auto solver = createSolver(metalSettings, paramSizes, ss);
 
   // CPU float solver for reference comparison (same fill-in structure)
-  CoalescedBlockMatrixSkel cpuSkel = buildSkeletonFromCsr(A0);
-  vector<float> cpuData(cpuSkel.totalDataSize());
-  Solver cpuSolver(std::move(cpuSkel), {}, {}, fastOps());
-  const auto& cpuSolverSkel = cpuSolver.skel();
-  vector<int64_t> cpuPivots(n);
+  Settings cpuSettings;
+  cpuSettings.backend = BackendFast;
+  cpuSettings.matrixType = MTYPE_GENERAL;
+  auto cpuSolver = createSolver(cpuSettings, paramSizes, ss);
 
+  vector<float> data(solver->skel().totalDataSize());
+  vector<float> cpuData(cpuSolver->skel().totalDataSize());
+
+  // Convert CSR values to float for loadFromCsr<float>
+  auto loadFloatCsr = [&](const CsrMatrix& A, Solver& slv, vector<float>& buf) {
+    vector<float> floatValues(A.values.begin(), A.values.end());
+    fill(buf.begin(), buf.end(), 0.0f);
+    slv.loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), floatValues.data(),
+                    buf.data());
+  };
+
+  const auto& perm = solver->paramToSpan();
+  const auto& cpuPerm = cpuSolver->paramToSpan();
   vector<int64_t> pivots(n);
+  vector<int64_t> cpuPivots(n);
   int passed = 0;
   int skipped = 0;
 
@@ -218,10 +165,15 @@ TEST(MetalSequenceSolve, RingOscillator) {
     // structure — skip those since the issue is precision, not Metal.
     float cpuResidual;
     try {
-      fillDataFromCsr<float>(cpuSolverSkel, A, cpuData);
-      cpuSolver.factorLU(cpuData.data(), cpuPivots.data());
-      Eigen::VectorXf xCpu = b;
-      cpuSolver.solveLU(cpuData.data(), cpuPivots.data(), xCpu.data(), n, 1);
+      loadFloatCsr(A, *cpuSolver, cpuData);
+      cpuSolver->factorLU(cpuData.data(), cpuPivots.data());
+
+      Eigen::VectorXf cpuBp(n);
+      for (int64_t j = 0; j < n; j++) cpuBp(cpuPerm[j]) = b(j);
+      cpuSolver->solveLU(cpuData.data(), cpuPivots.data(), cpuBp.data(), n, 1);
+      Eigen::VectorXf xCpu(n);
+      for (int64_t j = 0; j < n; j++) xCpu(j) = cpuBp(cpuPerm[j]);
+
       cpuResidual = computeResidualFloat(A, xCpu, b);
     } catch (const exception&) {
       // CPU float also fails (zero pivot) — skip this matrix
@@ -235,23 +187,29 @@ TEST(MetalSequenceSolve, RingOscillator) {
     }
 
     // Factor+solve on Metal GPU
-    fillDataFromCsr<float>(solverSkel, A, data);
+    loadFloatCsr(A, *solver, data);
 
     {
       MetalMirror<float> dataGpu(data);
-      solver.factorLU(dataGpu.ptr(), pivots.data());
+      solver->factorLU(dataGpu.ptr(), pivots.data());
       dataGpu.get(data);
     }
 
-    Eigen::VectorXf x = b;
+    // Permute RHS, solve on GPU, inverse permute
+    Eigen::VectorXf bp(n);
+    for (int64_t j = 0; j < n; j++) bp(perm[j]) = b(j);
+
     {
       MetalMirror<float> dataGpu(data);
-      MetalMirror<float> xGpu(vector<float>(x.data(), x.data() + n));
-      solver.solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+      MetalMirror<float> xGpu(vector<float>(bp.data(), bp.data() + n));
+      solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
       vector<float> xVec(n);
       xGpu.get(xVec);
-      for (int64_t j = 0; j < n; j++) x(j) = xVec[j];
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
     }
+
+    Eigen::VectorXf x(n);
+    for (int64_t j = 0; j < n; j++) x(j) = bp(perm[j]);
 
     float residual = computeResidualFloat(A, x, b);
 

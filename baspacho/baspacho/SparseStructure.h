@@ -47,11 +47,14 @@ struct SparseStructure {
   SparseStructure addIndependentEliminationFill(int64_t start, int64_t end,
                                                 bool sortIdx = true) const;
 
+  // Internal: used by EliminationTree during createSolver().
+  // Users should call createSolver() instead of using these directly.
   SparseStructure addFullEliminationFill() const;
 
-  // Fast elimination fill using CHOLMOD's symbolic Cholesky on A+A^T pattern.
+  // Internal: fast elimination fill using CHOLMOD's symbolic Cholesky on A+A^T pattern.
   // Uses reach-set algorithm with path compression: amortized O(nnz) vs
   // O(nnz * tree_path_length) for the basic algorithm above.
+  // Users should call createSolver() instead of using this directly.
   SparseStructure addFullEliminationFillCholmod() const;
 
   // return `perm`: `perm[i]` is old index that should move in `i`-th position

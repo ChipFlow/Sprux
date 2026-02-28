@@ -146,123 +146,54 @@ TEST(CudssBenchmark, BaSpaCho_LU) {
 
   int64_t n = A.nRows;
 
-  // Build BaSpaCho structure from CSR.
-  // For a scalar matrix, each row/col is its own span/lump (paramSize=1 for all).
-  // We need the sparsity structure as block columns.
-
-  // Build column sets from CSR (transpose gives CSC-like column access)
-  vector<set<int64_t>> colBlocks(n);
-  for (int64_t i = 0; i < n; i++) {
-    for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
-      int64_t j = A.colInd[k];
-      // BaSpaCho CSC structure: column j has row i
-      colBlocks[j].insert(i);
-    }
-  }
-
   nvtxRangePush("BaSpaCho_Analysis");
 
-  // Create SparseStructure (CSC format internally)
-  SparseStructure ss = columnsToCscStruct(colBlocks).transpose().addFullEliminationFill();
-
-  // Scalar blocks: each span/lump is size 1
-  vector<int64_t> paramSize(n, 1);
-  vector<int64_t> spanStart(n + 1);
-  iota(spanStart.begin(), spanStart.end(), 0);
-  vector<int64_t> lumpToSpan(n + 1);
-  iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
-
-  SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
-  CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
-  factorSkel.initUpperTriangle();
-
-  // Build dense-ish representation for filling block data.
-  // For scalar blocks, the factorSkel data is a flat array matching the sparse structure.
-  vector<double> data(factorSkel.totalDataSize(), 0.0);
-
-  // Fill from CSR values into BaSpaCho block storage
-  int64_t numLumps = factorSkel.numLumps();
-
-  // Build a lookup: (row, col) -> value from CSR
-  // For large matrices this is more efficient using the CSR directly
-  // We iterate the skeleton and look up values from the CSR structure
-  for (int64_t l = 0; l < numLumps; l++) {
-    int64_t chainStart = factorSkel.chainColPtr[l];
-    int64_t chainEnd = factorSkel.chainColPtr[l + 1];
-    int64_t lumpStartCol = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStartCol;
-
-    for (int64_t c = chainStart; c < chainEnd; c++) {
-      int64_t rowSpan = factorSkel.chainRowSpan[c];
-      int64_t rowStart = factorSkel.spanStart[rowSpan];
-      int64_t rowSize = factorSkel.spanStart[rowSpan + 1] - rowStart;
-      int64_t dataOffset = factorSkel.chainData[c];
-
-      for (int64_t r = 0; r < rowSize; r++) {
-        int64_t globalRow = rowStart + r;
-        for (int64_t col = 0; col < lumpSize; col++) {
-          int64_t globalCol = lumpStartCol + col;
-          // Look up (globalRow, globalCol) in CSR
-          for (int64_t k = A.rowPtr[globalRow]; k < A.rowPtr[globalRow + 1]; k++) {
-            if (A.colInd[k] == globalCol) {
-              data[dataOffset + r * lumpSize + col] = A.values[k];
-              break;
-            }
-          }
-        }
-      }
+  // Build CSR lower-triangle SparseStructure from CSR (ensure diagonal present)
+  vector<set<int64_t>> colBlocks(n);
+  for (int64_t i = 0; i < n; i++) {
+    colBlocks[i].insert(i);  // ensure diagonal is present
+    for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
+      int64_t j = A.colInd[k];
+      colBlocks[min(i, j)].insert(max(i, j));
     }
   }
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
 
-  // Fill upper triangle from CSR
-  if (!factorSkel.upperChainData.empty()) {
-    int64_t upperDataBase = factorSkel.dataSize();
-    for (int64_t l = 0; l < numLumps; l++) {
-      int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
-      int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
-      int64_t lumpStartRow = factorSkel.lumpStart[l];
-      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStartRow;
+  vector<int64_t> paramSizes(n, 1);
+  vector<int64_t> blockSizes(n, 1);
 
-      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
-        int64_t colSpan = factorSkel.upperChainColSpan[i];
-        int64_t colStart = factorSkel.spanStart[colSpan];
-        int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
-        int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+  Settings settings;
+  settings.backend = BackendCuda;
+  settings.matrixType = MTYPE_GENERAL;
+  auto solver = createSolver(settings, paramSizes, ss);
 
-        for (int64_t r = 0; r < lumpSize; r++) {
-          int64_t globalRow = lumpStartRow + r;
-          for (int64_t c = 0; c < colSize; c++) {
-            int64_t globalCol = colStart + c;
-            for (int64_t k = A.rowPtr[globalRow]; k < A.rowPtr[globalRow + 1]; k++) {
-              if (A.colInd[k] == globalCol) {
-                data[upperDataOffset + r * colSize + c] = A.values[k];
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  vector<double> data(solver->skel().totalDataSize(), 0.0);
+  solver->loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), A.values.data(),
+                      data.data());
 
-  Solver solver(std::move(factorSkel), {}, {}, cudaOps());
   nvtxRangePop();  // BaSpaCho_Analysis
 
   vector<int64_t> pivots(n);
+  const auto& perm = solver->paramToSpan();
 
   nvtxRangePush("BaSpaCho_Factor");
   auto factorStart = hrc::now();
-  solver.factorLU(data.data(), pivots.data());
+  solver->factorLU(data.data(), pivots.data());
   double factorMs = tdelta(hrc::now() - factorStart).count() * 1000;
   nvtxRangePop();
 
-  Vector<double> x = b;
+  // Permute RHS, solve, inverse permute
+  Vector<double> bp(n);
+  for (int64_t i = 0; i < n; i++) bp(perm[i]) = b(i);
 
   nvtxRangePush("BaSpaCho_Solve");
   auto solveStart = hrc::now();
-  solver.solveLU(data.data(), pivots.data(), x.data(), n, 1);
+  solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
   double solveMs = tdelta(hrc::now() - solveStart).count() * 1000;
   nvtxRangePop();
+
+  Vector<double> x(n);
+  for (int64_t i = 0; i < n; i++) x(i) = bp(perm[i]);
 
   double residual = computeResidual(A, x, b);
 

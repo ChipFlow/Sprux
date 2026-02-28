@@ -1330,6 +1330,10 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
     SparseStructure ssT = ss.transpose();  // to csc
     CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, ssT.ptrs, ssT.inds);
 
+    if (settings.matrixType == MTYPE_GENERAL) {
+      factorSkel.initUpperTriangle();
+    }
+
     std::vector<int64_t> sparseElimRangesCopy = sparseElimRanges;
     return SolverPtr(new Solver(std::move(factorSkel), std::move(sparseElimRangesCopy),
                                 std::move(permutation), getBackend(settings),
@@ -1436,6 +1440,10 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
 
   CoalescedBlockMatrixSkel factorSkel(fullSpanStart, fullLumpToSpan, fullColStart, fullRowParam);
 
+  if (settings.matrixType == MTYPE_GENERAL) {
+    factorSkel.initUpperTriangle();
+  }
+
   // include (additional) progressive Schur elimination sets, shifted
   std::vector<int64_t> fullSparseElimRanges = sparseElimRanges;
   if (!et.sparseElimRanges.empty()) {
@@ -1461,6 +1469,8 @@ void Solver::loadFromCsr(const int64_t* csrRowStart, const int64_t* csrColInds,
   // Get the accessor for mapping block positions
   // The accessor takes original (unpermuted) indices and handles permutation internally
   auto acc = accessor();
+  bool isGeneral = factorSkel.matrixType == MTYPE_GENERAL;
+  int64_t upperDataBase = isGeneral ? factorSkel.dataSize() : 0;
 
   int64_t numBlocks = permutation.size();
   int64_t valOffset = 0;  // Current offset in csrValues
@@ -1477,15 +1487,47 @@ void Solver::loadFromCsr(const int64_t* csrRowStart, const int64_t* csrColInds,
       // Get internal block position - accessor handles permutation and returns flip flag
       auto [offset, stride, flipped] = acc.blockOffset(origRow, origCol);
 
-      // Copy values from CSR to internal format
-      // CSR is row-major within blocks
-      // When flipped, the block is stored transposed internally
-      for (int64_t r = 0; r < rowSize; r++) {
-        for (int64_t c = 0; c < colSize; c++) {
-          if (flipped) {
-            // Block is transposed in internal storage
+      if (isGeneral && flipped) {
+        // Upper triangle entry for general matrices (permRow < permCol after permutation).
+        int64_t permRow = permutation[origRow];
+        int64_t permCol = permutation[origCol];
+        int64_t rowLump = acc.plainAcc.spanToLump[permRow];
+        int64_t colLump = acc.plainAcc.spanToLump[permCol];
+
+        if (rowLump == colLump) {
+          // Intra-lump: both spans in same lump, store in diagonal block directly.
+          // The diagonal block is a full NxN matrix (lumpSize x lumpSize).
+          int64_t lumpSize = acc.plainAcc.lumpStart[rowLump + 1] - acc.plainAcc.lumpStart[rowLump];
+          int64_t diagStart = acc.plainAcc.chainData[acc.plainAcc.chainColPtr[rowLump]];
+          int64_t rowOff = acc.plainAcc.spanOffsetInLump[permRow];
+          int64_t colOff = acc.plainAcc.spanOffsetInLump[permCol];
+          int64_t baseOffset = diagStart + rowOff * lumpSize + colOff;
+          for (int64_t r = 0; r < rowSize; r++) {
+            for (int64_t c = 0; c < colSize; c++) {
+              data[baseOffset + r * lumpSize + c] = csrValues[valOffset + r * colSize + c];
+            }
+          }
+        } else {
+          // Inter-lump: use separate upper triangle storage via upperBlockOffset.
+          auto [upperOff, upperStride] = acc.plainAcc.upperBlockOffset(permRow, permCol);
+          int64_t absOffset = upperDataBase + upperOff;
+          for (int64_t r = 0; r < rowSize; r++) {
+            for (int64_t c = 0; c < colSize; c++) {
+              data[absOffset + r * upperStride + c] = csrValues[valOffset + r * colSize + c];
+            }
+          }
+        }
+      } else if (flipped) {
+        // Symmetric: transpose into lower triangle (existing behavior)
+        for (int64_t r = 0; r < rowSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
             data[offset + c * stride + r] = csrValues[valOffset + r * colSize + c];
-          } else {
+          }
+        }
+      } else {
+        // Lower/diagonal (existing behavior)
+        for (int64_t r = 0; r < rowSize; r++) {
+          for (int64_t c = 0; c < colSize; c++) {
             data[offset + r * stride + c] = csrValues[valOffset + r * colSize + c];
           }
         }

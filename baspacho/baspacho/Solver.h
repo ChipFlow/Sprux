@@ -378,11 +378,16 @@ struct Settings {
   const ComputationModel* computationModel = nullptr;
   double supernodeMergeFillTolerance = 0.0;  // max extra-zero fraction: 0.0 = exact only, 0.25 = 25%
   int64_t maxSupernodeSize = 0;              // 0 = merging disabled, 256 = typical max size
+  MatrixType matrixType = MTYPE_SPD;         // MTYPE_SPD for Cholesky, MTYPE_GENERAL for LU
 };
 
 /**
- * @brief Create a Solver object, performing symbolic analysis, reordering and creating solver
- * with a factor where proper fill has been added to allow full or partial factorization.
+ * @brief Primary entry point for creating a solver. Performs symbolic analysis
+ * (fill-reducing reordering, elimination tree, supernode merging) and creates
+ * the solver with proper fill structure.
+ *
+ * Supports both SPD (Cholesky) and general (LU) matrices via settings.matrixType.
+ * For general matrices, automatically initializes upper triangle storage.
  *
  * @param settings settings as explained above
  * @param paramSizes vector with size of the n-th parameter block
