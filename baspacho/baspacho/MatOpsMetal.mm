@@ -288,41 +288,63 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  // Commit the pending command buffer and wait for GPU completion.
-  // Ends the persistent encoder first, then commits.
-  // No-op if no dispatches are pending.
-  void commitAndWait() {
-    flushPendingGemms();
+  // Commit the pending command buffer WITHOUT waiting for GPU completion.
+  // Metal command queue ordering guarantees that command buffers execute in
+  // submission order, so subsequent work on the same queue will see the results.
+  // Tracks the last committed buffer so waitForGpu() can wait on it later.
+  void commitPending() {
     if (pendingCmdBuf_) {
       if (pendingEncoder_) {
         [pendingEncoder_ endEncoding];
         pendingEncoder_ = nil;
       }
       [pendingCmdBuf_ commit];
-      [pendingCmdBuf_ waitUntilCompleted];
+      lastCommittedCmdBuf_ = pendingCmdBuf_;
       pendingCmdBuf_ = nil;
       pendingDispatchCount_ = 0;
     }
   }
 
+  // Wait for the most recently committed command buffer to complete.
+  // Since command buffers execute in submission order on the same queue,
+  // waiting for the last one implicitly waits for all prior work.
+  void waitForGpu() {
+    if (lastCommittedCmdBuf_) {
+      [lastCommittedCmdBuf_ waitUntilCompleted];
+      lastCommittedCmdBuf_ = nil;
+    }
+    checkDeferredPotrfStatus();
+  }
+
+  // Check deferred potrf status after GPU work has completed.
+  void checkDeferredPotrfStatus() {
+    if (potrfStatusPending_ && potrfStatusBuf_) {
+      auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>([potrfStatusBuf_ contents]);
+      if (status != MPSMatrixDecompositionStatusSuccess) {
+        fprintf(stderr, "Metal potrf: MPS Cholesky failed (status=%d)\n", (int)status);
+      }
+      potrfStatusPending_ = false;
+    }
+  }
+
+  // Commit the pending command buffer and wait for all GPU work to complete.
+  // This is needed when the CPU must access data that the GPU may have written
+  // (e.g., before CPU fallback paths or memcpy to shared buffers).
+  void commitAndWait() {
+    flushPendingGemms();
+    commitPending();
+    waitForGpu();
+  }
+
   // Flush buffered saveGemm work items as a single batched kernel dispatch.
-  // Must commit any pending command buffer first so the GPU finishes reading
-  // from devGemmWorkBuf_ before we overwrite it.
+  // Must wait for GPU to finish reading devGemmWorkBuf_ before overwriting it.
   void flushPendingGemms() {
     if (pendingGemms_.empty()) return;
 
-    // Commit pending work that may be reading from devGemmWorkBuf_
+    // Wait for GPU to finish reading from devGemmWorkBuf_ before overwriting
     if (gemmWorkBufInFlight_) {
-      if (pendingCmdBuf_) {
-        if (pendingEncoder_) {
-          [pendingEncoder_ endEncoding];
-          pendingEncoder_ = nil;
-        }
-        [pendingCmdBuf_ commit];
-        [pendingCmdBuf_ waitUntilCompleted];
-        pendingCmdBuf_ = nil;
-        pendingDispatchCount_ = 0;
-      }
+      commitPending();
+      waitForGpu();
       gemmWorkBufInFlight_ = false;
     }
 
@@ -516,6 +538,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       // Flush pending work, end compute encoder (MPS needs its own encoding)
       flushPendingGemms();
+      // If a previous potrf status hasn't been checked yet, wait and check now
+      // before reusing the status buffer.
+      if (potrfStatusPending_) {
+        commitPending();
+        waitForGpu();  // calls checkDeferredPotrfStatus()
+      }
       if (pendingEncoder_) {
         [pendingEncoder_ endEncoding];
         pendingEncoder_ = nil;
@@ -552,18 +580,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       [mpsChol encodeToCommandBuffer:pendingCmdBuf_
           sourceMatrix:mpsA resultMatrix:mpsA status:potrfStatusBuf_];
 
-      // Commit+wait — data is CPU-coherent (shared memory on Apple Silicon)
-      [pendingCmdBuf_ commit];
-      [pendingCmdBuf_ waitUntilCompleted];
-      pendingCmdBuf_ = nil;
-      pendingDispatchCount_ = 0;
-
-      // Check decomposition status (matches CPU path's fprintf)
-      auto status = *reinterpret_cast<MPSMatrixDecompositionStatus*>([potrfStatusBuf_ contents]);
-      if (status != MPSMatrixDecompositionStatusSuccess) {
-        fprintf(stderr, "Metal potrf: MPS Cholesky failed (status=%d, n=%lld)\n",
-                (int)status, (long long)n);
-      }
+      // Don't commit+wait here — leave pendingCmdBuf_ open so trsm() can be
+      // encoded into the same command buffer (saving one GPU sync round-trip).
+      // The status check is deferred to the next waitForGpu() call.
+      potrfStatusPending_ = true;
     }
   }
 
@@ -636,11 +656,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
          rightHandSideMatrix:mpsB
               solutionMatrix:mpsB];
 
-      // Commit+wait — data is CPU-coherent (shared memory on Apple Silicon)
-      [pendingCmdBuf_ commit];
-      [pendingCmdBuf_ waitUntilCompleted];
-      pendingCmdBuf_ = nil;
-      pendingDispatchCount_ = 0;
+      // Submit potrf+trsm together without waiting. GPU executes asynchronously;
+      // the next lump's prepareAssemble() will sync before CPU-visible writes.
+      commitPending();
     }
   }
 
@@ -649,8 +667,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      // Flush pending assemble work before overwriting tempBuffer
-      commitAndWait();
+      // Submit pending assemble work (which reads tempBuffer) without waiting.
+      // Metal command queue ordering ensures it completes before the GEMM below.
+      commitPending();
 
       // Ensure temp buffer is large enough
       tempBuffer.resizeToAtLeast(m * n);
@@ -721,12 +740,18 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                                                       alpha:1.0
                                                        beta:0.0];
 
-        id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
-        [gemm encodeToCommandBuffer:cmdBuf leftMatrix:mpsB rightMatrix:mpsA resultMatrix:mpsC];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Encode MPS GEMM into pendingCmdBuf_ — don't commit yet.
+        // The subsequent assemble() will encode into the same command buffer,
+        // and Metal guarantees sequential execution within a command buffer.
+        if (!pendingCmdBuf_) {
+          pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+        }
+        [gemm encodeToCommandBuffer:pendingCmdBuf_ leftMatrix:mpsB rightMatrix:mpsA
+                       resultMatrix:mpsC];
       } else {
-        // Use Eigen for small matrices (lower overhead)
+        // CPU fallback — need GPU to finish before CPU accesses shared memory
+        waitForGpu();
+
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
         const float* AB = data + offset;
@@ -918,11 +943,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           sourceMatrix:mpsA resultMatrix:mpsA
           pivotIndices:mpsPiv status:nil];
 
-      // Commit and wait — data is now CPU-coherent (shared memory)
-      [pendingCmdBuf_ commit];
-      [pendingCmdBuf_ waitUntilCompleted];
-      pendingCmdBuf_ = nil;
-      pendingDispatchCount_ = 0;
+      // Commit and wait — need CPU-visible data for pivot conversion below
+      commitPending();
+      waitForGpu();
 
       // Convert MPS uint32_t pivots → int64_t (MPS is 0-based, same as BaSpaCho)
       uint32_t* mpsPivots = devPivotBuf32.ptr();
@@ -1193,6 +1216,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   id<MTLCommandBuffer> pendingCmdBuf_ = nil;
   id<MTLComputeCommandEncoder> pendingEncoder_ = nil;
   int pendingDispatchCount_ = 0;
+  id<MTLCommandBuffer> lastCommittedCmdBuf_ = nil;  // For deferred GPU sync
+  bool potrfStatusPending_ = false;                 // Deferred potrf status check
 };
 
 // Solve context for float - Metal implementation

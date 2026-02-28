@@ -84,6 +84,7 @@ TEST(MetalKernel, Potrf) {
   {
     MetalMirror<float> dataGpu(dataMetal);
     metalCtx->potrf(n, dataGpu.ptr(), 0);
+    metalCtx->flush();  // Sync GPU before reading back (MPS potrf uses deferred commit)
     dataGpu.get(dataMetal);
   }
 
@@ -119,6 +120,7 @@ TEST(MetalKernel, Trsm) {
     MetalMirror<float> dataGpu(dataMetal);
     metalCtx->potrf(n0, dataGpu.ptr(), skel.chainData[0]);
     metalCtx->trsm(n0, n1, dataGpu.ptr(), skel.chainData[0], skel.chainData[1]);
+    metalCtx->flush();  // Sync GPU before reading back (MPS ops use deferred commit)
     dataGpu.get(dataMetal);
   }
 
@@ -527,6 +529,7 @@ TEST_P(MetalPotrfSizeTest, PotrfVsCpuReference) {
   {
     MetalMirror<float> dataGpu(dataMetal);
     metalCtx->potrf(n, dataGpu.ptr(), 0);
+    metalCtx->flush();  // Sync GPU before reading back (MPS potrf uses deferred commit)
     dataGpu.get(dataMetal);
   }
 
@@ -573,6 +576,7 @@ TEST_P(MetalTrsmSizeTest, TrsmVsCpuReference) {
     MetalMirror<float> dataGpu(dataMetal);
     metalCtx->potrf(n, dataGpu.ptr(), skel.chainData[0]);
     metalCtx->trsm(n, k, dataGpu.ptr(), skel.chainData[0], skel.chainData[1]);
+    metalCtx->flush();  // Sync GPU before reading back (MPS ops use deferred commit)
     dataGpu.get(dataMetal);
   }
 
