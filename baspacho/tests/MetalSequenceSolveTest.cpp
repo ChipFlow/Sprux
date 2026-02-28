@@ -13,6 +13,7 @@
 #include <Eigen/Dense>
 #include <Eigen/LU>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -110,6 +111,8 @@ TEST(MetalSequenceSolve, RingOscillator) {
 
   int64_t n = A0.nRows;
 
+  using Clock = chrono::high_resolution_clock;
+
   // Build solver once via CHOLMOD-based symbolic analysis
   SparseStructure ss = csrToSparseStructure(A0);
   vector<int64_t> paramSizes(n, 1);
@@ -119,7 +122,13 @@ TEST(MetalSequenceSolve, RingOscillator) {
   Settings metalSettings;
   metalSettings.backend = BackendMetal;
   metalSettings.matrixType = MTYPE_GENERAL;
+
+  auto t0 = Clock::now();
   auto solver = createSolver(metalSettings, paramSizes, ss);
+  double analysisTime = chrono::duration<double>(Clock::now() - t0).count();
+
+  cout << "=== Metal Ring Oscillator Timing ===" << endl;
+  cout << "  Symbolic analysis: " << fixed << setprecision(4) << analysisTime << "s" << endl;
 
   // CPU float solver for reference comparison (same fill-in structure)
   Settings cpuSettings;
@@ -144,6 +153,8 @@ TEST(MetalSequenceSolve, RingOscillator) {
   vector<int64_t> cpuPivots(n);
   int passed = 0;
   int skipped = 0;
+  double totalFactorTime = 0;
+  double totalSolveTime = 0;
 
   for (size_t i = 0; i < files.size(); i++) {
     CsrMatrix A = readMatrixMarket(files[i].first);
@@ -189,9 +200,12 @@ TEST(MetalSequenceSolve, RingOscillator) {
     // Factor+solve on Metal GPU
     loadFloatCsr(A, *solver, data);
 
+    double factorTime, solveTime;
     {
       MetalMirror<float> dataGpu(data);
+      auto tFactor = Clock::now();
       solver->factorLU(dataGpu.ptr(), pivots.data());
+      factorTime = chrono::duration<double>(Clock::now() - tFactor).count();
       dataGpu.get(data);
     }
 
@@ -202,7 +216,9 @@ TEST(MetalSequenceSolve, RingOscillator) {
     {
       MetalMirror<float> dataGpu(data);
       MetalMirror<float> xGpu(vector<float>(bp.data(), bp.data() + n));
+      auto tSolve = Clock::now();
       solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+      solveTime = chrono::duration<double>(Clock::now() - tSolve).count();
       vector<float> xVec(n);
       xGpu.get(xVec);
       for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
@@ -217,9 +233,20 @@ TEST(MetalSequenceSolve, RingOscillator) {
     float threshold = max(cpuResidual * 100.0f, 1e-4f);
     EXPECT_LT(residual, threshold) << "Matrix #" << i << " Metal residual too large: " << residual
                                    << " (CPU: " << cpuResidual << ")";
+
+    cout << "  Matrix #" << i << ": factor=" << fixed << setprecision(4) << factorTime
+         << "s, solve=" << solveTime << "s, residual=" << scientific << setprecision(2) << residual
+         << " (CPU: " << cpuResidual << ")" << endl;
+
+    totalFactorTime += factorTime;
+    totalSolveTime += solveTime;
     passed++;
   }
 
-  cout << "Passed: " << passed << ", Skipped (zero RHS): " << skipped << endl;
+  if (passed > 0) {
+    cout << "  Average: factor=" << fixed << setprecision(4) << totalFactorTime / passed
+         << "s, solve=" << totalSolveTime / passed << "s" << endl;
+  }
+  cout << "Passed: " << passed << ", Skipped: " << skipped << endl;
   ASSERT_GT(passed, 0) << "No matrices were actually tested";
 }

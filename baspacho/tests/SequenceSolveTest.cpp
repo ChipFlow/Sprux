@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <Eigen/Dense>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -112,6 +113,8 @@ TEST(SequenceSolve, RingOscillator) {
 
   int64_t n = A0.nRows;
 
+  using Clock = chrono::high_resolution_clock;
+
   // Build solver once via CHOLMOD-based symbolic analysis
   SparseStructure ss = csrToSparseStructure(A0);
   vector<int64_t> paramSizes(n, 1);
@@ -120,13 +123,21 @@ TEST(SequenceSolve, RingOscillator) {
   Settings settings;
   settings.backend = BackendFast;
   settings.matrixType = MTYPE_GENERAL;
+
+  auto t0 = Clock::now();
   auto solver = createSolver(settings, paramSizes, ss);
+  double analysisTime = chrono::duration<double>(Clock::now() - t0).count();
+
+  cout << "=== Ring Oscillator Timing ===" << endl;
+  cout << "  Symbolic analysis: " << fixed << setprecision(4) << analysisTime << "s" << endl;
 
   vector<double> data(solver->skel().totalDataSize());
   vector<int64_t> pivots(n);
   const auto& perm = solver->paramToSpan();
   int passed = 0;
   int skipped = 0;
+  double totalFactorTime = 0;
+  double totalSolveTime = 0;
 
   for (size_t i = 0; i < files.size(); i++) {
     CsrMatrix A = readMatrixMarket(files[i].first);
@@ -146,13 +157,18 @@ TEST(SequenceSolve, RingOscillator) {
     fill(data.begin(), data.end(), 0.0);
     solver->loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), A.values.data(),
                         data.data());
+
+    auto tFactor = Clock::now();
     solver->factorLU(data.data(), pivots.data());
+    double factorTime = chrono::duration<double>(Clock::now() - tFactor).count();
 
     // Permute RHS: bp[perm[i]] = b[i]
     Eigen::VectorXd bp(n);
     for (int64_t j = 0; j < n; j++) bp(perm[j]) = b(j);
 
+    auto tSolve = Clock::now();
     solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
+    double solveTime = chrono::duration<double>(Clock::now() - tSolve).count();
 
     // Inverse permute solution: x[i] = bp[perm[i]]
     Eigen::VectorXd x(n);
@@ -161,9 +177,20 @@ TEST(SequenceSolve, RingOscillator) {
     // Check residual
     double residual = computeResidual(A, x, b);
     EXPECT_LT(residual, 1e-6) << "Matrix #" << i << " residual too large: " << residual;
+
+    cout << "  Matrix #" << i << ": factor=" << fixed << setprecision(4) << factorTime
+         << "s, solve=" << solveTime << "s, residual=" << scientific << setprecision(2) << residual
+         << endl;
+
+    totalFactorTime += factorTime;
+    totalSolveTime += solveTime;
     passed++;
   }
 
+  if (passed > 0) {
+    cout << "  Average: factor=" << fixed << setprecision(4) << totalFactorTime / passed
+         << "s, solve=" << totalSolveTime / passed << "s" << endl;
+  }
   cout << "Passed: " << passed << ", Skipped (zero RHS): " << skipped << endl;
   ASSERT_GT(passed, 0) << "No matrices were actually tested";
 }
@@ -201,6 +228,8 @@ TEST(SequenceSolve, C6288) {
 
   int64_t n = A0.nRows;
 
+  using Clock = chrono::high_resolution_clock;
+
   // Build solver once via CHOLMOD-based symbolic analysis
   SparseStructure ss = csrToSparseStructure(A0);
   vector<int64_t> paramSizes(n, 1);
@@ -209,8 +238,13 @@ TEST(SequenceSolve, C6288) {
   Settings settings;
   settings.backend = BackendFast;
   settings.matrixType = MTYPE_GENERAL;
-  auto solver = createSolver(settings, paramSizes, ss);
 
+  auto t0 = Clock::now();
+  auto solver = createSolver(settings, paramSizes, ss);
+  double analysisTime = chrono::duration<double>(Clock::now() - t0).count();
+
+  cout << "=== C6288 Timing ===" << endl;
+  cout << "  Symbolic analysis: " << fixed << setprecision(4) << analysisTime << "s" << endl;
   cout << "  Solver: " << solver->skel().numLumps() << " lumps, " << solver->skel().numSpans()
        << " spans, dataSize=" << solver->totalDataSize() << endl;
 
@@ -220,6 +254,8 @@ TEST(SequenceSolve, C6288) {
   int passed = 0;
   int skipped = 0;
   int zeroPivot = 0;
+  double totalFactorTime = 0;
+  double totalSolveTime = 0;
 
   for (size_t idx : testIndices) {
     CsrMatrix A = readMatrixMarket(files[idx].first);
@@ -240,8 +276,11 @@ TEST(SequenceSolve, C6288) {
     solver->loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), A.values.data(),
                         data.data());
 
+    double factorTime = 0;
     try {
+      auto tFactor = Clock::now();
       solver->factorLU(data.data(), pivots.data());
+      factorTime = chrono::duration<double>(Clock::now() - tFactor).count();
     } catch (const exception& e) {
       // Zero pivot due to fill-reducing reordering — known limitation
       cout << "  Matrix #" << idx << ": " << e.what() << " (skipped)" << endl;
@@ -253,7 +292,9 @@ TEST(SequenceSolve, C6288) {
     Eigen::VectorXd bp(n);
     for (int64_t j = 0; j < n; j++) bp(perm[j]) = b(j);
 
+    auto tSolve = Clock::now();
     solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
+    double solveTime = chrono::duration<double>(Clock::now() - tSolve).count();
 
     // Inverse permute solution: x[i] = bp[perm[i]]
     Eigen::VectorXd x(n);
@@ -263,12 +304,19 @@ TEST(SequenceSolve, C6288) {
     double residual = computeResidual(A, x, b);
     EXPECT_LT(residual, 1e-6) << "Matrix #" << idx << " residual too large: " << residual;
 
-    cout << "  Matrix #" << idx << ": residual=" << scientific << setprecision(4) << residual
+    cout << "  Matrix #" << idx << ": factor=" << fixed << setprecision(4) << factorTime
+         << "s, solve=" << solveTime << "s, residual=" << scientific << setprecision(2) << residual
          << endl;
 
+    totalFactorTime += factorTime;
+    totalSolveTime += solveTime;
     passed++;
   }
 
+  if (passed > 0) {
+    cout << "  Average: factor=" << fixed << setprecision(4) << totalFactorTime / passed
+         << "s, solve=" << totalSolveTime / passed << "s" << endl;
+  }
   cout << "Passed: " << passed << ", Skipped (zero RHS): " << skipped
        << ", Zero pivot: " << zeroPivot << endl;
   // Verify at least one matrix was tested, or all were skipped for known reasons
