@@ -38,7 +38,7 @@ class Solver {
   // constructor, from RAW factor skeleton (do not call directly, use createSolver)
   Solver(CoalescedBlockMatrixSkel&& factorSkel, std::vector<int64_t>&& sparseElimRanges,
          std::vector<int64_t>&& permutation, OpsPtr&& ops, int64_t canFactorUpTo = -1,
-         LevelSetSchedule&& levelSetSchedule = {});
+         LevelSetSchedule&& levelSetSchedule = {}, double staticPivotThreshold = -1.0);
 
   // return a (permuted) accessor to access factor's block (re-ordering is auto-applied)
   PermutedCoalescedAccessor accessor() const {
@@ -205,6 +205,9 @@ class Solver {
   // return the level-set schedule for parallel factorization
   const LevelSetSchedule& levelSetSchedule() const { return levelSetSchedule_; }
 
+  // return the count of diagonal elements perturbed during the last factorLU call
+  int64_t staticPivotPerturbCount() const { return staticPivotPerturbCount_; }
+
   // TESTING: return
   SymbolicCtx& internalSymbolicContext() { return *symCtx; }
 
@@ -316,6 +319,9 @@ class Solver {
   std::vector<int64_t> permutation;  // *on indices*: v'[p[i]] = v[i];
   int64_t canFactorUpTo;
   LevelSetSchedule levelSetSchedule_;
+  double staticPivotThreshold_;
+  mutable int64_t staticPivotPerturbCount_ = 0;
+  mutable double effectiveStaticPivotThreshold_ = 0.0;
 
   OpsPtr ops;
   SymbolicCtxPtr symCtx;
@@ -379,6 +385,7 @@ struct Settings {
   double supernodeMergeFillTolerance = 0.0;  // max extra-zero fraction: 0.0 = exact only, 0.25 = 25%
   int64_t maxSupernodeSize = 0;              // 0 = merging disabled, 256 = typical max size
   MatrixType matrixType = MTYPE_SPD;         // MTYPE_SPD for Cholesky, MTYPE_GENERAL for LU
+  double staticPivotThreshold = -1.0;  // <0 disabled, 0 = auto (sqrt(eps)), >0 = manual
 };
 
 /**

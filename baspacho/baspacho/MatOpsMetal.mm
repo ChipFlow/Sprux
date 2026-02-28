@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <typeindex>
@@ -865,6 +866,21 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           },
           (NSUInteger)numThreads);
     }
+  }
+
+  // Static pivoting: scan and perturb small diagonals on CPU.
+  // Metal uses shared memory, so GPU data is directly CPU-accessible after waitForGpu().
+  virtual int64_t perturbSmallDiagonals(int64_t n, float* data, int64_t offset, int64_t stride,
+                                        float threshold) override {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; i++) {
+      float& diag = data[offset + i * stride + i];
+      if (!std::isfinite(diag) || std::abs(diag) < threshold) {
+        diag = (diag >= 0.0f) ? threshold : -threshold;
+        count++;
+      }
+    }
+    return count;
   }
 
   // ============ LU factorization methods ============

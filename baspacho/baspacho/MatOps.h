@@ -216,6 +216,18 @@ struct NumericCtx : NumericCtxBase {
     throw std::runtime_error("applyRowPerm: LU not supported by this backend");
   }
 
+  // Scan diagonal of row-major n×n matrix at data+offset with given stride,
+  // perturb elements with |value| < threshold. Returns count of perturbed elements.
+  virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
+                                        T threshold) {
+    (void)n;
+    (void)data;
+    (void)offset;
+    (void)stride;
+    (void)threshold;
+    throw std::runtime_error("perturbSmallDiagonals not supported by this backend");
+  }
+
   // ============ LDL^T factorization methods ============
   // For symmetric indefinite matrices: A = L * D * L^T
   // L is unit lower triangular (stored below diagonal), D is diagonal (stored on diagonal)

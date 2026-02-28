@@ -454,3 +454,145 @@ TEST(LUFactor, DISABLED_DebugBlockSparse) {
 TEST(LUFactor, BlockSparse_Blas_float) {
   testLUFactorBlockSparse<float>([] { return fastOps(); });
 }
+
+// Helper: build CSR row pointers and column indices for a dense n×n matrix
+static void buildDenseCsr(int64_t n, vector<int64_t>& rowPtr, vector<int64_t>& colInd) {
+  rowPtr.resize(n + 1);
+  colInd.resize(n * n);
+  for (int64_t i = 0; i < n; i++) {
+    rowPtr[i] = i * n;
+    for (int64_t j = 0; j < n; j++) {
+      colInd[i * n + j] = j;
+    }
+  }
+  rowPtr[n] = n * n;
+}
+
+// Test static pivoting: factor a singular matrix via createSolver
+template <typename T>
+void testStaticPivoting() {
+  // Create a 4x4 singular matrix where row 1 = 2*row 0.
+  // After Schur complement elimination, one pivot will be zero.
+  // With static pivoting enabled, factorization should complete.
+  int64_t n = 4;
+
+  // Build lower-triangle CSR structure for createSolver
+  vector<set<int64_t>> colBlocks;
+  for (int64_t i = 0; i < n; i++) {
+    set<int64_t> block;
+    for (int64_t j = i; j < n; j++) block.insert(j);
+    colBlocks.push_back(block);
+  }
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  vector<int64_t> paramSizes(n, 1);
+
+  // Create solver WITH static pivoting enabled (auto threshold)
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.matrixType = MTYPE_GENERAL;
+  settings.staticPivotThreshold = 0.0;  // auto = sqrt(epsilon)
+  auto solver = createSolver(settings, paramSizes, ss);
+
+  // Singular matrix: row 1 = 2 * row 0
+  Matrix<T> A(n, n);
+  A << 1, 2, 3, 4,  //
+      2, 4, 6, 8,   //
+      1, 1, 1, 1,   //
+      1, 3, 2, 5;
+
+  // Build full CSR and load via loadFromCsr
+  vector<int64_t> rowPtr, colInd;
+  buildDenseCsr(n, rowPtr, colInd);
+  vector<int64_t> blockSizes(n, 1);
+
+  // Extract CSR values in row-major order (Eigen stores col-major by default)
+  vector<T> csrValues(n * n);
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t j = 0; j < n; j++) {
+      csrValues[i * n + j] = A(i, j);
+    }
+  }
+
+  vector<T> data(solver->skel().totalDataSize(), T(0));
+  solver->loadFromCsr(rowPtr.data(), colInd.data(), blockSizes.data(), csrValues.data(),
+                      data.data());
+
+  vector<int64_t> pivots(n);
+
+  // Without static pivoting, this would throw "getrf failed with info = ..."
+  // With static pivoting, it should succeed
+  ASSERT_NO_THROW(solver->factorLU(data.data(), pivots.data()));
+  ASSERT_GT(solver->staticPivotPerturbCount(), 0)
+      << "Expected at least one diagonal perturbation";
+
+  cout << "Static pivoting perturbed " << solver->staticPivotPerturbCount() << " diagonal(s)"
+       << endl;
+
+  // Solve A*x = b; solution won't be exact due to perturbation, but should be finite
+  Vector<T> b(n);
+  b << 1, 2, 3, 4;
+
+  const auto& perm = solver->paramToSpan();
+  Vector<T> bp(n);
+  for (int64_t j = 0; j < n; j++) bp(perm[j]) = b(j);
+
+  solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
+
+  // Inverse permute
+  Vector<T> x(n);
+  for (int64_t j = 0; j < n; j++) x(j) = bp(perm[j]);
+
+  // Solution should be finite (no NaN/Inf)
+  for (int64_t j = 0; j < n; j++) {
+    EXPECT_TRUE(std::isfinite(x(j))) << "Solution element " << j << " is not finite: " << x(j);
+  }
+}
+
+TEST(LUFactor, StaticPivoting_double) { testStaticPivoting<double>(); }
+
+TEST(LUFactor, StaticPivoting_float) { testStaticPivoting<float>(); }
+
+// Test that static pivoting is disabled by default (negative threshold)
+TEST(LUFactor, StaticPivotingDisabledByDefault) {
+  int64_t n = 4;
+  vector<set<int64_t>> colBlocks;
+  for (int64_t i = 0; i < n; i++) {
+    set<int64_t> block;
+    for (int64_t j = i; j < n; j++) block.insert(j);
+    colBlocks.push_back(block);
+  }
+  SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+  vector<int64_t> paramSizes(n, 1);
+
+  // Default settings: staticPivotThreshold = -1.0 (disabled)
+  Settings settings;
+  settings.backend = BackendFast;
+  settings.matrixType = MTYPE_GENERAL;
+  auto solver = createSolver(settings, paramSizes, ss);
+
+  // Singular matrix: row 1 = 2 * row 0
+  Matrix<double> A(n, n);
+  A << 1, 2, 3, 4,  //
+      2, 4, 6, 8,   //
+      1, 1, 1, 1,   //
+      1, 3, 2, 5;
+
+  vector<int64_t> rowPtr, colInd;
+  buildDenseCsr(n, rowPtr, colInd);
+  vector<int64_t> blockSizes(n, 1);
+  vector<double> csrValues(n * n);
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t j = 0; j < n; j++) {
+      csrValues[i * n + j] = A(i, j);
+    }
+  }
+
+  vector<double> data(solver->skel().totalDataSize(), 0.0);
+  solver->loadFromCsr(rowPtr.data(), colInd.data(), blockSizes.data(), csrValues.data(),
+                      data.data());
+
+  vector<int64_t> pivots(n);
+
+  // Should throw since static pivoting is disabled
+  EXPECT_THROW(solver->factorLU(data.data(), pivots.data()), std::runtime_error);
+}

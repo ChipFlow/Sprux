@@ -396,6 +396,22 @@ __global__ void transposeSquareInPlaceKernel(T* mat, int64_t n) {
   mat[j * n + i] = tmp;
 }
 
+// Perturb small diagonal elements in a row-major n×n matrix on GPU.
+// One thread per diagonal element. Atomically increments *count for each perturbation.
+template <typename T>
+__global__ void perturbSmallDiagonalsKernel(int64_t n, T* data, int64_t offset, int64_t stride,
+                                            T threshold, int64_t* count) {
+  int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+
+  T& diag = data[offset + i * stride + i];
+  T absVal = (diag >= T(0)) ? diag : -diag;
+  if (isnan(diag) || isinf(diag) || absVal < threshold) {
+    diag = (diag >= T(0) && !isnan(diag)) ? threshold : -threshold;
+    atomicAdd(reinterpret_cast<unsigned long long*>(count), 1ULL);
+  }
+}
+
 // Apply row permutation to matrix columns on GPU
 // Sequential swaps (data dependency), parallel across columns within one block.
 // IMPORTANT: Must launch with exactly 1 block since __syncthreads only syncs within a block.
@@ -575,6 +591,20 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
                              int64_t numCols) override;
 
+  virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
+                                        T threshold) override {
+    if (n <= 0) return 0;
+    devPerturbCount.resizeToAtLeast(1);
+    cuCHECK(cudaMemset(devPerturbCount.ptr, 0, sizeof(int64_t)));
+    int wgs = 256;
+    int numGroups = (n + wgs - 1) / wgs;
+    perturbSmallDiagonalsKernel<<<numGroups, wgs>>>(n, data, offset, stride, threshold,
+                                                    devPerturbCount.ptr);
+    int64_t count = 0;
+    cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    return count;
+  }
+
   virtual void prepareAssemble(int64_t targetLump) override {
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -610,6 +640,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   vector<int64_t> spanToChainOffset;
   DevMirror<int> devGetrfPivots;       // cuSolver int pivots (1-based)
   DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based)
+  DevMirror<int64_t> devPerturbCount;  // Counter for perturbSmallDiagonals
 
   const CudaSymbolicCtx& sym;
 };

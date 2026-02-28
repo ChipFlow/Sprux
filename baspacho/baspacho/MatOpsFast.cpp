@@ -172,6 +172,19 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
                         int64_t ldC) override;
 #endif  // BASPACHO_USE_BLAS
 
+  virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
+                                        T threshold) override {
+    int64_t count = 0;
+    for (int64_t i = 0; i < n; i++) {
+      T& diag = data[offset + i * stride + i];
+      if (!std::isfinite(diag) || std::abs(diag) < threshold) {
+        diag = (diag >= T(0)) ? threshold : -threshold;
+        count++;
+      }
+    }
+    return count;
+  }
+
   virtual void prepareAssemble(int64_t targetLump) override {
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 

@@ -8,7 +8,9 @@
 #include "baspacho/baspacho/Solver.h"
 #include <dispenso/parallel_for.h>
 #include <Eigen/Eigenvalues>
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include "baspacho/baspacho/ComputationModel.h"
 #include "baspacho/baspacho/DebugMacros.h"
@@ -23,12 +25,13 @@ using tdelta = chrono::duration<double>;
 
 Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sparseElimRanges_,
                std::vector<int64_t>&& permutation_, OpsPtr&& ops_, int64_t canFactorUpTo_,
-               LevelSetSchedule&& levelSetSchedule)
+               LevelSetSchedule&& levelSetSchedule, double staticPivotThreshold)
     : factorSkel(std::move(factorSkel_)),
       sparseElimRanges(std::move(sparseElimRanges_)),
       permutation(std::move(permutation_)),
       canFactorUpTo(canFactorUpTo_),
       levelSetSchedule_(std::move(levelSetSchedule)),
+      staticPivotThreshold_(staticPivotThreshold),
       ops(std::move(ops_)) {
   if (canFactorUpTo < 0) {
     canFactorUpTo = factorSkel.numSpans();
@@ -468,9 +471,19 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
   // LU factorization with partial pivoting on diagonal block
   // pivots array stores the row permutation for this lump
   int64_t pivotOffset = factorSkel.lumpStart[lump];  // Pivot index (row-based, not span-based)
+
   int info = numCtx.getrf(lumpSize, lumpSize, data, diagBlockOffset, pivots + pivotOffset);
-  if (info != 0) {
+  if (info != 0 && staticPivotThreshold_ < 0) {
     throw std::runtime_error("getrf failed with info = " + std::to_string(info));
+  }
+
+  // Static pivoting: scan all diagonals when enabled (near-zero values that aren't
+  // exactly zero can still cause catastrophic growth in the L factor)
+  if (staticPivotThreshold_ >= 0) {
+    using ValT = typename std::remove_pointer<decltype(data)>::type;
+    ValT threshold = static_cast<ValT>(effectiveStaticPivotThreshold_);
+    staticPivotPerturbCount_ +=
+        numCtx.perturbSmallDiagonals(lumpSize, data, diagBlockOffset, lumpSize, threshold);
   }
 
   int64_t boardColBegin = factorSkel.boardColPtr[lump];
@@ -669,6 +682,30 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
 
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
 
+  // Compute effective static pivot threshold scaled by matrix diagonal magnitude.
+  // For auto mode (threshold == 0), use cbrt(eps) * max(|diag_ii|).
+  // cbrt(eps) is more aggressive than sqrt(eps) but necessary to prevent cascading
+  // growth in the L factor for matrices with many near-zero pivots.
+  if (staticPivotThreshold_ >= 0) {
+    using ValT = typename std::remove_pointer<decltype(data)>::type;
+    ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
+    if (staticPivotThreshold_ == 0) {
+      ValT maxDiag = 0;
+      for (int64_t l = startLump; l < upToLump; l++) {
+        int64_t lumpSize = factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l];
+        int64_t chainColBegin = factorSkel.chainColPtr[l];
+        int64_t diagOff = factorSkel.chainData[chainColBegin];
+        for (int64_t i = 0; i < lumpSize; i++) {
+          ValT absVal = std::abs(data[diagOff + i * lumpSize + i]);
+          if (absVal > maxDiag) maxDiag = absVal;
+        }
+      }
+      effectiveStaticPivotThreshold_ = static_cast<double>(epsScale * std::max(maxDiag, epsScale));
+    } else {
+      effectiveStaticPivotThreshold_ = staticPivotThreshold_;
+    }
+  }
+
   // Note: LU does not currently support sparse elimination optimization
   // All factorization is done in the dense phase
   int64_t denseOpsFromLump = 0;
@@ -703,6 +740,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
 
 template <typename T>
 void Solver::factorLU(T* data, int64_t* pivots, bool verbose) const {
+  staticPivotPerturbCount_ = 0;
   internalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
 }
 
@@ -1297,6 +1335,9 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   BASPACHO_CHECK_LE(settings.supernodeMergeFillTolerance, 1.0);
   BASPACHO_CHECK_GE(settings.maxSupernodeSize, (int64_t)0);
 
+  // validate static pivoting threshold
+  BASPACHO_CHECK_GE(settings.staticPivotThreshold, -1.0);
+
   BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
   if (!sparseElimRanges.empty()) {
@@ -1337,7 +1378,8 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
     std::vector<int64_t> sparseElimRangesCopy = sparseElimRanges;
     return SolverPtr(new Solver(std::move(factorSkel), std::move(sparseElimRangesCopy),
                                 std::move(permutation), getBackend(settings),
-                                settings.addFillPolicy == AddFillNone ? 0 : givenSparseElimEnd));
+                                settings.addFillPolicy == AddFillNone ? 0 : givenSparseElimEnd,
+                                {}, settings.staticPivotThreshold));
   }
 
   SparseStructure ssBottom = ss.extractRightBottom(givenSparseElimEnd);
@@ -1460,7 +1502,7 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
       std::move(factorSkel), std::move(fullSparseElimRanges), std::move(fullInvPerm),
       getBackend(settings),
       settings.addFillPolicy == AddFillForAutoElims ? fullSparseElimEnd : paramSize.size(),
-      std::move(levelSetSchedule)));
+      std::move(levelSetSchedule), settings.staticPivotThreshold));
 }
 
 template <typename T>
