@@ -353,6 +353,144 @@ kernel void sparse_elim_straight_kernel_float(
 }
 
 // ============================================================================
+// Kernel: lu_factor_lumps_kernel (LU factorization for 1x1 scalar lumps)
+// Divides below-diagonal entries by diagonal (no Cholesky sqrt).
+// One thread per lump.
+// ============================================================================
+kernel void lu_factor_lumps_kernel_float(
+    constant int64_t* lumpStart [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    constant int64_t* boardColPtr [[buffer(3)]],
+    constant int64_t* boardChainColOrd [[buffer(4)]],
+    constant int64_t* chainRowsTillEnd [[buffer(5)]],
+    device float* data [[buffer(6)]],
+    constant int64_t& lumpIndexStart [[buffer(7)]],
+    constant int64_t& lumpIndexEnd [[buffer(8)]],
+    constant float& staticPivotThreshold [[buffer(9)]],
+    device atomic_uint* perturbCount [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) return;
+
+    int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
+    int64_t colStart = chainColPtr[lump];
+    int64_t dataPtr = chainData[colStart];
+
+    // Read diagonal value
+    device float* diagPtr = data + dataPtr;
+    float diag = *diagPtr;
+
+    // Static pivoting: perturb near-zero or non-finite diagonals
+    if (staticPivotThreshold >= 0.0f) {
+        if (!isfinite(diag) || abs(diag) < staticPivotThreshold) {
+            diag = (diag >= 0.0f) ? staticPivotThreshold : -staticPivotThreshold;
+            *diagPtr = diag;
+            atomic_fetch_add_explicit(perturbCount, 1u, memory_order_relaxed);
+        }
+    }
+
+    // Divide below-diagonal entries by diagonal to get L column
+    int64_t gatheredStart = boardColPtr[lump];
+    int64_t gatheredEnd = boardColPtr[lump + 1];
+    int64_t rowDataStart = boardChainColOrd[gatheredStart + 1];
+    int64_t rowDataEnd = boardChainColOrd[gatheredEnd - 1];
+    int64_t belowDiagStart = chainData[colStart + rowDataStart];
+    int64_t numRows = chainRowsTillEnd[colStart + rowDataEnd - 1]
+                    - chainRowsTillEnd[colStart + rowDataStart - 1];
+
+    device float* belowDiagPtr = data + belowDiagStart;
+    float invDiag = 1.0f / diag;
+    for (int64_t i = 0; i < numRows * lumpSize; i++) {
+        belowDiagPtr[i] *= invDiag;
+    }
+}
+
+// ============================================================================
+// Kernel: lu_sparse_elim_kernel (LU Schur complement for scalar lumps)
+// Updates both lower and upper triangle: target -= L[a,k] * U[k,b]
+// One thread per (L_row, U_col) pair. n^2 pairs per lump.
+// ============================================================================
+kernel void lu_sparse_elim_kernel_float(
+    constant int64_t* chainColPtr [[buffer(0)]],
+    constant int64_t* lumpStart [[buffer(1)]],
+    constant int64_t* chainRowSpan [[buffer(2)]],
+    constant int64_t* spanStart [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    constant int64_t* spanToLump [[buffer(5)]],
+    constant int64_t* spanOffsetInLump [[buffer(6)]],
+    device float* data [[buffer(7)]],
+    constant int64_t& lumpIndexStart [[buffer(8)]],
+    constant int64_t& lumpIndexEnd [[buffer(9)]],
+    constant int64_t* blockPairEnum [[buffer(10)]],
+    constant int64_t& numBlockPairs [[buffer(11)]],
+    constant int64_t* upperChainRowPtr [[buffer(12)]],
+    constant int64_t* upperChainColSpan [[buffer(13)]],
+    constant int64_t* upperChainData [[buffer(14)]],
+    constant int64_t& upperDataBase [[buffer(15)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= numBlockPairs) return;
+
+    // Find which lump this pair belongs to
+    int64_t pos = bisect(blockPairEnum, lumpIndexEnd - lumpIndexStart, int64_t(tid));
+    int64_t l = lumpIndexStart + pos;
+
+    // Number of below-diagonal chain entries
+    int64_t colStart = chainColPtr[l] + 1;  // skip diagonal
+    int64_t colEnd = chainColPtr[l + 1];
+    int64_t n = colEnd - colStart;
+
+    // Map linear pair index to (row_idx, col_idx) in [0,n) x [0,n)
+    int64_t localPair = int64_t(tid) - blockPairEnum[pos];
+    int64_t row_idx = localPair / n;
+    int64_t col_idx = localPair % n;
+
+    // Get spans for this pair
+    int64_t aSpan = chainRowSpan[colStart + row_idx];  // row (L entry)
+    int64_t bSpan = chainRowSpan[colStart + col_idx];  // col (U entry)
+
+    // L value from lower chain
+    float L_val = data[chainData[colStart + row_idx]];
+
+    // U value from upper chain
+    int64_t uRowStart = upperChainRowPtr[l];
+    float U_val = data[upperDataBase + upperChainData[uRowStart + col_idx]];
+
+    float product = L_val * U_val;
+
+    if (aSpan >= bSpan) {
+        // Target in lower triangle at (row=aSpan, col=bSpan)
+        // Find in column chain of bSpan's lump
+        int64_t bLump = spanToLump[bSpan];
+        int64_t bSpanOff = spanOffsetInLump[bSpan];
+        int64_t targetStartPtr = chainColPtr[bLump];
+        int64_t targetEndPtr = chainColPtr[bLump + 1];
+        int64_t targetPos = bisect(chainRowSpan + targetStartPtr,
+                                   targetEndPtr - targetStartPtr, aSpan);
+        int64_t targetDataPtr = chainData[targetStartPtr + targetPos];
+
+        device atomic_uint* addr =
+            (device atomic_uint*)&data[targetDataPtr + bSpanOff];
+        atomicSubFloat(addr, product);
+    } else {
+        // Target in upper triangle at (row=aSpan, col=bSpan)
+        // Find in upper chain of aSpan's lump
+        int64_t aLump = spanToLump[aSpan];
+        int64_t targetURowStart = upperChainRowPtr[aLump];
+        int64_t targetURowEnd = upperChainRowPtr[aLump + 1];
+        int64_t targetPos = bisect(upperChainColSpan + targetURowStart,
+                                   targetURowEnd - targetURowStart, bSpan);
+        int64_t targetDataPtr = upperDataBase +
+            upperChainData[targetURowStart + targetPos];
+
+        device atomic_uint* addr = (device atomic_uint*)&data[targetDataPtr];
+        atomicSubFloat(addr, product);
+    }
+}
+
+// ============================================================================
 // Kernel 4: assemble_kernel (Assemble rectangular sections)
 // ============================================================================
 kernel void assemble_kernel_float(

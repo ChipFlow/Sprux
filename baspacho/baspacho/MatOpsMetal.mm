@@ -99,6 +99,14 @@ struct MetalSymbolicCtx : SymbolicCtx {
       devSpanToLump.load(skel.spanToLump);
       devPermutation.load(permutation);
 
+      // Upload upper triangle structure for LU factorization
+      if (skel.isGeneral()) {
+        devUpperChainRowPtr.load(skel.upperChainRowPtr);
+        devUpperChainColSpan.load(skel.upperChainColSpan);
+        devUpperChainData.load(skel.upperChainData);
+        NSLog(@"MetalSymbolicCtx: uploaded upper triangle data for LU");
+      }
+
       NSLog(@"MetalSymbolicCtx initialized");
     }
   }
@@ -133,6 +141,29 @@ struct MetalSymbolicCtx : SymbolicCtx {
     return SymElimCtxPtr(elim);
   }
 
+  virtual SymElimCtxPtr prepareLUElimination(int64_t lumpsBegin, int64_t lumpsEnd) override {
+    if (!skel.isGeneral()) return nullptr;
+
+    MetalSymElimCtx* elim = new MetalSymElimCtx;
+
+    vector<int64_t> pairEnum(lumpsEnd - lumpsBegin + 1);
+
+    // For LU: n^2 pairs per lump (L_rows × U_cols) instead of n*(n+1)/2
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t startPtr = skel.chainColPtr[l] + 1;  // skip diag block
+      int64_t endPtr = skel.chainColPtr[l + 1];
+      int64_t n = endPtr - startPtr;
+      pairEnum[l - lumpsBegin] = n * n;
+    }
+    cumSumVec(pairEnum);
+
+    elim->numColumns = lumpsEnd - lumpsBegin;
+    elim->numBlockPairs = pairEnum[pairEnum.size() - 1];
+    elim->makeBlockPairEnumStraight.load(pairEnum);
+
+    return SymElimCtxPtr(elim);
+  }
+
   virtual NumericCtxBase* createNumericCtxForType(type_index tIdx, int64_t tempBufSize,
                                                   int batchSize) override;
 
@@ -156,6 +187,11 @@ struct MetalSymbolicCtx : SymbolicCtx {
   MetalMirror<int64_t> devSpanStart;
   MetalMirror<int64_t> devSpanToLump;
   MetalMirror<int64_t> devPermutation;
+
+  // Upper triangle buffers (for LU factorization)
+  MetalMirror<int64_t> devUpperChainRowPtr;
+  MetalMirror<int64_t> devUpperChainColSpan;
+  MetalMirror<int64_t> devUpperChainData;
 };
 
 // Metal operations factory
@@ -515,6 +551,125 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             },
             (NSUInteger)elim.numBlockPairs);
       }
+    }
+  }
+
+  virtual void doEliminationLU(const SymElimCtx& elimData, float* data, int64_t lumpsBegin,
+                               int64_t lumpsEnd, float staticPivotThreshold,
+                               int64_t& perturbCount) override {
+    @autoreleasepool {
+      const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
+      BASPACHO_CHECK_NOTNULL(pElim);
+      const MetalSymElimCtx& elim = *pElim;
+
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error(
+            "MetalNumericCtx<float>::doEliminationLU: data buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      int64_t numLumps = lumpsEnd - lumpsBegin;
+      if (numLumps <= 0) return;
+
+      // Allocate GPU buffer for perturb count (atomic counter)
+      id<MTLBuffer> perturbBuf = [sym.device newBufferWithLength:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+      *(uint32_t*)[perturbBuf contents] = 0;
+
+      // Step 1: LU factor lumps (divide below-diag by diagonal)
+      {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "lu_factor_lumps_kernel_float");
+
+        float threshold = staticPivotThreshold;
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                          offset:0
+                         atIndex:5];
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&threshold length:sizeof(float) atIndex:9];
+              [encoder setBuffer:perturbBuf offset:0 atIndex:10];
+            },
+            (NSUInteger)numLumps);
+      }
+
+      // Step 2: LU Schur complement (L*U updates to both triangles)
+      if (elim.numBlockPairs > 0) {
+        id<MTLComputePipelineState> pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "lu_sparse_elim_kernel_float");
+
+        int64_t upperDataBase = sym.skel.dataSize();
+
+        dispatchKernel(
+            sym.commandQueue, pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
+                          offset:0
+                         atIndex:5];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
+                          offset:0
+                         atIndex:6];
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
+                          offset:0
+                         atIndex:10];
+              [encoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                          offset:0
+                         atIndex:12];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                          offset:0
+                         atIndex:13];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                          offset:0
+                         atIndex:14];
+              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:15];
+            },
+            (NSUInteger)elim.numBlockPairs);
+      }
+
+      // Read back perturb count
+      perturbCount = *(uint32_t*)[perturbBuf contents];
     }
   }
 

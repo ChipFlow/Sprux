@@ -69,8 +69,16 @@ struct SolveCtxBase {
 struct SymbolicCtx {
   virtual ~SymbolicCtx() {}
 
-  // prepares data for a parallel elimination op
+  // prepares data for a parallel elimination op (Cholesky)
   virtual SymElimCtxPtr prepareElimination(int64_t lumpsBegin, int64_t lumpsEnd) = 0;
+
+  // prepares data for LU sparse elimination (non-symmetric matrices)
+  // Default: returns nullptr (backend doesn't support LU sparse elimination)
+  virtual SymElimCtxPtr prepareLUElimination(int64_t lumpsBegin, int64_t lumpsEnd) {
+    (void)lumpsBegin;
+    (void)lumpsEnd;
+    return nullptr;
+  }
 
   virtual NumericCtxBase* createNumericCtxForType(std::type_index tIdx, int64_t tempBufSize,
                                                   int batchSize) = 0;
@@ -128,6 +136,20 @@ struct NumericCtx : NumericCtxBase {
   // does (possibly parallel) elimination on a lump of aggregs
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) = 0;
+
+  // LU sparse elimination for non-symmetric matrices (1x1 scalar lumps)
+  // Uses L from lower chain and U from upper chain for Schur complement
+  virtual void doEliminationLU(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
+                               int64_t lumpsEnd, T staticPivotThreshold,
+                               int64_t& perturbCount) {
+    (void)elimData;
+    (void)data;
+    (void)lumpsBegin;
+    (void)lumpsEnd;
+    (void)staticPivotThreshold;
+    (void)perturbCount;
+    throw std::runtime_error("doEliminationLU: LU sparse elimination not supported by this backend");
+  }
 
   // dense Cholesky on dense row-major matrix A (in place)
   virtual void potrf(int64_t n, T* data, int64_t offA) = 0;

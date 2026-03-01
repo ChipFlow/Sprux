@@ -41,6 +41,20 @@ Solver::Solver(CoalescedBlockMatrixSkel&& factorSkel_, std::vector<int64_t>&& sp
     elimCtxs.push_back(symCtx->prepareElimination(sparseElimRanges[l], sparseElimRanges[l + 1]));
   }
 
+  // Create LU sparse elimination contexts for non-symmetric matrices.
+  // Only populate luElimCtxs if the backend supports LU sparse elimination
+  // (returns non-null contexts). Otherwise leave empty to use the dense LU path.
+  if (factorSkel.isGeneral() && !sparseElimRanges.empty()) {
+    std::vector<SymElimCtxPtr> tmpCtxs;
+    bool anyValid = false;
+    for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+      auto ctx = symCtx->prepareLUElimination(sparseElimRanges[l], sparseElimRanges[l + 1]);
+      if (ctx) anyValid = true;
+      tmpCtxs.push_back(std::move(ctx));
+    }
+    if (anyValid) luElimCtxs = std::move(tmpCtxs);
+  }
+
   initElimination();
 }
 
@@ -706,9 +720,36 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
     }
   }
 
-  // Note: LU does not currently support sparse elimination optimization
-  // All factorization is done in the dense phase
-  int64_t denseOpsFromLump = 0;
+  // LU sparse elimination: use GPU-accelerated path for scalar lumps in sparse
+  // elimination ranges, then fall back to dense LU for remaining lumps.
+  using ValT = typename std::remove_pointer<decltype(data)>::type;
+  ValT effectiveThreshold =
+      (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
+
+  if (!luElimCtxs.empty()) {
+    for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+      if (sparseElimRanges[l + 1] > upToLump) {
+        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        break;
+      } else if (startLump > sparseElimRanges[l]) {
+        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        continue;
+      }
+      if (luElimCtxs[l]) {
+        if (verbose) {
+          std::cout << "LU Elim set: " << l << " (" << sparseElimRanges[l] << ".."
+                    << sparseElimRanges[l + 1] << ")" << std::endl;
+        }
+        int64_t perturbCount = 0;
+        numCtx->doEliminationLU(*luElimCtxs[l], data, sparseElimRanges[l],
+                                sparseElimRanges[l + 1], effectiveThreshold, perturbCount);
+        staticPivotPerturbCount_ += perturbCount;
+      }
+    }
+  }
+
+  int64_t denseOpsFromLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
   if (verbose) {
     std::cout << "LU Block-Fact from: " << denseOpsFromLump << std::endl;
   }
@@ -718,7 +759,12 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
     numCtx->prepareAssemble(l);
 
     //  iterate over columns having a non-trivial a-block
-    for (int64_t rPtr = startElimRowPtr[l - denseOpsFromLump],
+    // When sparse elimination was used (denseOpsFromLump > 0), startElimRowPtr
+    // skips board entries pointing to already-eliminated lumps.
+    // When no sparse elimination (denseOpsFromLump == 0), use boardRowPtr directly.
+    int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
+                                               : factorSkel.boardRowPtr[l];
+    for (int64_t rPtr = rPtrStart,
                  rEnd = factorSkel.boardRowPtr[l + 1] - 1;  // skip last (diag block)
          rPtr < rEnd; rPtr++) {
       int64_t origLump = factorSkel.boardColLump[rPtr];

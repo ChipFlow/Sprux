@@ -326,6 +326,7 @@ class Solver {
   OpsPtr ops;
   SymbolicCtxPtr symCtx;
   std::vector<SymElimCtxPtr> elimCtxs;
+  std::vector<SymElimCtxPtr> luElimCtxs;  // LU sparse elimination contexts (for MTYPE_GENERAL)
   std::vector<int64_t> startElimRowPtr;
   int64_t maxElimTempSize;
 };
