@@ -13,6 +13,7 @@ add_baspacho_test(LUFactorTest LUFactorTest.cpp)
 add_baspacho_test(LDLTFactorTest LDLTFactorTest.cpp)
 add_baspacho_test(FastSymbolicTest FastSymbolicTest.cpp)
 add_baspacho_test(SupernodeMergerTest SupernodeMergerTest.cpp)
+add_baspacho_test(PreprocessingTest PreprocessingTest.cpp)
 add_baspacho_test(SequenceSolveTest SequenceSolveTest.cpp)
 
 if(HAVE_UMFPACK)

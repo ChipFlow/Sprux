@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "baspacho/baspacho/Preprocessing.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/baspacho/SparseStructure.h"
 #include "baspacho/testing/MatrixMarketReader.h"
@@ -199,19 +200,19 @@ TEST(SequenceSolve, RingOscillator) {
 // C6288 sequence: 20 medium matrices (25380x25380), real-world integration
 // ============================================================================
 
-// This test exercises createSolver + CHOLMOD-based symbolic analysis + LU factorization
-// with static pivoting on the 25K C6288 circuit Jacobians.
+// This test exercises preprocessing (BTF maximum transversal + row/column equilibration)
+// + createSolver + CHOLMOD-based symbolic analysis + LU factorization with static pivoting
+// + iterative refinement on the 25K C6288 circuit Jacobians.
 //
-// KNOWN LIMITATION: BaSpaCho's fill-reducing ordering (designed for SPD/Cholesky) creates
-// ~40% zero/near-zero pivots for these non-symmetric circuit Jacobians. Static pivoting
-// handles individual zero pivots, but the cumulative perturbation errors cascade through
-// the Schur complement, causing overflow in late-stage lumps (~lump 24224 of 24945).
-// This produces NaN residuals for most matrices. The fix requires MC64 preprocessing
-// (weighted bipartite matching to place large values on the diagonal before ordering).
-//
-// This test verifies that factorization completes without throwing, and reports timing
-// and residual quality for benchmarking purposes. It does NOT assert residual quality.
-TEST(SequenceSolve, DISABLED_C6288) {
+// Without preprocessing, BaSpaCho's fill-reducing ordering (designed for SPD/Cholesky)
+// creates ~40% zero/near-zero pivots → NaN residuals. Preprocessing applies:
+// 1. BTF max transversal: row permutation Q for zero-free diagonal
+// 2. Row/column equilibration: scaling Dr, Dc so max entries are ~1
+// This eliminates zero pivots. However, BaSpaCho's supernodal LU with symmetric AMD ordering
+// and scalar blocks has limited accuracy for large non-symmetric matrices (no inter-block
+// pivoting). Iterative refinement recovers full accuracy: each refinement step requires only
+// a fast triangular solve (~5ms) plus a sparse matrix-vector product.
+TEST(SequenceSolve, C6288) {
   string dir = findTestDataDir("c6288_sequence");
   if (dir.empty()) {
     GTEST_SKIP() << "test_data/c6288_sequence/ not found";
@@ -238,8 +239,23 @@ TEST(SequenceSolve, DISABLED_C6288) {
 
   using Clock = chrono::high_resolution_clock;
 
-  // Build solver once via CHOLMOD-based symbolic analysis
-  SparseStructure ss = csrToSparseStructure(A0);
+  // Step 1: BTF max transversal — find row permutation for zero-free diagonal (once per pattern)
+  auto tPreproc = Clock::now();
+  auto preproc = computeMaxTransversal(n, A0.rowPtr.data(), A0.colInd.data());
+  double preprocTime = chrono::duration<double>(Clock::now() - tPreproc).count();
+
+  cout << "=== C6288 Timing ===" << endl;
+  cout << "  Preprocessing (max transversal): " << fixed << setprecision(4) << preprocTime
+       << "s, structural rank=" << preproc.structuralRank << "/" << n << endl;
+  ASSERT_EQ(preproc.structuralRank, n) << "Matrix is structurally singular";
+
+  // Step 2: Apply row perm to first matrix, build symmetric structure for solver
+  vector<int64_t> pRowPtr, pColInd;
+  vector<double> pValues;
+  applyRowPermToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                            preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+
+  SparseStructure ss = csrToSymmetricSparseStructure(n, pRowPtr.data(), pColInd.data());
   vector<int64_t> paramSizes(n, 1);
   vector<int64_t> blockSizes(n, 1);
 
@@ -252,7 +268,6 @@ TEST(SequenceSolve, DISABLED_C6288) {
   auto solver = createSolver(settings, paramSizes, ss);
   double analysisTime = chrono::duration<double>(Clock::now() - t0).count();
 
-  cout << "=== C6288 Timing ===" << endl;
   cout << "  Symbolic analysis: " << fixed << setprecision(4) << analysisTime << "s" << endl;
   cout << "  Solver: " << solver->skel().numLumps() << " lumps, " << solver->skel().numSpans()
        << " spans, dataSize=" << solver->totalDataSize() << endl;
@@ -279,9 +294,20 @@ TEST(SequenceSolve, DISABLED_C6288) {
       continue;
     }
 
-    // Load data via permutation-aware loadFromCsr and factor
+    // Compute per-matrix equilibration on Q*A (row perm applied, then scale)
+    applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                              preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+    vector<double> rowScale, colScale;
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale, colScale);
+
+    // Apply scaling: A' = Dr * Q * A * Dc
+    applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                                     preproc.rowPerm.data(), rowScale.data(), colScale.data(),
+                                     pRowPtr, pColInd, pValues);
+
+    // Load scaled/permuted data and factor
     fill(data.begin(), data.end(), 0.0);
-    solver->loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), A.values.data(),
+    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), pValues.data(),
                         data.data());
 
     auto tFactor = Clock::now();
@@ -290,24 +316,58 @@ TEST(SequenceSolve, DISABLED_C6288) {
 
     int64_t perturbCount = solver->staticPivotPerturbCount();
 
-    // Permute RHS: bp[perm[i]] = b[i]
+    // Initial solve: Dr*Q*A*Dc * y = Dr*Q*b
     Eigen::VectorXd bp(n);
-    for (int64_t j = 0; j < n; j++) bp(perm[j]) = b(j);
+    for (int64_t j = 0; j < n; j++) {
+      bp(perm[j]) = rowScale[j] * b(preproc.rowPerm[j]);
+    }
 
     auto tSolve = Clock::now();
     solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
+
+    Eigen::VectorXd x(n);
+    for (int64_t j = 0; j < n; j++) {
+      x(j) = colScale[j] * bp(perm[j]);
+    }
+
+    double initialResidual = computeResidual(A, x, b);
+
+    // Iterative refinement: solve A*x = b via repeated correction
+    // Each step: r = b - A*x, solve Dr*Q*A*Dc*d = Dr*Q*r, x += Dc*d
+    int refineSteps = 0;
+    const int maxRefine = 30;
+    double residual = initialResidual;
+    for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
+      // Compute r = b - A*x
+      Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+      for (int64_t i = 0; i < n; i++) {
+        for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
+          r(i) += A.values[k] * x(A.colInd[k]);
+        }
+      }
+      r = b - r;
+
+      // Solve for correction: Dr*Q*A*Dc * dy = Dr*Q*r
+      for (int64_t j = 0; j < n; j++) {
+        bp(perm[j]) = rowScale[j] * r(preproc.rowPerm[j]);
+      }
+      solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
+
+      for (int64_t j = 0; j < n; j++) {
+        x(j) += colScale[j] * bp(perm[j]);
+      }
+
+      residual = computeResidual(A, x, b);
+      refineSteps++;
+    }
     double solveTime = chrono::duration<double>(Clock::now() - tSolve).count();
 
-    // Inverse permute solution: x[i] = bp[perm[i]]
-    Eigen::VectorXd x(n);
-    for (int64_t j = 0; j < n; j++) x(j) = bp(perm[j]);
-
-    // Compute residual for reporting (not asserted — see KNOWN LIMITATION above)
-    double residual = computeResidual(A, x, b);
-
     cout << "  Matrix #" << idx << ": factor=" << fixed << setprecision(4) << factorTime
-         << "s, solve=" << solveTime << "s, residual=" << scientific << setprecision(2) << residual
+         << "s, solve=" << solveTime << "s" << ", initial_res=" << scientific << setprecision(2)
+         << initialResidual << ", final_res=" << residual << ", refine=" << refineSteps
          << ", perturbed=" << perturbCount << endl;
+
+    EXPECT_LT(residual, 1e-6) << "Matrix #" << idx << " residual too large after refinement";
 
     totalFactorTime += factorTime;
     totalSolveTime += solveTime;

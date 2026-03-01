@@ -233,7 +233,7 @@ if(BASPACHO_USE_SYSTEM_SUITESPARSE)
 else()
   # Vendored SuiteSparse via FetchContent - build only what we need
   if(NOT DEFINED suitesparse_SOURCE_DIR)
-    set(SUITESPARSE_ENABLE_PROJECTS "suitesparse_config;amd;colamd;camd;ccolamd;cholmod" CACHE STRING "" FORCE)
+    set(SUITESPARSE_ENABLE_PROJECTS "suitesparse_config;amd;colamd;camd;ccolamd;cholmod;btf" CACHE STRING "" FORCE)
     set(CHOLMOD_SUPERNODAL OFF CACHE BOOL "" FORCE)  # No BLAS needed for symbolic-only
     set(CHOLMOD_CAMD ON CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
@@ -274,6 +274,16 @@ else()
   else()
     message(FATAL_ERROR "Could not find CHOLMOD target from SuiteSparse")
   endif()
+
+  if(TARGET SuiteSparse::BTF)
+    set(SUITESPARSE_BTF_TARGET SuiteSparse::BTF)
+  elseif(TARGET BTF_static)
+    set(SUITESPARSE_BTF_TARGET BTF_static)
+  elseif(TARGET BTF)
+    set(SUITESPARSE_BTF_TARGET BTF)
+  else()
+    message(FATAL_ERROR "Could not find BTF target from SuiteSparse")
+  endif()
 endif()
 
 # AMD from SuiteSparse is now always available (vendored or system)
@@ -285,6 +295,11 @@ message("* Using SuiteSparse AMD for fill-reducing ordering")
 set(HAVE_CHOLMOD 1)
 add_compile_definitions(BASPACHO_HAVE_CHOLMOD)
 message("* Using CHOLMOD for fast symbolic analysis")
+
+# BTF is now always available (for MC64 preprocessing)
+set(HAVE_BTF 1)
+add_compile_definitions(BASPACHO_HAVE_BTF)
+message("* Using BTF for maximum transversal (LU preprocessing)")
 
 if(BASPACHO_BUILD_EXAMPLES)
 

@@ -6,6 +6,7 @@ set(BaSpaCho_sources
     EliminationTree.cpp
     MatOpsFast.cpp
     MatOpsRef.cpp
+    Preprocessing.cpp
     Solver.cpp
     SparseStructure.cpp
     SupernodeMerger.cpp
@@ -138,10 +139,11 @@ endif()
 
 target_compile_options(${BASPACHO_LIBRARY} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BASPACHO_CXX_FLAGS}>)
                      
-# SuiteSparse: AMD for fill-reducing ordering, CHOLMOD for fast symbolic analysis
+# SuiteSparse: AMD for fill-reducing ordering, CHOLMOD for fast symbolic analysis, BTF for max transversal
 target_link_libraries(${BASPACHO_LIBRARY}
                       ${SUITESPARSE_AMD_TARGET}
-                      ${SUITESPARSE_CHOLMOD_TARGET})
+                      ${SUITESPARSE_CHOLMOD_TARGET}
+                      ${SUITESPARSE_BTF_TARGET})
 
 if(NOT BUILD_SHARED_LIBS)
     bundle_static_library(${BASPACHO_LIBRARY} BaSpaCho)
