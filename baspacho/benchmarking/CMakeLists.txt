@@ -45,4 +45,5 @@ endif()
 
 if(HAVE_CUDSS)
   target_link_libraries (bench cuDSS::cuDSS CUDA::cudart)
+  target_link_libraries (lu_bench cuDSS::cuDSS CUDA::cudart)
 endif()

@@ -332,7 +332,7 @@ jobs:
         ./build/baspacho/benchmarking/lu_bench -J \
           -i test_data/c6288_jacobian/jacobian.mtx \
           -r test_data/c6288_jacobian/rhs.mtx \
-          -n "$ITERATIONS" -S "CUDA|CPU" > results-lu-cuda.json
+          -n "$ITERATIONS" -S "CUDA|CPU|cuDSS" > results-lu-cuda.json
         echo "=== LU Results ==="
         python3 -c "
         import json

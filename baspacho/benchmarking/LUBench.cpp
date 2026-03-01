@@ -31,6 +31,11 @@
 #include "baspacho/baspacho/CudaDefs.h"
 #endif
 
+#ifdef BASPACHO_HAVE_CUDSS
+#include <cuda_runtime.h>
+#include <cudss.h>
+#endif
+
 #ifdef BASPACHO_USE_METAL
 #include "baspacho/baspacho/MetalDefs.h"
 #endif
@@ -506,6 +511,133 @@ static vector<LUTimingResult> benchmarkLUCuda(
 #endif  // BASPACHO_USE_CUBLAS
 
 // ============================================================================
+// cuDSS LU benchmark (NVIDIA's native sparse solver)
+// ============================================================================
+
+#ifdef BASPACHO_HAVE_CUDSS
+
+#define cudssCHECK(call)                                                              \
+  do {                                                                                \
+    cudssStatus_t status_ = (call);                                                   \
+    if (status_ != CUDSS_STATUS_SUCCESS) {                                            \
+      fprintf(stderr, "[%s:%d] cuDSS Error: %d\n", __FILE__, __LINE__, (int)status_); \
+      exit(1);                                                                        \
+    }                                                                                 \
+  } while (0)
+
+static vector<LUTimingResult> benchmarkLUCudss(
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
+  if (matrices.empty()) return {};
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+
+  vector<LUTimingResult> results;
+
+  for (size_t mi = 0; mi < matrices.size(); mi++) {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    LUTimingResult res;
+
+    int64_t nnz = A.nnz;
+
+    // Convert int64_t indices to int32 for cuDSS
+    vector<int> rowPtr32(A.rowPtr.begin(), A.rowPtr.end());
+    vector<int> colInd32(A.colInd.begin(), A.colInd.end());
+
+    // Upload to GPU
+    int* d_rowPtr = nullptr;
+    int* d_colInd = nullptr;
+    double* d_values = nullptr;
+    cuCHECK(cudaMalloc(&d_rowPtr, (n + 1) * sizeof(int)));
+    cuCHECK(cudaMalloc(&d_colInd, nnz * sizeof(int)));
+    cuCHECK(cudaMalloc(&d_values, nnz * sizeof(double)));
+    cuCHECK(cudaMemcpy(d_rowPtr, rowPtr32.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    cuCHECK(cudaMemcpy(d_colInd, colInd32.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
+    cuCHECK(cudaMemcpy(d_values, A.values.data(), nnz * sizeof(double), cudaMemcpyHostToDevice));
+
+    // cuDSS setup
+    cudssHandle_t handle = nullptr;
+    cudssCHECK(cudssCreate(&handle));
+
+    cudssConfig_t config = nullptr;
+    cudssCHECK(cudssConfigCreate(&config));
+
+    cudssData_t data = nullptr;
+    cudssCHECK(cudssDataCreate(handle, &data));
+
+    // General (non-symmetric) matrix, full CSR
+    cudssMatrix_t cudssA = nullptr;
+    cudssCHECK(cudssMatrixCreateCsr(&cudssA, n, n, nnz, d_rowPtr, nullptr, d_colInd, d_values,
+                                     CUDA_R_32I, CUDA_R_64F, CUDSS_MTYPE_GENERAL,
+                                     CUDSS_MVIEW_FULL_L2U, CUDSS_BASE_ZERO));
+
+    // RHS and solution vectors on GPU
+    double* d_b = nullptr;
+    double* d_x = nullptr;
+    cuCHECK(cudaMalloc(&d_b, n * sizeof(double)));
+    cuCHECK(cudaMalloc(&d_x, n * sizeof(double)));
+    cuCHECK(cudaMemcpy(d_b, b.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+    cuCHECK(cudaMemset(d_x, 0, n * sizeof(double)));
+
+    cudssMatrix_t cudssB = nullptr;
+    cudssMatrix_t cudssX = nullptr;
+    cudssCHECK(
+        cudssMatrixCreateDn(&cudssB, n, 1, n, d_b, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+    cudssCHECK(
+        cudssMatrixCreateDn(&cudssX, n, 1, n, d_x, CUDA_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+
+    // Analysis
+    cudssCHECK(cudssExecute(handle, CUDSS_PHASE_ANALYSIS, config, data, cudssA, cudssX, cudssB));
+    cuCHECK(cudaDeviceSynchronize());
+
+    // Factor (timed)
+    auto tFactor = Clock::now();
+    cudssCHECK(
+        cudssExecute(handle, CUDSS_PHASE_FACTORIZATION, config, data, cudssA, cudssX, cudssB));
+    cuCHECK(cudaDeviceSynchronize());
+    res.factorTime = tdelta(Clock::now() - tFactor).count();
+
+    // Solve (timed)
+    auto tSolve = Clock::now();
+    cudssCHECK(cudssExecute(handle, CUDSS_PHASE_SOLVE, config, data, cudssA, cudssX, cudssB));
+    cuCHECK(cudaDeviceSynchronize());
+    res.solveTime = tdelta(Clock::now() - tSolve).count();
+
+    // Copy solution back and compute residual
+    Eigen::VectorXd x(n);
+    cuCHECK(cudaMemcpy(x.data(), d_x, n * sizeof(double), cudaMemcpyDeviceToHost));
+    res.residual = computeResidualDouble(A, x, b);
+    res.refineSteps = 0;
+    res.perturbCount = 0;
+
+    if (verbose) {
+      cout << "  [cuDSS] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
+           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+           << setprecision(2) << res.residual << endl;
+    }
+
+    // Cleanup
+    cudssMatrixDestroy(cudssA);
+    cudssMatrixDestroy(cudssB);
+    cudssMatrixDestroy(cudssX);
+    cudssDataDestroy(handle, data);
+    cudssConfigDestroy(config);
+    cudssDestroy(handle);
+    cudaFree(d_rowPtr);
+    cudaFree(d_colInd);
+    cudaFree(d_values);
+    cudaFree(d_b);
+    cudaFree(d_x);
+
+    results.push_back(res);
+  }
+
+  return results;
+}
+#endif  // BASPACHO_HAVE_CUDSS
+
+// ============================================================================
 // Convert timing results to BenchRecords
 // ============================================================================
 
@@ -633,6 +765,9 @@ void help() {
 #endif
 #ifdef BASPACHO_USE_CUBLAS
        << "  BaSpaCho_LU_CUDA\n"
+#endif
+#ifdef BASPACHO_HAVE_CUDSS
+       << "  cuDSS_LU\n"
 #endif
        << endl;
 }
@@ -845,6 +980,20 @@ int main(int argc, char* argv[]) {
 
     resultToRecords(problemName, "BaSpaCho_LU_CUDA", timings, allRecords);
     if (!jsonOutput) printResults("BaSpaCho_LU_CUDA", timings);
+  }
+#endif
+
+#ifdef BASPACHO_HAVE_CUDSS
+  if (regex_search(string("cuDSS_LU"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning cuDSS_LU..." << endl;
+    auto timings = benchmarkLUCudss(matrices, verbose);
+
+    if (isWarmup && timings.size() > 1) {
+      timings.erase(timings.begin());
+    }
+
+    resultToRecords(problemName, "cuDSS_LU", timings, allRecords);
+    if (!jsonOutput) printResults("cuDSS_LU", timings);
   }
 #endif
 
