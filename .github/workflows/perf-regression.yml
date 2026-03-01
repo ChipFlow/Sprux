@@ -139,6 +139,72 @@ jobs:
         path: baseline.json
         key: perf-baseline-macOS-ARM64-${{ github.sha }}
 
+    # --- LU Benchmarks ---
+
+    - name: Restore LU baseline
+      id: lu-baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-macOS-ARM64-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-lu-baseline-macOS-ARM64-
+
+    - name: Run LU benchmarks
+      run: |
+        ./build/baspacho/benchmarking/lu_bench -J \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -r test_data/c6288_jacobian/rhs.mtx \
+          -n "$ITERATIONS" > results-lu-metal.json
+        echo "=== LU Results ==="
+        python3 -c "
+        import json
+        with open('results-lu-metal.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare LU with baseline
+      if: steps.lu-baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py lu-baseline.json results-lu-metal.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-lu-metal.json
+
+    - name: LU job summary
+      if: always()
+      run: |
+        if [ -f comparison-lu-metal.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-lu-metal.json \
+            --comparison comparison-lu-metal.json \
+            --title "macOS Metal LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-lu-metal.json \
+            --title "macOS Metal LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload LU results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-lu-macos-metal-${{ github.sha }}
+        path: |
+          results-lu-metal.json
+          comparison-lu-metal.json
+        retention-days: 30
+
+    - name: Save LU baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-lu-metal.json lu-baseline.json
+
+    - name: Save LU baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-macOS-ARM64-${{ github.sha }}
+
   perf-cuda:
     runs-on: [nvidia-runner-1]
     container:
@@ -250,6 +316,72 @@ jobs:
       with:
         path: baseline.json
         key: perf-baseline-Linux-X64-cuda-${{ github.sha }}
+
+    # --- LU Benchmarks ---
+
+    - name: Restore LU baseline
+      id: lu-baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-Linux-X64-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-lu-baseline-Linux-X64-cuda-
+
+    - name: Run LU benchmarks
+      run: |
+        ./build/baspacho/benchmarking/lu_bench -J \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -r test_data/c6288_jacobian/rhs.mtx \
+          -n "$ITERATIONS" -S "CUDA|CPU" > results-lu-cuda.json
+        echo "=== LU Results ==="
+        python3 -c "
+        import json
+        with open('results-lu-cuda.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare LU with baseline
+      if: steps.lu-baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py lu-baseline.json results-lu-cuda.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-lu-cuda.json
+
+    - name: LU job summary
+      if: always()
+      run: |
+        if [ -f comparison-lu-cuda.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-lu-cuda.json \
+            --comparison comparison-lu-cuda.json \
+            --title "CUDA LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-lu-cuda.json \
+            --title "CUDA LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload LU results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-lu-cuda-${{ github.sha }}
+        path: |
+          results-lu-cuda.json
+          comparison-lu-cuda.json
+        retention-days: 30
+
+    - name: Save LU baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-lu-cuda.json lu-baseline.json
+
+    - name: Save LU baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-Linux-X64-cuda-${{ github.sha }}
 
   summary:
     runs-on: ubuntu-latest

@@ -14,6 +14,7 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include "BenchJson.h"
 #include "baspacho/baspacho/DebugMacros.h"
 #include "baspacho/baspacho/Solver.h"
 #include "baspacho/testing/TestingMatGen.h"
@@ -46,13 +47,7 @@ struct SparseProblem {
   vector<int64_t> paramSize;
 };
 
-struct BenchRecord {
-  string problem;
-  string solver;
-  string operation;
-  vector<double> times_sec;
-  double median_sec;
-};
+using BenchRecord = BaSpaCho::BenchRecord;
 
 struct BenchResults {
   double analysisTime;
@@ -845,60 +840,8 @@ void runBenchmarks(const BenchmarkSettings& settings, int seed = 37) {
   }
 }
 
-// Escape a string for JSON output
-static string jsonEscape(const string& s) {
-  string out;
-  for (char c : s) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      default:
-        out += c;
-    }
-  }
-  return out;
-}
-
-void writeJson(ostream& os, const vector<BenchRecord>& records) {
-  os << "{\n";
-  os << "  \"meta\": {\n";
-
-  // Timestamp in ISO 8601
-  auto now = chrono::system_clock::now();
-  auto time_t_now = chrono::system_clock::to_time_t(now);
-  struct tm tm_buf;
-  gmtime_r(&time_t_now, &tm_buf);
-  char timeBuf[64];
-  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
-  os << "    \"timestamp\": \"" << timeBuf << "\"\n";
-
-  os << "  },\n";
-  os << "  \"results\": [\n";
-  for (size_t i = 0; i < records.size(); i++) {
-    const auto& r = records[i];
-    os << "    {\n";
-    os << "      \"problem\": \"" << jsonEscape(r.problem) << "\",\n";
-    os << "      \"solver\": \"" << jsonEscape(r.solver) << "\",\n";
-    os << "      \"operation\": \"" << jsonEscape(r.operation) << "\",\n";
-    os << "      \"times_sec\": [";
-    for (size_t j = 0; j < r.times_sec.size(); j++) {
-      if (j > 0) os << ", ";
-      os << fixed << setprecision(6) << r.times_sec[j];
-    }
-    os << "],\n";
-    os << "      \"median_sec\": " << fixed << setprecision(6) << r.median_sec << "\n";
-    os << "    }" << (i + 1 < records.size() ? "," : "") << "\n";
-  }
-  os << "  ]\n";
-  os << "}\n";
-}
+using BaSpaCho::jsonEscape;
+using BaSpaCho::writeJson;
 
 void help() {
   cout << "This program runs a benchmark of several solver configurations"
