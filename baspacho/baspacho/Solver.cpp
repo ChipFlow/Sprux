@@ -710,7 +710,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
         int64_t chainColBegin = factorSkel.chainColPtr[l];
         int64_t diagOff = factorSkel.chainData[chainColBegin];
         for (int64_t i = 0; i < lumpSize; i++) {
-          ValT absVal = std::abs(data[diagOff + i * lumpSize + i]);
+          ValT absVal = std::abs(numCtx->readValue(data, diagOff + i * lumpSize + i));
           if (absVal > maxDiag) maxDiag = absVal;
         }
       }

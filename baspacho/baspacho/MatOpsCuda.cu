@@ -568,6 +568,12 @@ struct CudaNumericCtx : NumericCtx<T> {
 #endif
   }
 
+  virtual T readValue(const T* data, int64_t offset) override {
+    T val;
+    cuCHECK(cudaMemcpy(&val, data + offset, sizeof(T), cudaMemcpyDeviceToHost));
+    return val;
+  }
+
   virtual void potrf(int64_t n, T* data, int64_t offA) override;
 
   virtual void trsm(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override;

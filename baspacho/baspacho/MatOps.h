@@ -151,6 +151,10 @@ struct NumericCtx : NumericCtxBase {
     throw std::runtime_error("doEliminationLU: LU sparse elimination not supported by this backend");
   }
 
+  // Read a single value from data buffer. Default: direct CPU read.
+  // GPU backends override to copy from device memory.
+  virtual T readValue(const T* data, int64_t offset) { return data[offset]; }
+
   // dense Cholesky on dense row-major matrix A (in place)
   virtual void potrf(int64_t n, T* data, int64_t offA) = 0;
 
