@@ -570,7 +570,7 @@ static vector<LUTimingResult> benchmarkLUCudss(
     cudssMatrix_t cudssA = nullptr;
     cudssCHECK(cudssMatrixCreateCsr(&cudssA, n, n, nnz, d_rowPtr, nullptr, d_colInd, d_values,
                                      CUDA_R_32I, CUDA_R_64F, CUDSS_MTYPE_GENERAL,
-                                     CUDSS_MVIEW_FULL_L2U, CUDSS_BASE_ZERO));
+                                     CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
 
     // RHS and solution vectors on GPU
     double* d_b = nullptr;
