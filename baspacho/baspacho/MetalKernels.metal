@@ -139,6 +139,20 @@ inline void solveUpper_dev(device T* A, int lda, int n, device T* v) {
     }
 }
 
+// In-place solver for U*x = b where U is row-major upper triangular
+// (as stored by getrf: U is upper triangle of the LU-factored diagonal block)
+template <typename T>
+inline void solveUpperRowMajor_dev(device T* A, int lda, int n, device T* v) {
+  for (int i = n - 1; i >= 0; i--) {
+    T x = v[i];
+    device T* row = A + i * lda;
+    for (int j = i + 1; j < n; j++) {
+      x -= row[j] * v[j];
+    }
+    v[i] = x / row[i];
+  }
+}
+
 // ============================================================================
 // Atomic operations for sparse elimination
 // Metal 2.4 lacks native atomic_float, so we use CAS-based emulation
@@ -1331,6 +1345,92 @@ kernel void sparseElim_subDiagMultT_float(
                 v[lumpStart + c + rhs * ldc] -= sum;
             }
         }
+    }
+}
+
+// ============================================================================
+// LU solve kernels: upper triangle gather and diagonal divide
+// ============================================================================
+
+// Backward U solve: gather from upper triangle entries
+// For each lump, computes v[lump] -= U[lump, colSpan] * v[colSpan]
+// One thread per lump.
+kernel void sparseElim_upperGather_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* upperChainRowPtr [[buffer(2)]],
+    constant int64_t* upperChainColSpan [[buffer(3)]],
+    constant int64_t* upperChainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    constant int64_t& upperDataBase [[buffer(11)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t uRowStart = upperChainRowPtr[lump];
+    int64_t uRowEnd = upperChainRowPtr[lump + 1];
+
+    for (int64_t uIdx = uRowStart; uIdx < uRowEnd; uIdx++) {
+        int64_t colSpan = upperChainColSpan[uIdx];
+        int64_t colStart = spanStarts[colSpan];
+        int64_t colSize = spanStarts[colSpan + 1] - colStart;
+        int64_t uDataOffset = upperDataBase + upperChainData[uIdx];
+
+        // U block: lumpSize x colSize, row-major
+        // v[lump] -= U * v[colSpan]
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t r = 0; r < lumpSize; r++) {
+                float sum = 0.0f;
+                for (int64_t c = 0; c < colSize; c++) {
+                    sum += data[uDataOffset + r * colSize + c] * v[colStart + c + rhs * ldc];
+                }
+                v[lumpStart + r + rhs * ldc] -= sum;
+            }
+        }
+    }
+}
+
+// Backward U solve: divide by U diagonal
+// For each lump, computes v[lump] /= U_diagonal
+// One thread per lump.
+kernel void sparseElim_diagDivU_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    device float* data [[buffer(3)]],
+    device float* v [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    constant int64_t& lumpIndexStart [[buffer(7)]],
+    constant int64_t& lumpIndexEnd [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + tid;
+    if (lump >= lumpIndexEnd) {
+        return;
+    }
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+    int64_t colStart = chainColPtr[lump];
+    int64_t diagDataPtr = chainData[colStart];
+
+    device float* diagBlock = data + diagDataPtr;
+
+    // For LU, diagonal block has U in upper triangle (row-major, from getrf)
+    // Solve U * x = b: back-substitution with row-major U
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveUpperRowMajor_dev(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
     }
 }
 

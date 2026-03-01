@@ -802,7 +802,11 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   //   3. Solve U * x = z (backward substitution)
 
   // Step 1: Apply row permutation P: y = P * b
-  for (int64_t l = 0; l < factorSkel.numLumps(); l++) {
+  // Skip sparse-elim lumps when LU sparse elimination is active —
+  // their pivots are identity (1x1 scalar blocks, no pivoting needed)
+  int64_t pivotStartLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
+  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
     int64_t pivotOffset = factorSkel.lumpStart[l];  // Row-based pivot index
@@ -824,7 +828,7 @@ template <typename T>
 void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                      int64_t endSpanIndex, T* vecData, int64_t stride,
                                      int nRHS) const {
-  (void)nRHS;  // Currently not using sparse elimination or fragmented ops for LU
+  (void)nRHS;
   BASPACHO_CHECK_GE(startSpanIndex, 0);
   BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
   BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
@@ -833,8 +837,27 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
-  // LU does not use sparse elimination - go straight to dense ops
-  for (int64_t l = startLump; l < upToLump; l++) {
+  int64_t denseOpsFromLump;
+  if (SparseElimSolve && !luElimCtxs.empty()) {
+    // Use LU sparse elimination solve for the sparse-elim ranges (Metal backend)
+    for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+      if (sparseElimRanges[l + 1] > upToLump) {
+        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        return;
+      } else if (startLump > sparseElimRanges[l]) {
+        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        continue;
+      }
+      slvCtx.sparseElimSolveLUnit(*elimCtxs[l], matData, sparseElimRanges[l],
+                                  sparseElimRanges[l + 1], vecData, stride);
+    }
+    denseOpsFromLump =
+        std::max(startLump, (int64_t)(sparseElimRanges.empty() ? 0 : sparseElimRanges.back()));
+  } else {
+    denseOpsFromLump = startLump;
+  }
+
+  for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
     int64_t chainColBegin = factorSkel.chainColPtr[l];
@@ -877,8 +900,16 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   // Upper triangle data base offset (after lower triangle data)
   int64_t upperDataBase = factorSkel.dataSize();
 
-  // Backward substitution with U (from last lump to first)
-  for (int64_t l = upToLump - 1; l >= startLump; l--) {
+  int64_t denseOpsFromLump;
+  if (SparseElimSolve && !luElimCtxs.empty()) {
+    denseOpsFromLump =
+        std::max(startLump, (int64_t)(sparseElimRanges.empty() ? 0 : sparseElimRanges.back()));
+  } else {
+    denseOpsFromLump = startLump;
+  }
+
+  // Dense backward substitution with U (from last lump down to denseOpsFromLump)
+  for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
     int64_t chainColBegin = factorSkel.chainColPtr[l];
@@ -904,6 +935,21 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
 
     // Solve U * x_l = y_l for diagonal block
     slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+  }
+
+  // Sparse elimination backward U solve (reverse order, like Cholesky Lt)
+  if (SparseElimSolve && !luElimCtxs.empty()) {
+    for (int64_t l = (int64_t)sparseElimRanges.size() - 2; l >= 0; l--) {
+      if (sparseElimRanges[l + 1] > upToLump) {
+        BASPACHO_CHECK_LE(sparseElimRanges[l], upToLump);
+        continue;
+      } else if (sparseElimRanges[l] < startLump) {
+        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        return;
+      }
+      slvCtx.sparseElimSolveU(*elimCtxs[l], matData, sparseElimRanges[l],
+                              sparseElimRanges[l + 1], vecData, stride);
+    }
   }
 }
 

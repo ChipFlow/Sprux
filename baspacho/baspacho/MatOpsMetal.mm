@@ -1540,6 +1540,131 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // LU sparse elimination forward solve: unit L (skip diagonal, just scatter)
+  virtual void sparseElimSolveLUnit(const SymElimCtx& elimData, const float* data,
+                                    int64_t lumpsBegin, int64_t lumpsEnd, float* C,
+                                    int64_t ldc) override {
+    @autoreleasepool {
+      const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
+      BASPACHO_CHECK_NOTNULL(pElim);
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::sparseElimSolveLUnit: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
+
+      int64_t numLumps = lumpsEnd - lumpsBegin;
+      if (numLumps <= 0) return;
+
+      int64_t nRHS64 = nRHS;
+
+      // No diagonal solve for unit L (diagonal is implicitly 1)
+      // Only dispatch below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
+      id<MTLComputePipelineState> subDiagPipeline =
+          getProfiledPipeline("sparseElim_subDiagMult_float");
+
+      dispatchKernel(
+          sym.commandQueue, subDiagPipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                        offset:0
+                       atIndex:2];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:0
+                       atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:4];
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+          },
+          (NSUInteger)numLumps);
+    }
+  }
+
+  // LU sparse elimination backward solve: gather from upper triangle then U diagonal solve
+  virtual void sparseElimSolveU(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
+                                int64_t lumpsEnd, float* C, int64_t ldc) override {
+    @autoreleasepool {
+      const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
+      BASPACHO_CHECK_NOTNULL(pElim);
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::sparseElimSolveU: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
+
+      int64_t numLumps = lumpsEnd - lumpsBegin;
+      if (numLumps <= 0) return;
+
+      int64_t nRHS64 = nRHS;
+      int64_t upperDataBase = sym.skel.dataSize();
+
+      // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
+      id<MTLComputePipelineState> gatherPipeline =
+          getProfiledPipeline("sparseElim_upperGather_float");
+
+      dispatchKernel(
+          sym.commandQueue, gatherPipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                        offset:0
+                       atIndex:2];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                        offset:0
+                       atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                        offset:0
+                       atIndex:4];
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
+          },
+          (NSUInteger)numLumps);
+
+      // Then: diagonal U solve: v[lump] /= U_diagonal
+      id<MTLComputePipelineState> diagPipeline =
+          getProfiledPipeline("sparseElim_diagDivU_float");
+
+      dispatchKernel(
+          sym.commandQueue, diagPipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                        offset:0
+                       atIndex:1];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+          },
+          (NSUInteger)numLumps);
+    }
+  }
+
   virtual void symm(const float* data, int64_t offset, int64_t n, const float* C, int64_t offC,
                     int64_t ldc, float* D, int64_t ldd, float alpha) override {
     @autoreleasepool {

@@ -339,6 +339,31 @@ struct SolveCtx : SolveCtxBase {
   virtual void sparseElimSolveLt(const SymElimCtx& elimData, const T* data, int64_t lumpsBegin,
                                  int64_t lumpsEnd, T* C, int64_t ldc) = 0;
 
+  // LU sparse elimination forward solve: L has unit diagonal (skip diag solve)
+  // Only does below-diagonal scatter: v[rowSpan] -= L[rowSpan, lump] * v[lump]
+  virtual void sparseElimSolveLUnit(const SymElimCtx& elimData, const T* data, int64_t lumpsBegin,
+                                    int64_t lumpsEnd, T* C, int64_t ldc) {
+    (void)elimData;
+    (void)data;
+    (void)lumpsBegin;
+    (void)lumpsEnd;
+    (void)C;
+    (void)ldc;
+    throw std::runtime_error("sparseElimSolveLUnit: LU sparse solve not supported");
+  }
+
+  // LU sparse elimination backward solve: gather from upper triangle then divide by U diagonal
+  virtual void sparseElimSolveU(const SymElimCtx& elimData, const T* data, int64_t lumpsBegin,
+                                int64_t lumpsEnd, T* C, int64_t ldc) {
+    (void)elimData;
+    (void)data;
+    (void)lumpsBegin;
+    (void)lumpsEnd;
+    (void)C;
+    (void)ldc;
+    throw std::runtime_error("sparseElimSolveU: LU sparse solve not supported");
+  }
+
   virtual void symm(const T* data, int64_t offset, int64_t n, const T* C, int64_t offC, int64_t ldc,
                     T* D, int64_t ldd, BaseType<T> alpha) = 0;
 
