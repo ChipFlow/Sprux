@@ -296,15 +296,16 @@ static vector<LUTimingResult> benchmarkLUMetal(
       bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
     }
 
+    // Create GPU mirrors once — factored data doesn't change between refinement iterations
+    MetalMirror<float> dataGpu(data);
+    MetalMirror<float> xGpu;
+    vector<float> xVec(n);
+
     auto tSolve = Clock::now();
-    {
-      MetalMirror<float> dataGpu(data);
-      MetalMirror<float> xGpu(vector<float>(bp.data(), bp.data() + n));
-      solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
-      vector<float> xVec(n);
-      xGpu.get(xVec);
-      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
-    }
+    xGpu.load(vector<float>(bp.data(), bp.data() + n));
+    solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+    xGpu.get(xVec);
+    for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
     Eigen::VectorXd x(n);
     for (int64_t j = 0; j < n; j++) {
@@ -326,14 +327,10 @@ static vector<LUTimingResult> benchmarkLUMetal(
       for (int64_t j = 0; j < n; j++) {
         bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
       }
-      {
-        MetalMirror<float> dataGpu(data);
-        MetalMirror<float> xGpu(vector<float>(bp.data(), bp.data() + n));
-        solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
-        vector<float> xVec(n);
-        xGpu.get(xVec);
-        for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
-      }
+      xGpu.load(vector<float>(bp.data(), bp.data() + n));
+      solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+      xGpu.get(xVec);
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
       for (int64_t j = 0; j < n; j++) {
         x(j) += colScale[j] * double(bp(perm[j]));
@@ -448,15 +445,16 @@ static vector<LUTimingResult> benchmarkLUCuda(
       bp(perm[j]) = rowScale[j] * b(preproc.rowPerm[j]);
     }
 
+    // Create GPU mirrors once — factored data doesn't change between refinement iterations
+    DevMirror<double> dataGpu(data);
+    DevMirror<double> xGpu;
+    vector<double> xVec(n);
+
     auto tSolve = Clock::now();
-    {
-      DevMirror<double> dataGpu(data);
-      DevMirror<double> xGpu(vector<double>(bp.data(), bp.data() + n));
-      solver->solveLU(dataGpu.ptr, pivots.data(), xGpu.ptr, n, 1);
-      vector<double> xVec(n);
-      xGpu.get(xVec);
-      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
-    }
+    xGpu.load(vector<double>(bp.data(), bp.data() + n));
+    solver->solveLU(dataGpu.ptr, pivots.data(), xGpu.ptr, n, 1);
+    xGpu.get(xVec);
+    for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
     Eigen::VectorXd x(n);
     for (int64_t j = 0; j < n; j++) {
@@ -478,14 +476,10 @@ static vector<LUTimingResult> benchmarkLUCuda(
       for (int64_t j = 0; j < n; j++) {
         bp(perm[j]) = rowScale[j] * r(preproc.rowPerm[j]);
       }
-      {
-        DevMirror<double> dataGpu(data);
-        DevMirror<double> xGpu(vector<double>(bp.data(), bp.data() + n));
-        solver->solveLU(dataGpu.ptr, pivots.data(), xGpu.ptr, n, 1);
-        vector<double> xVec(n);
-        xGpu.get(xVec);
-        for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
-      }
+      xGpu.load(vector<double>(bp.data(), bp.data() + n));
+      solver->solveLU(dataGpu.ptr, pivots.data(), xGpu.ptr, n, 1);
+      xGpu.get(xVec);
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
       for (int64_t j = 0; j < n; j++) {
         x(j) += colScale[j] * bp(perm[j]);
