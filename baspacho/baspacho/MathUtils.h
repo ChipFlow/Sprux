@@ -96,4 +96,18 @@ __BASPACHO_HOST_DEVICE__ inline static void solveUpper(const T* A, int lda, int 
   }
 }
 
+// in-place solver for row-major upper triangular U*x = b
+// U is stored row-major with leading dimension lda
+template <typename T>
+__BASPACHO_HOST_DEVICE__ inline static void solveUpperRowMajor(const T* A, int lda, int n, T* v) {
+  for (int i = n - 1; i >= 0; i--) {
+    T x = v[i];
+    const T* row = A + i * lda;
+    for (int j = i + 1; j < n; j++) {
+      x -= row[j] * v[j];
+    }
+    v[i] = x / row[i];
+  }
+}
+
 }  // end namespace BaSpaCho

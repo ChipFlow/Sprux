@@ -73,6 +73,13 @@ struct CudaSymbolicCtx : SymbolicCtx {
     devSpanStart.load(skel.spanStart);
     devSpanToLump.load(skel.spanToLump);
     devPermutation.load(permutation);
+
+    // Upload upper triangle structure for LU factorization
+    if (skel.isGeneral()) {
+      devUpperChainRowPtr.load(skel.upperChainRowPtr);
+      devUpperChainColSpan.load(skel.upperChainColSpan);
+      devUpperChainData.load(skel.upperChainData);
+    }
   }
 
   virtual ~CudaSymbolicCtx() override {
@@ -112,6 +119,29 @@ struct CudaSymbolicCtx : SymbolicCtx {
     return SymElimCtxPtr(elim);
   }
 
+  virtual SymElimCtxPtr prepareLUElimination(int64_t lumpsBegin, int64_t lumpsEnd) override {
+    if (!skel.isGeneral()) return nullptr;
+
+    CudaSymElimCtx* elim = new CudaSymElimCtx;
+
+    vector<int64_t> pairEnum(lumpsEnd - lumpsBegin + 1);
+
+    // For LU: n^2 pairs per lump (L_rows x U_cols) instead of n*(n+1)/2
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t startPtr = skel.chainColPtr[l] + 1;  // skip diag block
+      int64_t endPtr = skel.chainColPtr[l + 1];
+      int64_t n = endPtr - startPtr;
+      pairEnum[l - lumpsBegin] = n * n;
+    }
+    cumSumVec(pairEnum);
+
+    elim->numColumns = lumpsEnd - lumpsBegin;
+    elim->numBlockPairs = pairEnum[pairEnum.size() - 1];
+    elim->makeBlockPairEnumStraight.load(pairEnum);
+
+    return SymElimCtxPtr(elim);
+  }
+
   virtual NumericCtxBase* createNumericCtxForType(type_index tIdx, int64_t tempBufSize,
                                                   int batchSize) override;
 
@@ -134,6 +164,11 @@ struct CudaSymbolicCtx : SymbolicCtx {
   DevMirror<int64_t> devSpanStart;
   DevMirror<int64_t> devSpanToLump;
   DevMirror<int64_t> devPermutation;
+
+  // Upper triangle buffers (for LU factorization)
+  DevMirror<int64_t> devUpperChainRowPtr;
+  DevMirror<int64_t> devUpperChainColSpan;
+  DevMirror<int64_t> devUpperChainData;
 };
 
 // cuda ops implemented using CUBLAS and custom kernels
@@ -474,6 +509,195 @@ __global__ void applyRowPermVecInvKernel(const int64_t* pivots, int64_t n, T* ve
   }
 }
 
+// ============================================================================
+// LU sparse elimination kernels (factor + Schur complement for scalar lumps)
+// ============================================================================
+
+// LU factor: divide below-diagonal by diagonal, with static pivoting.
+// One thread per lump.
+template <typename T>
+__global__ void lu_factor_lumps_kernel(const int64_t* lumpStart, const int64_t* chainColPtr,
+                                       const int64_t* chainData, const int64_t* boardColPtr,
+                                       const int64_t* boardChainColOrd,
+                                       const int64_t* chainRowsTillEnd, T* data,
+                                       int64_t lumpIndexStart, int64_t lumpIndexEnd,
+                                       T staticPivotThreshold, int64_t* perturbCount) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t lump = lumpIndexStart + i;
+  if (lump >= lumpIndexEnd) return;
+
+  int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
+  int64_t colStart = chainColPtr[lump];
+  int64_t dataPtr = chainData[colStart];
+
+  // Read diagonal value
+  T* diagPtr = data + dataPtr;
+  T diag = *diagPtr;
+
+  // Static pivoting: perturb near-zero or non-finite diagonals
+  if (staticPivotThreshold >= T(0)) {
+    T absVal = (diag >= T(0)) ? diag : -diag;
+    if (isnan(diag) || isinf(diag) || absVal < staticPivotThreshold) {
+      diag = (diag >= T(0) && !isnan(diag)) ? staticPivotThreshold : -staticPivotThreshold;
+      *diagPtr = diag;
+      atomicAdd(reinterpret_cast<unsigned long long*>(perturbCount), 1ULL);
+    }
+  }
+
+  // Divide below-diagonal entries by diagonal to get L column
+  int64_t gatheredStart = boardColPtr[lump];
+  int64_t gatheredEnd = boardColPtr[lump + 1];
+  int64_t rowDataStart = boardChainColOrd[gatheredStart + 1];
+  int64_t rowDataEnd = boardChainColOrd[gatheredEnd - 1];
+  int64_t belowDiagStart = chainData[colStart + rowDataStart];
+  int64_t numRows =
+      chainRowsTillEnd[colStart + rowDataEnd - 1] - chainRowsTillEnd[colStart + rowDataStart - 1];
+
+  T* belowDiagPtr = data + belowDiagStart;
+  T invDiag = T(1) / diag;
+  for (int64_t r = 0; r < numRows * lumpSize; r++) {
+    belowDiagPtr[r] *= invDiag;
+  }
+}
+
+// LU Schur complement: target -= L[a,k] * U[k,b]
+// One thread per (L_row, U_col) pair. n^2 pairs per lump.
+template <typename T>
+__global__ void lu_sparse_elim_kernel(
+    const int64_t* chainColPtr, const int64_t* lumpStart, const int64_t* chainRowSpan,
+    const int64_t* spanStart, const int64_t* chainData, const int64_t* spanToLump,
+    const int64_t* spanOffsetInLump, T* data, int64_t lumpIndexStart, int64_t lumpIndexEnd,
+    const int64_t* blockPairEnum, int64_t numBlockPairs, const int64_t* upperChainRowPtr,
+    const int64_t* upperChainColSpan, const int64_t* upperChainData, int64_t upperDataBase) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= numBlockPairs) return;
+
+  // Find which lump this pair belongs to
+  int64_t pos = bisect(blockPairEnum, lumpIndexEnd - lumpIndexStart, (int64_t)i);
+  int64_t l = lumpIndexStart + pos;
+
+  // Number of below-diagonal chain entries
+  int64_t colStart = chainColPtr[l] + 1;  // skip diagonal
+  int64_t colEnd = chainColPtr[l + 1];
+  int64_t n = colEnd - colStart;
+
+  // Map linear pair index to (row_idx, col_idx) in [0,n) x [0,n)
+  int64_t localPair = (int64_t)i - blockPairEnum[pos];
+  int64_t row_idx = localPair / n;
+  int64_t col_idx = localPair % n;
+
+  // Get spans for this pair
+  int64_t aSpan = chainRowSpan[colStart + row_idx];  // row (L entry)
+  int64_t bSpan = chainRowSpan[colStart + col_idx];  // col (U entry)
+
+  // L value from lower chain
+  T L_val = data[chainData[colStart + row_idx]];
+
+  // U value from upper chain
+  int64_t uRowStart = upperChainRowPtr[l];
+  T U_val = data[upperDataBase + upperChainData[uRowStart + col_idx]];
+
+  T product = L_val * U_val;
+
+  if (aSpan >= bSpan) {
+    // Target in lower triangle at (row=aSpan, col=bSpan)
+    int64_t bLump = spanToLump[bSpan];
+    int64_t bSpanOff = spanOffsetInLump[bSpan];
+    int64_t targetStartPtr = chainColPtr[bLump];
+    int64_t targetEndPtr = chainColPtr[bLump + 1];
+    int64_t targetPos = bisect(chainRowSpan + targetStartPtr, targetEndPtr - targetStartPtr, aSpan);
+    int64_t targetDataPtr = chainData[targetStartPtr + targetPos];
+
+    atomicAdd(data + targetDataPtr + bSpanOff, -product);
+  } else {
+    // Target in upper triangle at (row=aSpan, col=bSpan)
+    int64_t aLump = spanToLump[aSpan];
+    int64_t targetURowStart = upperChainRowPtr[aLump];
+    int64_t targetURowEnd = upperChainRowPtr[aLump + 1];
+    int64_t targetPos = bisect(upperChainColSpan + targetURowStart,
+                               targetURowEnd - targetURowStart, bSpan);
+    int64_t targetDataPtr = upperDataBase + upperChainData[targetURowStart + targetPos];
+
+    atomicAdd(data + targetDataPtr, -product);
+  }
+}
+
+// ============================================================================
+// LU sparse elimination solve kernels
+// ============================================================================
+
+// Backward U solve: gather from upper triangle entries
+// For each lump, computes v[lump] -= U[lump, colSpan] * v[colSpan]
+template <typename TT, typename B>
+__global__ void sparseElim_upperGather(const int64_t* lumpStarts, const int64_t* spanStarts,
+                                       const int64_t* upperChainRowPtr,
+                                       const int64_t* upperChainColSpan,
+                                       const int64_t* upperChainData, const TT* dataB, TT* vB,
+                                       int64_t ldc, int64_t nRHS, int64_t lumpIndexStart,
+                                       int64_t lumpIndexEnd, int64_t upperDataBase, B batch) {
+  if (!batch.verify()) return;
+  using T = remove_cv_t<remove_reference_t<decltype(batch.get(dataB)[0])>>;
+  const T* data = batch.get(dataB);
+  T* v = batch.get(vB);
+
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t lump = lumpIndexStart + i;
+  if (lump >= lumpIndexEnd) return;
+
+  int64_t lumpStart = lumpStarts[lump];
+  int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+  int64_t uRowStart = upperChainRowPtr[lump];
+  int64_t uRowEnd = upperChainRowPtr[lump + 1];
+
+  for (int64_t uIdx = uRowStart; uIdx < uRowEnd; uIdx++) {
+    int64_t colSpan = upperChainColSpan[uIdx];
+    int64_t colStart = spanStarts[colSpan];
+    int64_t colSize = spanStarts[colSpan + 1] - colStart;
+    int64_t uDataOffset = upperDataBase + upperChainData[uIdx];
+
+    // U block: lumpSize x colSize, row-major
+    // v[lump] -= U * v[colSpan]
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+      for (int64_t r = 0; r < lumpSize; r++) {
+        T sum = T(0);
+        for (int64_t c = 0; c < colSize; c++) {
+          sum += data[uDataOffset + r * colSize + c] * v[colStart + c + rhs * ldc];
+        }
+        v[lumpStart + r + rhs * ldc] -= sum;
+      }
+    }
+  }
+}
+
+// Backward U solve: divide by U diagonal (row-major upper triangular)
+template <typename TT, typename B>
+__global__ void sparseElim_diagDivU(const int64_t* lumpStarts, const int64_t* chainColPtr,
+                                    const int64_t* chainData, const TT* dataB, TT* vB,
+                                    int64_t ldc, int64_t nRHS, int64_t lumpIndexStart,
+                                    int64_t lumpIndexEnd, B batch) {
+  if (!batch.verify()) return;
+  using T = remove_cv_t<remove_reference_t<decltype(batch.get(dataB)[0])>>;
+  const T* data = batch.get(dataB);
+  T* v = batch.get(vB);
+
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t lump = lumpIndexStart + i;
+  if (lump >= lumpIndexEnd) return;
+
+  int64_t lumpStart = lumpStarts[lump];
+  int64_t lumpSize = lumpStarts[lump + 1] - lumpStart;
+  int64_t colStart = chainColPtr[lump];
+  int64_t diagDataPtr = chainData[colStart];
+
+  const T* diagBlock = data + diagDataPtr;
+
+  // For LU, diagonal block has U in upper triangle (row-major, from getrf)
+  // Solve U * x = b: back-substitution with row-major U
+  for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+    solveUpperRowMajor(diagBlock, (int)lumpSize, (int)lumpSize, v + lumpStart + ldc * rhs);
+  }
+}
+
 template <typename TT, typename B>
 __global__ void assemble_kernel(int64_t numBlockRows, int64_t numBlockCols, int64_t rectRowBegin,
                                 int64_t srcRectWidth, int64_t dstStride,
@@ -609,6 +833,49 @@ struct CudaNumericCtx : NumericCtx<T> {
     int64_t count = 0;
     cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
     return count;
+  }
+
+  virtual void doEliminationLU(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
+                               int64_t lumpsEnd, T staticPivotThreshold,
+                               int64_t& perturbCount) override {
+    const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
+    BASPACHO_CHECK_NOTNULL(pElim);
+    const CudaSymElimCtx& elim = *pElim;
+
+    int64_t numLumps = lumpsEnd - lumpsBegin;
+    if (numLumps <= 0) return;
+
+    // Allocate GPU counter for perturbations
+    devPerturbCount.resizeToAtLeast(1);
+    cuCHECK(cudaMemset(devPerturbCount.ptr, 0, sizeof(int64_t)));
+
+    // Step 1: LU factor lumps (divide below-diag by diagonal)
+    {
+      int wgs = 32;
+      int numGroups = (numLumps + wgs - 1) / wgs;
+      lu_factor_lumps_kernel<T><<<numGroups, wgs>>>(
+          sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr, sym.devBoardColPtr.ptr,
+          sym.devBoardChainColOrd.ptr, sym.devChainRowsTillEnd.ptr, data, lumpsBegin, lumpsEnd,
+          staticPivotThreshold, devPerturbCount.ptr);
+    }
+
+    // Step 2: LU Schur complement (L*U updates to both triangles)
+    if (elim.numBlockPairs > 0) {
+      int64_t upperDataBase = sym.skel.dataSize();
+      int wgs = 32;
+      int numGroups = (elim.numBlockPairs + wgs - 1) / wgs;
+      lu_sparse_elim_kernel<T><<<numGroups, wgs>>>(
+          sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr,
+          sym.devSpanStart.ptr, sym.devChainData.ptr, sym.devSpanToLump.ptr,
+          sym.devSpanOffsetInLump.ptr, data, lumpsBegin, lumpsEnd,
+          elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, sym.devUpperChainRowPtr.ptr,
+          sym.devUpperChainColSpan.ptr, sym.devUpperChainData.ptr, upperDataBase);
+    }
+
+    // Read back perturb count
+    int64_t count = 0;
+    cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    perturbCount = count;
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
@@ -1378,6 +1645,46 @@ struct CudaSolveCtx : SolveCtx<T> {
     sparseElim_diagSolveLt<T><<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
                                                   sym.devChainData.ptr, data, C, ldc, nRHS,
                                                   lumpsBegin, lumpsEnd, Plain{});
+  }
+
+  // LU sparse elimination forward solve: unit L (skip diagonal, just scatter)
+  virtual void sparseElimSolveLUnit(const SymElimCtx& /*elimData*/, const T* data,
+                                    int64_t lumpsBegin, int64_t lumpsEnd, T* C,
+                                    int64_t ldc) override {
+    int64_t numLumps = lumpsEnd - lumpsBegin;
+    if (numLumps <= 0) return;
+
+    int wgs = 32;
+    int numGroups = (numLumps + wgs - 1) / wgs;
+
+    // No diagonal solve for unit L (diagonal is implicitly 1)
+    // Only dispatch below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
+    sparseElim_subDiagMult<T><<<numGroups, wgs>>>(
+        sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
+        sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin, lumpsEnd, Plain{});
+  }
+
+  // LU sparse elimination backward solve: gather from upper triangle then U diagonal solve
+  virtual void sparseElimSolveU(const SymElimCtx& /*elimData*/, const T* data, int64_t lumpsBegin,
+                                int64_t lumpsEnd, T* C, int64_t ldc) override {
+    int64_t numLumps = lumpsEnd - lumpsBegin;
+    if (numLumps <= 0) return;
+
+    int wgs = 32;
+    int numGroups = (numLumps + wgs - 1) / wgs;
+
+    int64_t upperDataBase = sym.skel.dataSize();
+
+    // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
+    sparseElim_upperGather<T><<<numGroups, wgs>>>(
+        sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devUpperChainRowPtr.ptr,
+        sym.devUpperChainColSpan.ptr, sym.devUpperChainData.ptr, data, C, ldc, nRHS, lumpsBegin,
+        lumpsEnd, upperDataBase, Plain{});
+
+    // Then: diagonal U solve: v[lump] /= U_diagonal (row-major)
+    sparseElim_diagDivU<T><<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
+                                               sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin,
+                                               lumpsEnd, Plain{});
   }
 
   virtual void symm(const T* data, int64_t offset, int64_t n, const T* C, int64_t offC, int64_t ldc,
