@@ -1399,7 +1399,73 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     tempVecBuffer.resizeToAtLeast(sym.skel.order() * nRHS);
   }
 
-  virtual ~MetalSolveCtx() override {}
+  virtual ~MetalSolveCtx() override {
+    // Flush any pending GPU work before destruction
+    commitAndWait();
+  }
+
+  // Encode a kernel dispatch onto a persistent compute encoder within the
+  // pending command buffer. Uses a single encoder for all dispatches with
+  // memory barriers between them to ensure correct data ordering.
+  void encodeKernel(id<MTLComputePipelineState> pipeline,
+                    void (^encodeBlock)(id<MTLComputeCommandEncoder>),
+                    NSUInteger numThreads) {
+    @autoreleasepool {
+      if (!pendingCmdBuf_) {
+        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+      }
+      if (!pendingEncoder_) {
+        pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
+        pendingDispatchCount_ = 0;
+      }
+
+      // Insert memory barrier so previous dispatches' buffer writes are visible
+      if (pendingDispatchCount_ > 0) {
+        [pendingEncoder_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      }
+
+      [pendingEncoder_ setComputePipelineState:pipeline];
+      encodeBlock(pendingEncoder_);
+
+      NSUInteger threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
+      threadGroupSize = MIN(threadGroupSize, numThreads);
+
+      MTLSize threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+      MTLSize numGroups =
+          MTLSizeMake((numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
+
+      [pendingEncoder_ dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+      pendingDispatchCount_++;
+    }
+  }
+
+  // Commit the pending command buffer WITHOUT waiting for GPU completion.
+  void commitPending() {
+    if (pendingCmdBuf_) {
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      [pendingCmdBuf_ commit];
+      lastCommittedCmdBuf_ = pendingCmdBuf_;
+      pendingCmdBuf_ = nil;
+      pendingDispatchCount_ = 0;
+    }
+  }
+
+  // Wait for the most recently committed command buffer to complete.
+  void waitForGpu() {
+    if (lastCommittedCmdBuf_) {
+      [lastCommittedCmdBuf_ waitUntilCompleted];
+      lastCommittedCmdBuf_ = nil;
+    }
+  }
+
+  // Commit the pending command buffer and wait for all GPU work to complete.
+  void commitAndWait() {
+    commitPending();
+    waitForGpu();
+  }
 
   virtual void sparseElimSolveL(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {
@@ -1421,13 +1487,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t numLumps = lumpsEnd - lumpsBegin;
       if (numLumps <= 0) return;
 
-      // Dispatch diagonal solve kernel
+      // Encode diagonal solve kernel
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "sparseElim_diagSolveL_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -1443,12 +1509,12 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           },
           (NSUInteger)numLumps);
 
-      // Dispatch below-diagonal multiply: matQ -= block * matC
+      // Encode below-diagonal multiply: matQ -= block * matC
       id<MTLComputePipelineState> subDiagPipeline = getProfiledPipeline(
               "sparseElim_subDiagMult_float");
 
-      dispatchKernel(
-          sym.commandQueue, subDiagPipeline,
+      encodeKernel(
+          subDiagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
@@ -1492,12 +1558,12 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       int64_t nRHS64 = nRHS;
 
-      // Dispatch below-diagonal transpose multiply first: matC -= block^T * matQ
+      // Encode below-diagonal transpose multiply first: matC -= block^T * matQ
       id<MTLComputePipelineState> subDiagPipeline = getProfiledPipeline(
               "sparseElim_subDiagMultT_float");
 
-      dispatchKernel(
-          sym.commandQueue, subDiagPipeline,
+      encodeKernel(
+          subDiagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
@@ -1517,12 +1583,12 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           },
           (NSUInteger)numLumps);
 
-      // Then dispatch diagonal solve kernel
+      // Then encode diagonal solve kernel
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "sparseElim_diagSolveLt_float");
 
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -1564,12 +1630,12 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t nRHS64 = nRHS;
 
       // No diagonal solve for unit L (diagonal is implicitly 1)
-      // Only dispatch below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
+      // Only encode below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
       id<MTLComputePipelineState> subDiagPipeline =
           getProfiledPipeline("sparseElim_subDiagMult_float");
 
-      dispatchKernel(
-          sym.commandQueue, subDiagPipeline,
+      encodeKernel(
+          subDiagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
@@ -1618,8 +1684,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLComputePipelineState> gatherPipeline =
           getProfiledPipeline("sparseElim_upperGather_float");
 
-      dispatchKernel(
-          sym.commandQueue, gatherPipeline,
+      encodeKernel(
+          gatherPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
@@ -1646,8 +1712,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLComputePipelineState> diagPipeline =
           getProfiledPipeline("sparseElim_diagDivU_float");
 
-      dispatchKernel(
-          sym.commandQueue, diagPipeline,
+      encodeKernel(
+          diagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
@@ -1669,6 +1735,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                     int64_t ldc, float* D, int64_t ldd, float alpha) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
+      commitAndWait();  // Flush GPU work before CPU reads shared buffers
 
       // Use row-major for data buffer (matches CpuBaseSolveCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -1691,6 +1758,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                       int64_t ldc) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
+      commitAndWait();  // Flush GPU work before CPU reads shared buffers
 
       // Use row-major for data buffer (matches CpuBaseSolveCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -1709,6 +1777,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                     int64_t offA, int64_t lda, float alpha) override {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
+      commitAndWait();  // Flush GPU work before CPU reads shared buffers
 
       // Use row-major for data buffer (matches CpuBaseSolveCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -1745,8 +1814,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)
@@ -1770,6 +1839,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                        int64_t ldc) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
+      commitAndWait();  // Flush GPU work before CPU reads shared buffers
 
       // Use row-major for data buffer (matches CpuBaseSolveCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -1788,6 +1858,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                      int64_t offA, int64_t lda, float alpha) override {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
+      commitAndWait();  // Flush GPU work before CPU reads shared buffers
 
       // Use row-major for data buffer (matches CpuBaseSolveCtx)
       using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -1823,8 +1894,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
                         offset:chainColPtr * sizeof(int64_t)
@@ -1866,8 +1937,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "lu_solveLUnit_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
             [encoder setBytes:&offM length:sizeof(int64_t) atIndex:1];
@@ -1901,8 +1972,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "lu_solveU_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
             [encoder setBytes:&offM length:sizeof(int64_t) atIndex:1];
@@ -1922,6 +1993,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
+      // Must flush pending GPU work before overwriting devPivots (shared buffer)
+      commitAndWait();
+
       // Copy pivots to GPU buffer
       devPivots.resizeToAtLeast(n);
       memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
@@ -1937,8 +2011,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "lu_applyRowPermVec_kernel_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
@@ -1946,7 +2020,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
           },
-          1);  // Must sync because devPivots reused across calls
+          1);
     }
   }
 
@@ -1955,6 +2029,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                    int64_t ldVec) override {
     @autoreleasepool {
       if (n <= 0) return;
+
+      // Must flush pending GPU work before overwriting devPivots (shared buffer)
+      commitAndWait();
 
       // Copy pivots to GPU buffer
       devPivots.resizeToAtLeast(n);
@@ -1971,8 +2048,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "lu_applyRowPermVecInv_kernel_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
@@ -1980,7 +2057,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:4];
           },
-          1);  // Must sync because devPivots reused across calls
+          1);
     }
   }
 
@@ -2005,8 +2082,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
               "lu_gemvDirect_kernel_float");
 
       int64_t nRHS64 = nRHS;
-      dispatchKernel(
-          sym.commandQueue, pipeline,
+      encodeKernel(
+          pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
             [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
@@ -2023,12 +2100,18 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
-  void flush() override { MetalContext::instance().synchronize(); }
+  void flush() override { commitAndWait(); }
 
   MetalSymbolicCtx& sym;
   int nRHS;
   MetalMirror<float> tempVecBuffer;
   MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
+
+  // Deferred sync state — batch multiple GPU dispatches into shared command buffers
+  id<MTLCommandBuffer> pendingCmdBuf_ = nil;
+  id<MTLComputeCommandEncoder> pendingEncoder_ = nil;
+  int pendingDispatchCount_ = 0;
+  id<MTLCommandBuffer> lastCommittedCmdBuf_ = nil;
 };
 
 // Batched numeric context for float
