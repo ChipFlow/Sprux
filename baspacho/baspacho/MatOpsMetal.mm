@@ -282,6 +282,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       : sym(sym_), numSpans_(numSpans), spanToChainOffset(numSpans) {
     tempBuffer.resizeToAtLeast(tempBufSize);
     devSpanToChainOffset.resizeToAtLeast(numSpans);
+    // Pre-allocate GPU pivot buffer for all rows (avoids reallocation during factorization)
+    if (sym.skel.isGeneral()) {
+      devAllPivots.resizeToAtLeast(sym.skel.order());
+    }
   }
 
   virtual ~MetalNumericCtx() override {
@@ -351,6 +355,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       lastCommittedCmdBuf_ = nil;
     }
     checkDeferredPotrfStatus();
+    flushDeferredState();
   }
 
   // Check deferred potrf status after GPU work has completed.
@@ -361,6 +366,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         fprintf(stderr, "Metal potrf: MPS Cholesky failed (status=%d)\n", (int)status);
       }
       potrfStatusPending_ = false;
+    }
+  }
+
+  // Flush deferred GPU state back to CPU after GPU work has completed.
+  // Copies all GPU-resident pivots back to the CPU pivot array.
+  void flushDeferredState() {
+    if (pivotsOnGpu_ && allPivotsCpuBase_ && allPivotsCount_ > 0) {
+      memcpy(allPivotsCpuBase_, devAllPivots.ptr(), allPivotsCount_ * sizeof(int64_t));
+      pivotsOnGpu_ = false;
     }
   }
 
@@ -1062,19 +1076,51 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  // Static pivoting: scan and perturb small diagonals on CPU.
-  // Metal uses shared memory, so GPU data is directly CPU-accessible after waitForGpu().
+  // Static pivoting: scan and perturb small diagonals on GPU.
+  // Uses a single shared atomic counter that accumulates across all lumps,
+  // zeroed once at first call. Total read back at flush() time.
   virtual int64_t perturbSmallDiagonals(int64_t n, float* data, int64_t offset, int64_t stride,
                                         float threshold) override {
-    int64_t count = 0;
-    for (int64_t i = 0; i < n; i++) {
-      float& diag = data[offset + i * stride + i];
-      if (!std::isfinite(diag) || std::abs(diag) < threshold) {
-        diag = (diag >= 0.0f) ? threshold : -threshold;
-        count++;
+    @autoreleasepool {
+      if (n <= 0) return 0;
+
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error(
+            "MetalNumericCtx<float>::perturbSmallDiagonals: data buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      // Allocate perturb count buffer on first call, zero it once.
+      // All subsequent perturbDiag kernels atomically add to it.
+      if (!perturbCountBuf_) {
+        perturbCountBuf_ = [sym.device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+        *(uint32_t*)[perturbCountBuf_ contents] = 0;
+        perturbCountPending_ = true;
+      }
+
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "lu_perturbDiag_kernel_float");
+
+      // Adjust offset to be relative to the MTLBuffer start
+      int64_t absOffset = (int64_t)(dataBaseOffset / sizeof(float)) + offset;
+
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:0 atIndex:0];
+            [encoder setBytes:&absOffset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&threshold length:sizeof(float) atIndex:4];
+            [encoder setBuffer:perturbCountBuf_ offset:0 atIndex:5];
+          },
+          (NSUInteger)n);
+
+      return 0;  // Actual count read back in deferredPerturbCount() after flush
     }
-    return count;
   }
 
   // ============ LU factorization methods ============
@@ -1093,11 +1139,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
+      // Ensure devPivots is large enough for this lump's pivots
+      devPivots.resizeToAtLeast(minMN);
+
       // Profiling fallback: use sync dispatch for per-kernel GPU timestamps
       if (metalProfilingEnabled()) {
         id<MTLComputePipelineState> pipeline = getProfiledPipeline(
                 "lu_getrf_kernel_float");
-        devPivots.resizeToAtLeast(minMN);
         dispatchKernel(
             sym.commandQueue, pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1153,14 +1201,43 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           sourceMatrix:mpsA resultMatrix:mpsA
           pivotIndices:mpsPiv status:nil];
 
-      // Commit and wait — need CPU-visible data for pivot conversion below
-      commitPending();
-      waitForGpu();
+      // GPU-resident pivot path: for general (LU) matrices with pre-allocated
+      // devAllPivots, encode a GPU-side uint32→int64 conversion kernel and
+      // keep pivots on GPU. For non-general matrices (e.g. simple LU tests),
+      // fall back to CPU conversion with commitAndWait.
+      if (devAllPivots.buffer()) {
+        // Compute offset into the persistent all-pivots buffer.
+        if (!allPivotsCpuBase_) {
+          allPivotsCpuBase_ = pivots;  // First getrf call — record base
+        }
+        int64_t pivotOffset = pivots - allPivotsCpuBase_;
+        allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
 
-      // Convert MPS uint32_t pivots → int64_t (MPS is 0-based, same as BaSpaCho)
-      uint32_t* mpsPivots = devPivotBuf32.ptr();
-      for (int64_t i = 0; i < minMN; i++) {
-        pivots[i] = static_cast<int64_t>(mpsPivots[i]);
+        // Encode GPU-side pivot conversion (uint32→int64) into the same cmd buffer.
+        int64_t pivotByteOffset = pivotOffset * sizeof(int64_t);
+        id<MTLComputePipelineState> convertPipeline = getProfiledPipeline(
+                "lu_convertPivots_kernel_float");
+        encodeKernel(
+            convertPipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
+                          offset:0 atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
+                          offset:pivotByteOffset atIndex:1];
+              [encoder setBytes:&minMN length:sizeof(int64_t) atIndex:2];
+            },
+            (NSUInteger)minMN);
+
+        // Mark pivots as GPU-resident — applyRowPerm will skip memcpy.
+        pivotsOnGpu_ = true;
+      } else {
+        // Fallback: non-general matrix, commit and read pivots on CPU
+        commitPending();
+        waitForGpu();
+        uint32_t* mpsPivots = devPivotBuf32.ptr();
+        for (int64_t i = 0; i < minMN; i++) {
+          pivots[i] = static_cast<int64_t>(mpsPivots[i]);
+        }
       }
 
       return 0;
@@ -1357,11 +1434,21 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getProfiledPipeline(
               "lu_applyRowPerm_kernel_float");
 
-      // Copy pivots to GPU buffer (shared memory, safe: all applyRowPerm calls
-      // within a lump use the same pivot data, and GPU hasn't started reading
-      // until the next commit in getrf's MPS path)
-      devPivots.resizeToAtLeast(n);
-      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+      // Determine pivot buffer and offset.
+      // If pivots are GPU-resident (from getrf deferred path), use devAllPivots
+      // at the correct offset. Otherwise, copy from CPU to devPivots.
+      id<MTLBuffer> pivotBuffer;
+      size_t pivotByteOffset = 0;
+      if (pivotsOnGpu_ && allPivotsCpuBase_) {
+        int64_t pivotElemOffset = pivots - allPivotsCpuBase_;
+        pivotBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
+        pivotByteOffset = pivotElemOffset * sizeof(int64_t);
+      } else {
+        devPivots.resizeToAtLeast(n);
+        memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+        pivotByteOffset = 0;
+      }
 
       // Dispatch as single threadgroup with min(256, numCols) threads
       // (threadgroup_barrier in kernel requires single threadgroup)
@@ -1371,7 +1458,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         dispatchKernel(
             sym.commandQueue, pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+              [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:0];
               [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
               [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
               [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
@@ -1385,7 +1472,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
             [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
             [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
@@ -1402,7 +1489,22 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     cachedDataBuffer_ = nil;
     cachedDataBaseOffset_ = 0;
     gemmWorkBufInFlight_ = false;
+    // Reset pivot state for next factorization
+    allPivotsCpuBase_ = nullptr;
+    allPivotsCount_ = 0;
     MetalContext::instance().synchronize();
+  }
+
+  int64_t deferredPerturbCount() override {
+    // Read the accumulated GPU atomic counter (valid after flush/commitAndWait)
+    int64_t count = 0;
+    if (perturbCountPending_ && perturbCountBuf_) {
+      count = *(uint32_t*)[perturbCountBuf_ contents];
+      perturbCountPending_ = false;
+      // Reset buffer for next factorization
+      *(uint32_t*)[perturbCountBuf_ contents] = 0;
+    }
+    return count;
   }
 
   MetalSymbolicCtx& sym;
@@ -1410,10 +1512,22 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   MetalMirror<float> tempBuffer;
   MetalMirror<int64_t> devSpanToChainOffset;
   std::vector<int64_t> spanToChainOffset;
-  MetalMirror<int64_t> devPivots;        // GPU buffer for LU pivots (profiling path)
+  MetalMirror<int64_t> devPivots;        // GPU buffer for LU pivots
   MetalMirror<uint32_t> devPivotBuf32;  // GPU buffer for MPS LU pivot output (uint32_t format)
   id<MTLBuffer> potrfStatusBuf_ = nil;  // Cached status buffer for MPS Cholesky
   bool assembleWasCalled_ = false;      // Track whether assemble() was called
+
+  // GPU-resident pivot state: after getrf, pivots live in devAllPivots on GPU
+  // at the correct offset for each lump. applyRowPerm reads from devPivots
+  // (a view into devAllPivots). CPU copy deferred to flush().
+  bool pivotsOnGpu_ = false;           // True if devPivots has valid GPU-side pivots
+  MetalMirror<int64_t> devAllPivots;   // Full pivot buffer for all lumps
+  int64_t* allPivotsCpuBase_ = nullptr;  // CPU pivot array base (for deferred copy)
+  int64_t allPivotsCount_ = 0;        // Total pivot count (for deferred copy)
+
+  // GPU-resident perturbSmallDiagonals state
+  id<MTLBuffer> perturbCountBuf_ = nil;  // Atomic counter for perturbed diagonals (accumulates)
+  bool perturbCountPending_ = false;     // True if perturbCountBuf_ has unread count
 
   // Batched saveGemm state
   std::vector<LUGemmWorkItem> pendingGemms_;   // CPU-side work item accumulator

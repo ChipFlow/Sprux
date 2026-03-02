@@ -57,6 +57,9 @@ struct NumericCtxBase {
   virtual ~NumericCtxBase() {}
   // Flush pending GPU operations (no-op for CPU backends)
   virtual void flush() {}
+  // Get count of deferred perturbSmallDiagonals perturbations (GPU backends
+  // defer the count to avoid per-lump CPU sync). Returns 0 for CPU backends.
+  virtual int64_t deferredPerturbCount() { return 0; }
 };
 
 struct SolveCtxBase {

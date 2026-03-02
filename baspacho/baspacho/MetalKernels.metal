@@ -1206,6 +1206,39 @@ kernel void lu_getrf_kernel_float(
     lu_factor(A, int(n), int(minMN), pivots);
 }
 
+// Convert MPS uint32_t pivots to int64_t (MPS outputs 0-based uint32, BaSpaCho uses int64)
+kernel void lu_convertPivots_kernel_float(
+    device const uint32_t* src [[buffer(0)]],
+    device int64_t* dst [[buffer(1)]],
+    constant int64_t& count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid < uint(count)) {
+        dst[tid] = int64_t(src[tid]);
+    }
+}
+
+// GPU-side perturbSmallDiagonals: scan diagonal elements after getrf and perturb
+// near-zero or non-finite values. Data is row-major with stride 'stride'.
+// perturbCount is an atomic counter incremented for each perturbed diagonal.
+kernel void lu_perturbDiag_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offset [[buffer(1)]],
+    constant int64_t& stride [[buffer(2)]],
+    constant int64_t& n [[buffer(3)]],
+    constant float& threshold [[buffer(4)]],
+    device atomic_uint* perturbCount [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(n)) return;
+    int64_t idx = offset + int64_t(tid) * stride + int64_t(tid);
+    float diag = data[idx];
+    if (!isfinite(diag) || abs(diag) < threshold) {
+        data[idx] = (diag >= 0.0f) ? threshold : -threshold;
+        atomic_fetch_add_explicit(perturbCount, 1u, memory_order_relaxed);
+    }
+}
+
 // ============================================================================
 // Direct-offset LU solve kernels (for per-lump calls with explicit offsets)
 // ============================================================================

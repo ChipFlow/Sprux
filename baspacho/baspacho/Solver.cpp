@@ -784,6 +784,9 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   }
 
   numCtx->flush();
+  // Collect deferred perturb count from GPU backends (Metal defers perturbSmallDiagonals
+  // to GPU kernel, returning 0 inline and accumulating count on device).
+  staticPivotPerturbCount_ += numCtx->deferredPerturbCount();
 }
 
 template <typename T>
