@@ -10,7 +10,6 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include <cerrno>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -23,12 +22,13 @@
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Utils.h"
+#ifdef BASPACHO_USE_BLAS
+#include "baspacho/baspacho/BlasDefs.h"
+#endif
 
 namespace BaSpaCho {
 
 using namespace std;
-using hrc = chrono::high_resolution_clock;
-using tdelta = chrono::duration<double>;
 
 // Read an MPS operation threshold from an environment variable, returning
 // defaultVal if the variable is unset or not a valid non-negative integer.
@@ -677,11 +677,17 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
+      // Three-tier threshold for Cholesky factorization:
+      // - n < kMinN: CPU Eigen (tiny matrices, MPS dispatch overhead dominates)
+      // - n > kMaxN: CPU BLAS (large matrices, multi-threaded BLAS >> MPS)
+      // - otherwise: MPS Cholesky (GPU acceleration for medium matrices)
       static const int64_t kMpsPotrfMinN =
-          getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 32);
+          getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 4);
+      static const int64_t kMpsPotrfMaxN =
+          getMpsThreshold("BASPACHO_MPS_POTRF_MAX_N", 128);
 
       if (n < kMpsPotrfMinN) {
-        // Small matrix — CPU Eigen is faster than MPS dispatch overhead
+        // Very small matrix (1-3) — MPS dispatch overhead exceeds computation
         commitAndWait();
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
         Eigen::Map<MatRMaj> matA(data + offA, n, n);
@@ -692,7 +698,17 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         return;
       }
 
-      // Flush pending work, end compute encoder (MPS needs its own encoding)
+#ifdef BASPACHO_USE_BLAS
+      if (n > kMpsPotrfMaxN) {
+        // Large matrix — multi-threaded CPU BLAS is faster than MPS.
+        // col-major upper = row-major lower, matching BaSpaCho's storage.
+        commitAndWait();
+        LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
+        return;
+      }
+#endif
+
+      // Medium matrix — use MPS Cholesky on GPU
       flushPendingGemms();
       // If a previous potrf status hasn't been checked yet, wait and check now
       // before reusing the status buffer.
@@ -747,11 +763,18 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
+      // Two-tier threshold for triangular solve:
+      // - n*n*k > kMaxThreshold: CPU BLAS (multi-threaded, better for large ops)
+      // - otherwise: MPS triangular solve (GPU acceleration)
+      // Set BASPACHO_MPS_TRSM_THRESHOLD > 0 to add a minimum for MPS (Eigen below).
+      // Set BASPACHO_MPS_TRSM_MAX_THRESHOLD to control the BLAS upper threshold.
       static const int64_t kMpsTrsmThreshold =
-          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 64 * 64 * 64);
+          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 0);
+      static const int64_t kMpsTrsmMaxThreshold =
+          getMpsThreshold("BASPACHO_MPS_TRSM_MAX_THRESHOLD", 128LL * 128 * 128);
 
       if ((int64_t)n * n * k < kMpsTrsmThreshold) {
-        // Small — CPU Eigen is faster than MPS dispatch overhead
+        // CPU Eigen fallback — only used when env override sets threshold > 0
         commitAndWait();
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
         using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
@@ -761,6 +784,17 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
         return;
       }
+
+#ifdef BASPACHO_USE_BLAS
+      if ((int64_t)n * n * k > kMpsTrsmMaxThreshold) {
+        // Large triangular solve — multi-threaded CPU BLAS is faster than MPS.
+        // col-major upper = row-major lower, matching BaSpaCho's storage.
+        commitAndWait();
+        cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
+                    1.0f, data + offA, n, data + offB, n);
+        return;
+      }
+#endif
 
       // Flush pending work, end compute encoder (MPS needs its own encoding)
       flushPendingGemms();
@@ -823,17 +857,22 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      // Submit pending assemble work (which reads tempBuffer) without waiting.
-      // Metal command queue ordering ensures it completes before the GEMM below.
-      commitPending();
+      // End compute encoder if active (MPS needs its own encoding pass)
+      // but keep the same command buffer — Metal guarantees sequential execution
+      // within a buffer, so assembly + GEMM can share one submission.
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
 
       // Ensure temp buffer is large enough
       tempBuffer.resizeToAtLeast(m * n);
 
-      // Use MPS for larger matrices (threshold based on empirical testing)
-      // MPS dispatch overhead makes it slower for small matrices
+      // Always use MPS GEMM by default — single-threaded Eigen CPU fallback is
+      // far slower than MPS dispatch overhead for supernodal Cholesky workloads.
+      // Set BASPACHO_MPS_GEMM_THRESHOLD > 0 to revert to size-based routing.
       static const int64_t kMpsThreshold =
-          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 64 * 64 * 64);
+          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 0);
       bool useMps = (m * n * k >= kMpsThreshold);
 
       if (useMps) {
@@ -905,8 +944,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         [gemm encodeToCommandBuffer:pendingCmdBuf_ leftMatrix:mpsB rightMatrix:mpsA
                        resultMatrix:mpsC];
       } else {
-        // CPU fallback — need GPU to finish before CPU accesses shared memory
-        waitForGpu();
+        // CPU fallback — commit pending GPU work and wait before CPU accesses
+        commitAndWait();
 
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
@@ -2295,7 +2334,8 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      static const int64_t kMpsPotrfMinN = getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 32);
+      static const int64_t kMpsPotrfMinN = getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 4);
+      static const int64_t kMpsPotrfMaxN = getMpsThreshold("BASPACHO_MPS_POTRF_MAX_N", 128);
 
       if (n < kMpsPotrfMinN) {
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -2308,6 +2348,16 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         }
         return;
       }
+
+#ifdef BASPACHO_USE_BLAS
+      if (n > kMpsPotrfMaxN) {
+        // Large matrix — multi-threaded CPU BLAS is faster than MPS.
+        for (int b = 0; b < batchSize; b++) {
+          LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, (*data)[b] + offA, n);
+        }
+        return;
+      }
+#endif
 
       // MPS path: encode all batch items into one command buffer
       id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
@@ -2363,7 +2413,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
       if (n <= 0 || k <= 0) return;
 
       static const int64_t kMpsTrsmThreshold =
-          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 64 * 64 * 64);
+          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 0);
 
       if ((int64_t)n * n * k < kMpsTrsmThreshold) {
         using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
@@ -2431,7 +2481,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
       static const int64_t kMpsThreshold =
-          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 64 * 64 * 64);
+          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 0);
       bool useMps = (m * n * k >= kMpsThreshold);
 
       if (useMps) {
