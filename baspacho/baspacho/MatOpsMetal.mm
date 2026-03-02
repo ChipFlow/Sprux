@@ -53,6 +53,26 @@ struct LUGemmWorkItem {
   int64_t m, n, k;
 };
 
+// Threshold for CPU BLAS fallback: when lump size is below this, dense
+// operations (getrf, trsm, gemm, applyRowPerm) use Accelerate BLAS on CPU
+// instead of MPS/GPU kernels. This avoids GPU dispatch overhead for small
+// matrices where CPU BLAS is faster (e.g., c6288 has max lump n=111).
+static int64_t getCpuBlasThreshold() {
+  static int64_t val = getMpsThreshold("BASPACHO_METAL_CPU_BLAS_THRESHOLD", 256);
+  return val;
+}
+
+#ifdef BASPACHO_USE_BLAS
+// Transpose square matrix in-place (for row-major ↔ col-major conversion)
+static void transposeSquareInPlaceFloat(float* data, int64_t n) {
+  for (int64_t i = 0; i < n; i++) {
+    for (int64_t j = i + 1; j < n; j++) {
+      std::swap(data[i * n + j], data[j * n + i]);
+    }
+  }
+}
+#endif
+
 // Synchronization ops for Metal
 struct MetalSyncOps {
   static void sync() { MetalContext::instance().synchronize(); }
@@ -388,24 +408,39 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Flush buffered saveGemm work items as a single batched kernel dispatch.
-  // Must wait for GPU to finish reading devGemmWorkBuf_ before overwriting it.
+  // Uses append-only strategy: each flush writes at increasing offsets in
+  // devGemmWorkBuf_, avoiding the need to wait for GPU to finish reading
+  // previous data. Buffer reset happens at flush() time between factorizations.
   void flushPendingGemms() {
     if (pendingGemms_.empty()) return;
 
-    // Wait for GPU to finish reading from devGemmWorkBuf_ before overwriting
-    if (gemmWorkBufInFlight_) {
-      commitPending();
-      waitForGpu();
-      gemmWorkBufInFlight_ = false;
-    }
-
     int64_t count = (int64_t)pendingGemms_.size();
     size_t bytesNeeded = count * sizeof(LUGemmWorkItem);
-    size_t int64sNeeded = (bytesNeeded + sizeof(int64_t) - 1) / sizeof(int64_t);
-    devGemmWorkBuf_.resizeToAtLeast(int64sNeeded);
+    // Align to 16 bytes for Metal buffer offset requirements
+    size_t alignedBytes = (bytesNeeded + 15) & ~size_t(15);
 
-    // Copy work items to GPU buffer (safe — GPU is not reading it now)
-    memcpy(devGemmWorkBuf_.ptr(), pendingGemms_.data(), bytesNeeded);
+    size_t newUsedBytes = gemmWorkBufUsedBytes_ + alignedBytes;
+    size_t int64sNeeded = (newUsedBytes + sizeof(int64_t) - 1) / sizeof(int64_t);
+
+    if (int64sNeeded > devGemmWorkBuf_.allocSize()) {
+      // Buffer too small: commit and wait before reallocating to avoid
+      // invalidating in-flight buffer references.
+      if (gemmWorkBufInFlight_) {
+        commitPending();
+        waitForGpu();
+        gemmWorkBufInFlight_ = false;
+      }
+      // Reset position since we waited — old data is consumed, buffer will be replaced
+      gemmWorkBufUsedBytes_ = 0;
+      newUsedBytes = alignedBytes;
+      int64sNeeded = (newUsedBytes + sizeof(int64_t) - 1) / sizeof(int64_t);
+      // Grow with 4x headroom to minimize future reallocations
+      devGemmWorkBuf_.resizeToAtLeast(int64sNeeded * 4);
+    }
+
+    // Append work items at current offset (safe: GPU reads from earlier offsets)
+    size_t writeOffset = gemmWorkBufUsedBytes_;
+    memcpy((char*)devGemmWorkBuf_.ptr() + writeOffset, pendingGemms_.data(), bytesNeeded);
 
     id<MTLComputePipelineState> pipeline = getProfiledPipeline(
             "lu_batchedSaveGemm_kernel_float");
@@ -415,12 +450,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         ^(id<MTLComputeCommandEncoder> encoder) {
           [encoder setBuffer:cachedDataBuffer_ offset:0 atIndex:0];
           [encoder setBuffer:(__bridge id<MTLBuffer>)devGemmWorkBuf_.buffer()
-                      offset:0
+                      offset:writeOffset
                      atIndex:1];
           [encoder setBytes:&count length:sizeof(int64_t) atIndex:2];
         },
         (NSUInteger)count);
 
+    gemmWorkBufUsedBytes_ = newUsedBytes;
     gemmWorkBufInFlight_ = true;
     pendingGemms_.clear();
   }
@@ -1076,13 +1112,26 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  // Static pivoting: scan and perturb small diagonals on GPU.
-  // Uses a single shared atomic counter that accumulates across all lumps,
-  // zeroed once at first call. Total read back at flush() time.
+  // Static pivoting: scan and perturb small diagonals.
+  // CPU path for dense ops, GPU path for deferred execution.
   virtual int64_t perturbSmallDiagonals(int64_t n, float* data, int64_t offset, int64_t stride,
                                         float threshold) override {
     @autoreleasepool {
       if (n <= 0) return 0;
+
+      // CPU path: no pending GPU work, operate directly
+      if (!pendingEncoder_ && !pendingCmdBuf_) {
+        int64_t count = 0;
+        for (int64_t i = 0; i < n; i++) {
+          int64_t idx = offset + i * stride + i;
+          float diag = data[idx];
+          if (!std::isfinite(diag) || std::abs(diag) < threshold) {
+            data[idx] = (diag >= 0.0f) ? threshold : -threshold;
+            count++;
+          }
+        }
+        return count;
+      }
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1159,6 +1208,44 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
         return 0;
       }
+
+      // CPU BLAS path: for small matrices, use Accelerate sgetrf directly.
+      // On Apple Silicon shared memory, CPU can access the Metal buffer without copy.
+      // This avoids MPS dispatch overhead which dominates for small blocks.
+#ifdef BASPACHO_USE_BLAS
+      if (minMN <= getCpuBlasThreshold()) {
+        // Flush any pending GPU work to ensure data is visible to CPU
+        flushPendingGemms();
+        if (pendingEncoder_ || pendingCmdBuf_) {
+          commitPending();
+          waitForGpu();
+        }
+
+        // Transpose row-major → col-major for LAPACK
+        if (m == n) {
+          transposeSquareInPlaceFloat(data + offA, n);
+        }
+
+        std::vector<BLAS_INT> ipiv(minMN);
+        int info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, (BLAS_INT)m, (BLAS_INT)n,
+                                  data + offA, (BLAS_INT)m, ipiv.data());
+
+        // Transpose col-major → row-major
+        if (m == n) {
+          transposeSquareInPlaceFloat(data + offA, n);
+        }
+
+        // Convert pivots: LAPACK 1-based → 0-based
+        for (int64_t i = 0; i < minMN; i++) {
+          pivots[i] = ipiv[i] - 1;
+        }
+
+        // Pivots are on CPU — mark as not GPU-resident
+        pivotsOnGpu_ = false;
+
+        return info;
+      }
+#endif
 
       // MPS path: use MPSMatrixDecompositionLU for parallel GPU factorization.
       // Flush pending saveGemm work items first — ensures all Schur
@@ -1249,6 +1336,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
+      // CPU BLAS path for small operations
+#ifdef BASPACHO_USE_BLAS
+      if (m <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
+        cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit,
+                    (BLAS_INT)n, (BLAS_INT)m, 1.0f, L + offL, (BLAS_INT)m, B + offB, (BLAS_INT)ldb);
+        return;
+      }
+#endif
+
       auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!lBufferInfo.first || !bBufferInfo.first) {
@@ -1297,6 +1393,16 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                                int64_t offB, int64_t ldb) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
+
+      // CPU BLAS path for small operations
+#ifdef BASPACHO_USE_BLAS
+      if (n <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
+        (void)ldb;
+        cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
+                    (BLAS_INT)n, (BLAS_INT)m, 1.0f, U + offU, (BLAS_INT)n, B + offB, (BLAS_INT)n);
+        return;
+      }
+#endif
 
       auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
@@ -1388,6 +1494,19 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         return;
       }
 
+      // CPU BLAS path: immediate GEMM for small operations
+#ifdef BASPACHO_USE_BLAS
+      if (k <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
+        // C -= L * U (row-major: in col-major view, C^T -= U^T * L^T)
+        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                    (BLAS_INT)n, (BLAS_INT)m, (BLAS_INT)k, -1.0f,
+                    U + offU, (BLAS_INT)ldU, L + offL, (BLAS_INT)ldL,
+                    1.0f, C + offC, (BLAS_INT)ldC);
+        sym.luGemmCalls++;
+        return;
+      }
+#endif
+
       // Batched path: buffer work items, flush later in flushPendingGemms()
       // On first call, cache the data buffer info (L, U, C all share the same buffer)
       if (!cachedDataBuffer_) {
@@ -1423,6 +1542,20 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                              int64_t numCols) override {
     @autoreleasepool {
       if (n <= 0 || numCols <= 0) return;
+
+      // CPU path: pivots on CPU, no pending GPU work
+      if (!pivotsOnGpu_ && !pendingEncoder_ && !pendingCmdBuf_) {
+        float* d = data + offData;
+        for (int64_t i = 0; i < n; i++) {
+          int64_t swapRow = pivots[i];
+          if (swapRow != i) {
+            for (int64_t c = 0; c < numCols; c++) {
+              std::swap(d[i + c * ld], d[swapRow + c * ld]);
+            }
+          }
+        }
+        return;
+      }
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1485,9 +1618,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   void flush() override {
     commitAndWait();
+
     // Reset batched state for next factorization
     cachedDataBuffer_ = nil;
     cachedDataBaseOffset_ = 0;
+    // Reset append-only GEMM work buffer for next factorization
+    gemmWorkBufUsedBytes_ = 0;
     gemmWorkBufInFlight_ = false;
     // Reset pivot state for next factorization
     allPivotsCpuBase_ = nullptr;
@@ -1529,9 +1665,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   id<MTLBuffer> perturbCountBuf_ = nil;  // Atomic counter for perturbed diagonals (accumulates)
   bool perturbCountPending_ = false;     // True if perturbCountBuf_ has unread count
 
-  // Batched saveGemm state
+  // Batched saveGemm state (append-only: each flush writes at increasing offsets)
   std::vector<LUGemmWorkItem> pendingGemms_;   // CPU-side work item accumulator
-  MetalMirror<int64_t> devGemmWorkBuf_;        // GPU buffer for work items (reused per flush)
+  MetalMirror<int64_t> devGemmWorkBuf_;        // GPU buffer for work items (append-only)
+  size_t gemmWorkBufUsedBytes_ = 0;            // Current write position (bytes, 16-aligned)
   bool gemmWorkBufInFlight_ = false;           // True if GPU may be reading devGemmWorkBuf_
   id<MTLBuffer> cachedDataBuffer_ = nil;       // Cached MTLBuffer for data
   size_t cachedDataBaseOffset_ = 0;            // Cached byte offset into MTLBuffer
@@ -1542,6 +1679,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   int pendingDispatchCount_ = 0;
   id<MTLCommandBuffer> lastCommittedCmdBuf_ = nil;  // For deferred GPU sync
   bool potrfStatusPending_ = false;                 // Deferred potrf status check
+
 };
 
 // Solve context for float - Metal implementation
