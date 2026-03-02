@@ -431,6 +431,14 @@ struct SolveCtx : SolveCtxBase {
     throw std::runtime_error("solveU: LU not supported by this backend");
   }
 
+  // Pre-upload all pivots to GPU for batched permutation dispatch.
+  // When called, subsequent applyRowPermVec/Inv calls can skip per-call upload.
+  // Default: no-op (CPU backends don't need this).
+  virtual void uploadPivots(const int64_t* pivots, int64_t totalSize) {
+    (void)pivots;
+    (void)totalSize;
+  }
+
   // Apply row permutation P to vector: y = P * x (for LU solve, applies pivots)
   virtual void applyRowPermVec(const int64_t* pivots, int64_t n, T* vec, int64_t ldVec) {
     (void)pivots;

@@ -803,6 +803,9 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   //   2. Solve L * z = y (forward substitution)
   //   3. Solve U * x = z (backward substitution)
 
+  // Pre-upload all pivots to GPU (avoids per-lump sync on GPU backends)
+  slvCtx->uploadPivots(pivots, factorSkel.lumpStart[factorSkel.numLumps()]);
+
   // Step 1: Apply row permutation P: y = P * b
   // Skip sparse-elim lumps when LU sparse elimination is active —
   // their pivots are identity (1x1 scalar blocks, no pivoting needed)

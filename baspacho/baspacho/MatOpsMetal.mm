@@ -1987,18 +1987,34 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // Pre-upload all pivots to GPU in a single memcpy.
+  // Subsequent applyRowPermVec/Inv calls use offsets into this buffer.
+  virtual void uploadPivots(const int64_t* pivots, int64_t totalSize) override {
+    // Flush any pending GPU work that might be reading devPivots
+    commitAndWait();
+
+    devPivots.resizeToAtLeast(totalSize);
+    memcpy(devPivots.ptr(), pivots, totalSize * sizeof(int64_t));
+    pivotsBase_ = pivots;
+    pivotsSize_ = totalSize;
+  }
+
   // Apply row permutation P to vector: for each i, swap row i with row pivots[i]
   virtual void applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
                                 int64_t ldVec) override {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Must flush pending GPU work before overwriting devPivots (shared buffer)
-      commitAndWait();
-
-      // Copy pivots to GPU buffer
-      devPivots.resizeToAtLeast(n);
-      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+      // Compute offset into pre-uploaded pivot buffer, or upload on-demand
+      size_t pivotByteOffset = 0;
+      if (pivotsBase_ && pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        pivotByteOffset = (pivots - pivotsBase_) * sizeof(int64_t);
+      } else {
+        // Fallback: no pre-upload, sync and copy per-call
+        commitAndWait();
+        devPivots.resizeToAtLeast(n);
+        memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+      }
 
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
       if (!vecBufferInfo.first) {
@@ -2014,7 +2030,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer()
+                        offset:pivotByteOffset
+                       atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
             [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:2];
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
@@ -2030,12 +2048,16 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Must flush pending GPU work before overwriting devPivots (shared buffer)
-      commitAndWait();
-
-      // Copy pivots to GPU buffer
-      devPivots.resizeToAtLeast(n);
-      memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+      // Compute offset into pre-uploaded pivot buffer, or upload on-demand
+      size_t pivotByteOffset = 0;
+      if (pivotsBase_ && pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        pivotByteOffset = (pivots - pivotsBase_) * sizeof(int64_t);
+      } else {
+        // Fallback: no pre-upload, sync and copy per-call
+        commitAndWait();
+        devPivots.resizeToAtLeast(n);
+        memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+      }
 
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
       if (!vecBufferInfo.first) {
@@ -2051,7 +2073,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer()
+                        offset:pivotByteOffset
+                       atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
             [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:2];
             [encoder setBytes:&ldVec length:sizeof(int64_t) atIndex:3];
@@ -2106,6 +2130,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   int nRHS;
   MetalMirror<float> tempVecBuffer;
   MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
+  const int64_t* pivotsBase_ = nullptr;  // Base pointer of pre-uploaded pivots
+  int64_t pivotsSize_ = 0;               // Size of pre-uploaded pivot buffer
 
   // Deferred sync state — batch multiple GPU dispatches into shared command buffers
   id<MTLCommandBuffer> pendingCmdBuf_ = nil;
