@@ -386,5 +386,11 @@ Choose serial batching for production; reserve concurrent + MTLEvent for future 
 
 **Application**: When targeting production adoption in scientific computing workflows (simulators, optimization, analysis), plan Python bindings early. Bindings serve as integration point for higher-level tools and enable ecosystem plugins. Choose binding strategy (pybind11 recommended for C++, low overhead, clean Python API). Test bindings with real workflows (vajax circuit sim integration validates binding maturity). Document bindings as production-ready component, not afterthought.
 
+### Cholesky GRID Factor Profiling: Dispatch Overhead in Small Block Loops (2026-03-03)
+**Insight**: GRID 100x100 (small 3x3 blocks, 127K non-zeros) exhibits 5× GPU dispatch overhead on Cholesky factorization despite existing CPU BLAS fallback infrastructure. Root cause: dense loop iterates over many small lumps, each triggering GPU command dispatch (potrf, saveSyrkGemm, trsm), where setup overhead dominates computation time for blocks n≤256.
+
+**Context**: Optimization phase validating Metal performance parity. LU factorization solved same problem with hybrid CPU-GPU execution (threshold-based dispatch routing). Cholesky factor loop has same structure (iterates lumps, calls potrf/trsm/GEMM), suggesting same optimization should apply. Profiling setup: identified 5× performance gap (Metal 364ms vs CPU 72ms), prepared ProfileCholGrid.cpp benchmarking tool, fixed Metal BLAS compilation bug (CblasTrans undefined constant). Analysis revealed CPU BLAS fallback thresholds already exist (BASPACHO_METAL_CPU_BLAS_THRESHOLD=256) but require verification that threshold comparison uses correct operation dimension (n vs k for different operations).
+
+**Application**: When optimizing GPU-accelerated matrix operations on block-structured problems, verify that dispatch overhead thresholds are applied consistently across all operations in a computation loop. GRID bottleneck shows that even with fallback infrastructure in place, profiling on real problem sizes is essential to confirm effectiveness—synthetic benchmarks may not expose bottlenecks that appear in irregular block distributions. Next optimization: verify saveSyrkGemm threshold logic uses operation size (m×n×k), not just k, to catch all small-operation cases.
 
 
