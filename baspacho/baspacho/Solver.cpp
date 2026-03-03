@@ -6,6 +6,7 @@
  */
 
 #include "baspacho/baspacho/Solver.h"
+#include <chrono>
 #include <dispenso/parallel_for.h>
 #include <Eigen/Eigenvalues>
 #include <cmath>
@@ -756,8 +757,17 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
     std::cout << "LU Block-Fact from: " << denseOpsFromLump << std::endl;
   }
 
+  // Dense loop profiling: measure time per lump when verbose or BASPACHO_PROFILE_LU is set.
+  // Note: profiling forces per-lump GPU sync (flush), so benchmark numbers will be worse.
+  using ClockT = std::chrono::high_resolution_clock;
+  double totalBoardMs = 0, totalFactorMs = 0;
+  static const bool profileLU = std::getenv("BASPACHO_PROFILE_LU") != nullptr;
+  if (profileLU) verbose = true;
+
   for (int64_t l = std::max(startLump, denseOpsFromLump);
        l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
+    auto tLumpStart = verbose ? ClockT::now() : ClockT::time_point{};
+
     numCtx->prepareAssemble(l);
 
     //  iterate over columns having a non-trivial a-block
@@ -766,6 +776,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
     // When no sparse elimination (denseOpsFromLump == 0), use boardRowPtr directly.
     int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
                                                : factorSkel.boardRowPtr[l];
+    int64_t boardCount = 0;
     for (int64_t rPtr = rPtrStart,
                  rEnd = factorSkel.boardRowPtr[l + 1] - 1;  // skip last (diag block)
          rPtr < rEnd; rPtr++) {
@@ -776,11 +787,33 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
         continue;
       }
       eliminateBoardLU(*numCtx, data, rPtr);
+      boardCount++;
     }
+
+    auto tBoardEnd = verbose ? ClockT::now() : ClockT::time_point{};
 
     if (l < upToLump) {
       factorLumpLU(*numCtx, data, pivots, l);
     }
+
+    if (verbose) {
+      numCtx->flush();  // sync GPU for accurate timing
+      auto tEnd = ClockT::now();
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l];
+      double boardMs = std::chrono::duration<double, std::milli>(tBoardEnd - tLumpStart).count();
+      double factorMs = std::chrono::duration<double, std::milli>(tEnd - tBoardEnd).count();
+      totalBoardMs += boardMs;
+      totalFactorMs += factorMs;
+      std::cout << "  Dense lump " << l << ": n=" << lumpSize
+                << " boards=" << boardCount
+                << " boardMs=" << boardMs
+                << " factorMs=" << factorMs << std::endl;
+    }
+  }
+
+  if (verbose) {
+    std::cout << "  Dense loop totals: boardMs=" << totalBoardMs
+              << " factorMs=" << totalFactorMs << std::endl;
   }
 
   numCtx->flush();
