@@ -34,6 +34,9 @@ target_link_libraries (bench ${BASPACHO_LIBRARY} testing)
 add_executable(lu_bench LUBench.cpp)
 target_link_libraries (lu_bench ${BASPACHO_LIBRARY} testing)
 
+add_executable(profile_chol_grid ProfileCholGrid.cpp)
+target_link_libraries (profile_chol_grid ${BASPACHO_LIBRARY} testing)
+
 if(HAVE_CHOLMOD)
   target_link_libraries (BAL_bench ${SUITESPARSE_CHOLMOD_TARGET})
   target_link_libraries (bench ${SUITESPARSE_CHOLMOD_TARGET})

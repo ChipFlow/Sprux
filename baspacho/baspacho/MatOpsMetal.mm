@@ -727,6 +727,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
+      if (!pendingEncoder_ && !pendingCmdBuf_ && n <= getCpuBlasThreshold()) {
+        flushPendingGemms();
+        LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
+        return;
+      }
+#endif
+
       // Three-tier threshold for Cholesky factorization:
       // - n < kMinN: CPU Eigen (tiny matrices, MPS dispatch overhead dominates)
       // - n > kMaxN: CPU BLAS (large matrices, multi-threaded BLAS >> MPS)
@@ -812,6 +821,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
+
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
+      if (!pendingEncoder_ && !pendingCmdBuf_ && n <= getCpuBlasThreshold()) {
+        cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
+                    1.0f, data + offA, n, data + offB, n);
+        return;
+      }
+#endif
 
       // Two-tier threshold for triangular solve:
       // - n*n*k > kMaxThreshold: CPU BLAS (multi-threaded, better for large ops)
@@ -906,6 +924,19 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                             int64_t offset) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
+
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
+      if (!pendingEncoder_ && !pendingCmdBuf_ && k <= getCpuBlasThreshold()) {
+        tempBuffer.resizeToAtLeast(m * n);
+        // C(n,m) = B(n,k) * A^T(k,m), where A and B share data at offset
+        // Row-major: C = B * A^T => col-major: C^T = A * B^T => use col-major GEMM
+        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasConjTrans, (BLAS_INT)m, (BLAS_INT)n,
+                    (BLAS_INT)k, 1.0f, data + offset, (BLAS_INT)k, data + offset, (BLAS_INT)k,
+                    0.0f, tempBuffer.ptr(), (BLAS_INT)m);
+        return;
+      }
+#endif
 
       // End compute encoder if active (MPS needs its own encoding pass)
       // but keep the same command buffer — Metal guarantees sequential execution
@@ -1037,6 +1068,37 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
+
+      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead)
+      if (!pendingEncoder_ && !pendingCmdBuf_) {
+        const int64_t* chainRowsTillEnd =
+            sym.skel.chainRowsTillEnd.data() + srcColDataOffset;
+        const int64_t* pToSpan = sym.skel.chainRowSpan.data() + srcColDataOffset;
+        const int64_t* pSpanToChainOffset = spanToChainOffset.data();
+        const int64_t* pSpanOffsetInLump = sym.skel.spanOffsetInLump.data();
+        const float* matRectPtr = tempBuffer.ptr();
+        for (int64_t r = 0; r < numBlockRows; r++) {
+          int64_t rBegin = chainRowsTillEnd[r - 1] - rectRowBegin;
+          int64_t rSize = chainRowsTillEnd[r] - rBegin - rectRowBegin;
+          int64_t rParam = pToSpan[r];
+          int64_t rOffset = pSpanToChainOffset[rParam];
+          const float* matRowPtr = matRectPtr + rBegin * srcRectWidth;
+          int64_t cEnd = std::min(numBlockCols, r + 1);
+          for (int64_t c = 0; c < cEnd; c++) {
+            int64_t cStart = chainRowsTillEnd[c - 1] - rectRowBegin;
+            int64_t cSize = chainRowsTillEnd[c] - cStart - rectRowBegin;
+            int64_t offset = rOffset + pSpanOffsetInLump[pToSpan[c]];
+            float* dst = data + offset;
+            const float* src = matRowPtr + cStart;
+            for (int64_t i = 0; i < rSize; i++) {
+              for (int64_t j = 0; j < cSize; j++) {
+                dst[i * dstStride + j] -= src[i * srcRectWidth + j];
+              }
+            }
+          }
+        }
+        return;
+      }
 
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);

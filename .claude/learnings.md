@@ -354,5 +354,37 @@
 - Current dispatchKernel: Safe baseline, per-dispatch overhead
 Choose serial batching for production robustness. Reserve concurrent + MTLEvent for performance-critical future work where profiling shows dispatch overhead dominates.
 
+### CPU-GPU Hybrid Execution Model for Dense LU on Unified Memory (2026-03-02)
+**Insight**: Commit bdd0f77 demonstrates that on Apple Silicon (unified memory architecture), CPU BLAS can outperform GPU dispatch for small matrices. Threshold-based hybrid execution (CPU for n≤256, GPU for n>256) yields 8.8× speedup on factorization by eliminating dispatch overhead for small lumps. Metal's ~10–100µs per-kernel dispatch overhead dominates computation time for 3×3 blocks (~1µs), making CPU execution faster despite GPU hardware capabilities.
+
+**Context**: GPU acceleration assumes computation time dominates dispatch overhead. On Apple Silicon's unified memory, CPU BLAS (multi-threaded Accelerate) operates directly on GPU buffers without copying, eliminating memory transfer overhead. For dense LU on block-structured matrices, blocks vary in size (root lumps large, factor-stage lumps small). Small lumps (n≤256) spend 90%+ time in dispatch, large lumps (n>256) spend time in computation. Hybrid execution routes small lumps to CPU, large lumps to GPU. Unified memory is essential—copying would eliminate CPU advantage.
+
+**Application**: When implementing GPU acceleration on unified memory architectures (Apple Silicon, NVIDIA Grace + GPU, future Intel GPUs), profile dispatch overhead on small problem sizes. Implement size-adaptive dispatch: measure compute time vs dispatch overhead crossover point, set threshold there, provide tuning knob (BASPACHO_METAL_CPU_BLAS_THRESHOLD). For factorization-heavy workloads (LU, Cholesky, LDL^T) with diverse block sizes, expect 2–10× improvement from hybrid execution. This pattern generalizes to other GPU platforms with unified memory. CUDA applications (cuBLAS vs Eigen) may have similar crossover points worth profiling.
+
+### CPU Fallback Pattern Generalizes Across GPU Operations (2026-03-02)
+**Insight**: Commit b4f93c3 validates that the CPU-GPU hybrid threshold pattern (bdd0f77) applies systematically to solve phase operations, not just factorization. Dense solve (solveLUnit, solveU) below threshold uses CPU Eigen triangular solves; above threshold uses GPU. Same conditional gate (`!pendingEncoder_ && !pendingCmdBuf_`) ensures sparse elimination completes before CPU dense ops. **Result: 8.3× speedup on solve phase (41.4ms → 4.98ms), cumulative 38.8× end-to-end LU improvement (470ms → 12.1ms)**.
+
+**Context**: Hybrid CPU-GPU execution isn't specific to factorization but a general principle: when dispatch overhead dominates computation, CPU wins despite lower peak throughput. Solve operations (triangular systems, matrix-vector products) are generally lower arithmetic intensity than dense matrix operations (GEMM), making them more susceptible to dispatch overhead on small problems. Validating the pattern across factorization AND solve phases demonstrates that it's a fundamental architectural lesson, not operation-specific tuning.
+
+**Application**: When designing GPU-accelerated solvers for block-structured matrices with diverse block sizes, implement CPU fallback thresholds for ALL dense operations: factorization (potrf, getrf, LDL^T), triangular solves (trsm, solveLUnit, solveU), and dense matrix-vector operations. Threshold values should be determined per-operation via profiling (dispatch overhead vs compute time crossover), not guessed. Document thresholds as tuning knobs (BASPACHO_METAL_CPU_BLAS_THRESHOLD, or operation-specific variants). This pattern delivers dramatic improvements on unified memory architectures where CPU can operate on GPU buffers without explicit copies. Total benefit across all dense ops likely 5–10× on block-structured problems.
+
+### GPU Synchronization: Memory Barriers Are Insufficient for Execution Ordering (2026-03-02)
+**Insight**: Commit 4e7fcf2 documents a critical discovery during concurrent dispatch optimization: Metal's `memoryBarrierWithScope` provides visibility guarantees (one thread group sees another's writes) but NOT execution ordering between dependent phases. When phase 1 produces data and phase 2 consumes it, concurrent dispatch allows both to overlap, causing phase 2 to read stale/incomplete data despite memory barriers.
+
+**Context**: Attempted MTLDispatchTypeConcurrent (concurrent encoder) to execute independent level-sets in parallel within a single command buffer. Profiling revealed data corruption: solution vectors with NaN/Inf where concurrent dispatch overlapped dependent sparse elimination phases. Root cause: `memoryBarrierWithScope(MTLMemoryScopeDevice)` ensures memory visibility but doesn't order GPU execution. Phase 2 threads can execute before phase 1 threads complete their writes. Correct solution requires explicit synchronization events: phase 1 signals MTLEvent when complete; phase 2 waits on event before starting. This distinguishes between memory coherence (visibility) and execution ordering (serialization).
+
+**Application**: Metal GPU code patterns:
+- **Serial encoder + batching** (current): Simple, 60-70% of potential concurrent benefit, preserves ordering through encoder's implicit sequencing. Recommended for production robustness.
+- **Concurrent encoder + MTLEvent**: Enables true parallelism for independent operations within a phase, but requires explicit event signaling for cross-phase dependencies. Complex but necessary for performance-critical scenarios where dispatch overhead dominates.
+- **Memory barriers alone**: INSUFFICIENT for dependent operations—use only for visibility within a single phase, not for cross-phase synchronization.
+Choose serial batching for production; reserve concurrent + MTLEvent for future optimization frontiers where profiling shows dispatch overhead dominates cost. Document synchronization requirements clearly—memory barriers solve visibility, events solve ordering.
+
+### Python Bindings as Integration Layer for Production Workflows (2026-03-02)
+**Insight**: Commit 56d8d86 packages BaSpaCho as Python module (baspacho_bindings.cpp, 179 lines), enabling integration with python-based circuit simulators (vajax workflow). Includes comprehensive literature review and implementation documentation.
+
+**Context**: Production adoption of solver libraries requires language bindings beyond C++. Circuit simulation tools (SPICE derivatives, custom python-based analyzers) are increasingly python-first. Binding native C++ solver to Python is a standard engineering pattern (ctypes, pybind11, SWIG). BaSpaCho bindings expose core API: createSolver, factor, solve, with proper memory management and error handling.
+
+**Application**: When targeting production adoption in scientific computing workflows (simulators, optimization, analysis), plan Python bindings early. Bindings serve as integration point for higher-level tools and enable ecosystem plugins. Choose binding strategy (pybind11 recommended for C++, low overhead, clean Python API). Test bindings with real workflows (vajax circuit sim integration validates binding maturity). Document bindings as production-ready component, not afterthought.
+
 
 

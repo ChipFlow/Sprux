@@ -1,4 +1,11 @@
 *~
 build
+build_clean/
+build_debug/
+build_metal/
+build_metal_debug/
 .vscode
 Testing
+.claude
+*.a
+comparison_summary.json
