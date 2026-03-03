@@ -455,6 +455,39 @@ __global__ void convertPivotsKernel(const int* src, int64_t* dst, int64_t count)
   }
 }
 
+// Batched small GEMM: C -= L * U (row-major) for many small matrix multiplies.
+// Each block handles one work item. Threads within a block parallelize over output elements.
+// This avoids the ~10μs cuBLAS dispatch overhead per GEMM for thousands of tiny operations.
+struct GemmWorkItem {
+  int64_t offL, offU, offC;
+  int32_t m, n, k;
+  int32_t ldL, ldU, ldC;
+};
+
+template <typename T>
+__global__ void batchedSmallGemmKernel(T* data, const GemmWorkItem* work, int64_t numWork) {
+  int64_t wid = blockIdx.x;
+  if (wid >= numWork) return;
+
+  const GemmWorkItem& w = work[wid];
+  int tid = threadIdx.x;
+  int total = w.m * w.n;
+
+  // Each thread computes one or more output elements
+  for (int idx = tid; idx < total; idx += blockDim.x) {
+    int i = idx / w.n;
+    int j = idx % w.n;
+    T sum = T(0);
+    for (int t = 0; t < w.k; t++) {
+      sum += data[w.offL + i * w.ldL + t] * data[w.offU + t * w.ldU + j];
+    }
+    data[w.offC + i * w.ldC + j] -= sum;
+  }
+}
+
+// Threshold: GEMMs with m*n <= this value are batched; larger ones use cuBLAS directly
+static const int kBatchGemmMaxMN = 64;
+
 // Apply row permutation to matrix columns on GPU
 // Sequential swaps (data dependency), parallel across columns within one block.
 // IMPORTANT: Must launch with exactly 1 block since __syncthreads only syncs within a block.
@@ -829,6 +862,8 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
                              int64_t numCols) override;
 
+  virtual void flush() override { flushGemmBatch(); }
+
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
                                         T threshold) override {
     if (n <= 0) return 0;
@@ -915,6 +950,19 @@ struct CudaNumericCtx : NumericCtx<T> {
         pToSpan, pSpanToChainOffset, pSpanOffsetInLump, devTempBuffer.ptr, data, Plain{});
   }
 
+  void flushGemmBatch() {
+    if (gemmBatch_.empty()) return;
+    devGemmWork_.resizeToAtLeast(gemmBatch_.size() * sizeof(GemmWorkItem) / sizeof(T) + 1);
+    cuCHECK(cudaMemcpy(devGemmWork_.ptr, gemmBatch_.data(),
+                        gemmBatch_.size() * sizeof(GemmWorkItem), cudaMemcpyHostToDevice));
+    int wgs = 64;  // threads per block — each handles output elements of one GEMM
+    batchedSmallGemmKernel<T>
+        <<<gemmBatch_.size(), wgs>>>(gemmDataPtr_, (GemmWorkItem*)devGemmWork_.ptr,
+                                     (int64_t)gemmBatch_.size());
+    gemmBatch_.clear();
+    gemmDataPtr_ = nullptr;
+  }
+
   DevMirror<T> devTempBuffer;
   DevMirror<int> devPotrfSingIndex;
   DevMirror<int64_t> devSpanToChainOffset;
@@ -923,6 +971,11 @@ struct CudaNumericCtx : NumericCtx<T> {
   DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based)
   DevMirror<int64_t> devPerturbCount;  // Counter for perturbSmallDiagonals
   int64_t lastGetrfPivotN_ = 0;       // Size of pivots in devPivotBuf from last getrf
+
+  // Batched small GEMM buffer
+  vector<GemmWorkItem> gemmBatch_;
+  DevMirror<T> devGemmWork_;  // GPU storage for GemmWorkItem array (reinterpret_cast)
+  T* gemmDataPtr_ = nullptr;  // data pointer for current batch (for validation)
 
   const CudaSymbolicCtx& sym;
 };
@@ -1021,6 +1074,7 @@ template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                    int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
+  flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
 
   // Step 1: Transpose row-major → col-major on GPU (in-place for square)
@@ -1074,6 +1128,7 @@ template <>
 int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
                                   int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
+  flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
 
   // Step 1: Transpose row-major → col-major on GPU (in-place for square)
@@ -1165,20 +1220,46 @@ template <>
 void CudaNumericCtx<double>::saveGemm(int64_t m, int64_t n, int64_t k, const double* L,
                                        int64_t offL, int64_t ldL, const double* U, int64_t offU,
                                        int64_t ldU, double* C, int64_t offC, int64_t ldC) {
+  sym.gemmCalls++;
+
+  // Batch small GEMMs into a single kernel dispatch
+  if (m * n <= kBatchGemmMaxMN) {
+    if (gemmDataPtr_ == nullptr) {
+      gemmDataPtr_ = const_cast<double*>(L);
+    }
+    gemmBatch_.push_back({offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
+                          (int32_t)ldL, (int32_t)ldU, (int32_t)ldC});
+    return;
+  }
+
+  flushGemmBatch();
   double alpha(-1.0), beta(1.0);
   cublasCHECK(cublasDgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
                            L + offL, ldL, &beta, C + offC, ldC));
-  sym.gemmCalls++;
 }
 
 template <>
 void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const float* L,
                                       int64_t offL, int64_t ldL, const float* U, int64_t offU,
                                       int64_t ldU, float* C, int64_t offC, int64_t ldC) {
+  sym.gemmCalls++;
+
+  // Batch small GEMMs into a single kernel dispatch to avoid cuBLAS overhead
+  if (m * n <= kBatchGemmMaxMN) {
+    // All pointers must refer to the same data buffer (they do in BaSpaCho)
+    if (gemmDataPtr_ == nullptr) {
+      gemmDataPtr_ = const_cast<float*>(L);  // Track the base data pointer
+    }
+    gemmBatch_.push_back({offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
+                          (int32_t)ldL, (int32_t)ldU, (int32_t)ldC});
+    return;
+  }
+
+  // Large GEMM: flush any pending batch first, then use cuBLAS
+  flushGemmBatch();
   float alpha(-1.0), beta(1.0);
   cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
                            L + offL, ldL, &beta, C + offC, ldC));
-  sym.gemmCalls++;
 }
 
 // applyRowPerm: GPU kernel - use GPU-resident pivots from getrf when available,
