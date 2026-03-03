@@ -2776,6 +2776,16 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (n <= 0) return;
 
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback: faster than MPS dispatch for small/medium matrices
+      if (n <= getCpuBlasThreshold()) {
+        for (int b = 0; b < batchSize; b++) {
+          LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, (*data)[b] + offA, n);
+        }
+        return;
+      }
+#endif
+
       static const int64_t kMpsPotrfMinN = getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 4);
       static const int64_t kMpsPotrfMaxN = getMpsThreshold("BASPACHO_MPS_POTRF_MAX_N", 128);
 
@@ -2854,6 +2864,18 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback: faster than MPS for small/medium operations
+      if (n <= getCpuBlasThreshold()) {
+        for (int b = 0; b < batchSize; b++) {
+          float* batchData = (*data)[b];
+          cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
+                      1.0f, batchData + offA, n, batchData + offB, n);
+        }
+        return;
+      }
+#endif
+
       static const int64_t kMpsTrsmThreshold =
           getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 0);
 
@@ -2921,6 +2943,21 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
                             int64_t offset) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
+
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS fallback: faster than MPS for small/medium operations
+      if (k <= getCpuBlasThreshold()) {
+        for (int b = 0; b < batchSize; b++) {
+          const float* batchData = (*data)[b];
+          // C(n,m) = B(n,k) * A^T(k,m), row-major at data+offset
+          // Fortran col-major: C(m,n) = A^T(m,k) * B(k,n)
+          cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, (BLAS_INT)m, (BLAS_INT)n,
+                      (BLAS_INT)k, 1.0f, batchData + offset, (BLAS_INT)k,
+                      batchData + offset, (BLAS_INT)k, 0.0f, tempBufPtrs[b], (BLAS_INT)m);
+        }
+        return;
+      }
+#endif
 
       static const int64_t kMpsThreshold =
           getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 0);
@@ -2995,18 +3032,19 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
-    if (assembleWasCalled_) {
+    if (assembleWasCalled_ && gpuAssemblyUsed_) {
       MetalContext::instance().synchronize();
-      assembleWasCalled_ = false;
     }
+    assembleWasCalled_ = false;
+    gpuAssemblyUsed_ = false;
 
     const CoalescedBlockMatrixSkel& skel = sym.skel;
     for (int64_t i = skel.chainColPtr[targetLump], iEnd = skel.chainColPtr[targetLump + 1];
          i < iEnd; i++) {
       spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
     }
-    memcpy(devSpanToChainOffset.ptr(), spanToChainOffset.data(),
-           spanToChainOffset.size() * sizeof(int64_t));
+    // Only copy to GPU buffer if GPU assembly might be used
+    // (deferred: done in assemble() GPU path if needed)
   }
 
   virtual void assemble(std::vector<float*>* data, int64_t rectRowBegin, int64_t dstStride,
@@ -3015,6 +3053,45 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
+
+      // CPU fallback: scatter-subtract per batch item (avoids GPU dispatch overhead)
+      if (numBlockRows * numBlockCols <= getCpuBlasThreshold()) {
+        const int64_t* chainRowsTillEnd =
+            sym.skel.chainRowsTillEnd.data() + srcColDataOffset;
+        const int64_t* pToSpan = sym.skel.chainRowSpan.data() + srcColDataOffset;
+        const int64_t* pSpanToChainOffset = spanToChainOffset.data();
+        const int64_t* pSpanOffsetInLump = sym.skel.spanOffsetInLump.data();
+        for (int b = 0; b < batchSize; b++) {
+          float* batchData = (*data)[b];
+          const float* matRectPtr = tempBufPtrs[b];
+          for (int64_t r = 0; r < numBlockRows; r++) {
+            int64_t rBegin = chainRowsTillEnd[r - 1] - rectRowBegin;
+            int64_t rSize = chainRowsTillEnd[r] - rBegin - rectRowBegin;
+            int64_t rParam = pToSpan[r];
+            int64_t rOffset = pSpanToChainOffset[rParam];
+            const float* matRowPtr = matRectPtr + rBegin * srcRectWidth;
+            int64_t cEnd = std::min(numBlockCols, r + 1);
+            for (int64_t c = 0; c < cEnd; c++) {
+              int64_t cStart = chainRowsTillEnd[c - 1] - rectRowBegin;
+              int64_t cSize = chainRowsTillEnd[c] - cStart - rectRowBegin;
+              int64_t offset = rOffset + pSpanOffsetInLump[pToSpan[c]];
+              float* dst = batchData + offset;
+              const float* src = matRowPtr + cStart;
+              for (int64_t i = 0; i < rSize; i++)
+                for (int64_t j = 0; j < cSize; j++)
+                  dst[i * dstStride + j] -= src[i * srcRectWidth + j];
+            }
+          }
+        }
+        return;
+      }
+
+      // GPU path: upload spanToChainOffset if not yet done
+      if (!gpuAssemblyUsed_) {
+        memcpy(devSpanToChainOffset.ptr(), spanToChainOffset.data(),
+               spanToChainOffset.size() * sizeof(int64_t));
+        gpuAssemblyUsed_ = true;
+      }
 
       id<MTLComputePipelineState> pipeline = getProfiledPipeline("assemble_kernel_float");
 
@@ -3083,6 +3160,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
   MetalMirror<int64_t> devSpanToChainOffset;
   std::vector<int64_t> spanToChainOffset;
   bool assembleWasCalled_ = false;
+  bool gpuAssemblyUsed_ = false;
 };
 
 // Batched solve context for float
