@@ -862,20 +862,42 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void applyRowPerm(int64_t* pivots, int64_t n, T* data, int64_t offData, int64_t ld,
                              int64_t numCols) override;
 
-  virtual void flush() override { flushGemmBatch(); }
+  virtual void flush() override {
+    flushGemmBatch();
+    // Flush deferred pivot copies: one bulk sync + sequential copies
+    if (!deferredPivotCopies_.empty()) {
+      for (auto& dc : deferredPivotCopies_) {
+        cuCHECK(cudaMemcpy(dc.cpuDst, devDensePivots.ptr + dc.gpuSrcOffset,
+                            dc.count * sizeof(int64_t), cudaMemcpyDeviceToHost));
+      }
+      deferredPivotCopies_.clear();
+      densePivotWriteOffset_ = 0;
+      lastGetrfPivotOff_ = -1;
+    }
+  }
+
+  int64_t deferredPerturbCount() override {
+    if (!perturbCountPending_) return 0;
+    int64_t count = 0;
+    cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
+    perturbCountPending_ = false;
+    return count;
+  }
 
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
                                         T threshold) override {
     if (n <= 0) return 0;
-    devPerturbCount.resizeToAtLeast(1);
-    cuCHECK(cudaMemset(devPerturbCount.ptr, 0, sizeof(int64_t)));
+    // Initialize persistent counter on first call (once per factorization)
+    if (!perturbCountPending_) {
+      devPerturbCount.resizeToAtLeast(1);
+      cuCHECK(cudaMemsetAsync(devPerturbCount.ptr, 0, sizeof(int64_t), 0));
+      perturbCountPending_ = true;
+    }
     int wgs = 256;
     int numGroups = (n + wgs - 1) / wgs;
     perturbSmallDiagonalsKernel<<<numGroups, wgs>>>(n, data, offset, stride, threshold,
                                                     devPerturbCount.ptr);
-    int64_t count = 0;
-    cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
-    return count;
+    return 0;  // Actual count read in deferredPerturbCount() after flush
   }
 
   virtual void doEliminationLU(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
@@ -963,14 +985,44 @@ struct CudaNumericCtx : NumericCtx<T> {
     gemmDataPtr_ = nullptr;
   }
 
+  // Grow devDensePivots with data preservation (DevMirror::resizeToAtLeast destroys data).
+  // Uses doubling strategy to minimize reallocations across multiple getrf calls.
+  void ensureDensePivotCapacity(int64_t needed) {
+    if (devDensePivots.allocSize >= (size_t)needed) return;
+    size_t newSize = std::max(devDensePivots.allocSize * 2, (size_t)needed);
+    int64_t* newPtr = nullptr;
+    cuCHECK(cudaMalloc((void**)&newPtr, newSize * sizeof(int64_t)));
+    if (devDensePivots.ptr && densePivotWriteOffset_ > 0) {
+      cuCHECK(cudaMemcpyAsync(newPtr, devDensePivots.ptr,
+                                densePivotWriteOffset_ * sizeof(int64_t),
+                                cudaMemcpyDeviceToDevice, 0));
+    }
+    devDensePivots.clear();
+    devDensePivots.ptr = newPtr;
+    devDensePivots.allocSize = newSize;
+  }
+
   DevMirror<T> devTempBuffer;
   DevMirror<int> devPotrfSingIndex;
   DevMirror<int64_t> devSpanToChainOffset;
   vector<int64_t> spanToChainOffset;
   DevMirror<int> devGetrfPivots;       // cuSolver int pivots (1-based)
-  DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based)
-  DevMirror<int64_t> devPerturbCount;  // Counter for perturbSmallDiagonals
-  int64_t lastGetrfPivotN_ = 0;       // Size of pivots in devPivotBuf from last getrf
+  DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based, for CPU-uploaded pivots)
+  DevMirror<int64_t> devPerturbCount;  // GPU atomic counter for perturbSmallDiagonals
+  bool perturbCountPending_ = false;   // True when devPerturbCount has accumulated data
+  int64_t lastGetrfPivotN_ = 0;       // Size of pivots from last getrf
+
+  // Deferred pivot state: store all dense lumps' converted pivots on GPU,
+  // defer D→H copies to flush() to eliminate per-lump sync barriers.
+  DevMirror<int64_t> devDensePivots;   // Stores all dense lumps' converted pivots
+  int64_t densePivotWriteOffset_ = 0;  // Current write offset in devDensePivots
+  int64_t lastGetrfPivotOff_ = -1;     // Offset of last getrf pivots in devDensePivots
+  struct DeferredPivotCopy {
+    int64_t* cpuDst;
+    int64_t gpuSrcOffset;
+    int64_t count;
+  };
+  std::vector<DeferredPivotCopy> deferredPivotCopies_;
 
   // Batched small GEMM buffer
   vector<GemmWorkItem> gemmBatch_;
@@ -1067,9 +1119,9 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
 // ============ LU NumericCtx implementations ============
 
 // getrf: GPU implementation using cuSolver + transpose kernel
-// GPU-resident pivot conversion: avoids per-lump D→H sync for applyRowPerm.
-// Pivots are converted int→int64_t on GPU (stored in devPivotBuf), AND copied D→H
-// for CPU pivot storage (needed by solve path).
+// Deferred pivot readback: pivots are converted on GPU and stored in devDensePivots
+// at per-lump offsets. D→H copy is deferred to flush() to eliminate per-lump sync.
+// applyRowPerm reads directly from devDensePivots via lastGetrfPivotOff_.
 template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                    int64_t* pivots) {
@@ -1108,18 +1160,21 @@ int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t of
     }
   }
 
-  // Step 4: Convert pivots on GPU (int 1-based → int64_t 0-based) for applyRowPerm
-  devPivotBuf.resizeToAtLeast(minMN);
+  // Step 4: Convert pivots on GPU into devDensePivots at current offset
+  int64_t pivotOff = densePivotWriteOffset_;
+  ensureDensePivotCapacity(pivotOff + minMN);
   {
     int wgs = 256;
     int numGroups = (minMN + wgs - 1) / wgs;
-    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr, devPivotBuf.ptr, minMN);
+    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr,
+                                             devDensePivots.ptr + pivotOff, minMN);
   }
+  lastGetrfPivotOff_ = pivotOff;
   lastGetrfPivotN_ = minMN;
+  densePivotWriteOffset_ = pivotOff + minMN;
 
-  // Step 5: Copy converted pivots (int64_t, 0-based) from GPU to CPU for solve path
-  cuCHECK(cudaMemcpy(pivots, devPivotBuf.ptr, minMN * sizeof(int64_t),
-                      cudaMemcpyDeviceToHost));
+  // Step 5: Defer D→H pivot copy to flush() — no sync barrier here
+  deferredPivotCopies_.push_back({pivots, pivotOff, minMN});
 
   return 0;
 }
@@ -1162,18 +1217,21 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
     }
   }
 
-  // Step 4: Convert pivots on GPU (int 1-based → int64_t 0-based) for applyRowPerm
-  devPivotBuf.resizeToAtLeast(minMN);
+  // Step 4: Convert pivots on GPU into devDensePivots at current offset
+  int64_t pivotOff = densePivotWriteOffset_;
+  ensureDensePivotCapacity(pivotOff + minMN);
   {
     int wgs = 256;
     int numGroups = (minMN + wgs - 1) / wgs;
-    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr, devPivotBuf.ptr, minMN);
+    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr,
+                                             devDensePivots.ptr + pivotOff, minMN);
   }
+  lastGetrfPivotOff_ = pivotOff;
   lastGetrfPivotN_ = minMN;
+  densePivotWriteOffset_ = pivotOff + minMN;
 
-  // Step 5: Copy converted pivots (int64_t, 0-based) from GPU to CPU for solve path
-  cuCHECK(cudaMemcpy(pivots, devPivotBuf.ptr, minMN * sizeof(int64_t),
-                      cudaMemcpyDeviceToHost));
+  // Step 5: Defer D→H pivot copy to flush() — no sync barrier here
+  deferredPivotCopies_.push_back({pivots, pivotOff, minMN});
 
   return 0;
 }
@@ -1262,23 +1320,27 @@ void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
                            L + offL, ldL, &beta, C + offC, ldC));
 }
 
-// applyRowPerm: GPU kernel - use GPU-resident pivots from getrf when available,
+// applyRowPerm: GPU kernel - use GPU-resident pivots from deferred getrf when available,
 // otherwise copy small pivots H→D. Run permutation kernel on device.
 template <>
 void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* data, int64_t offData,
                                            int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
 
-  if (n != lastGetrfPivotN_) {
+  int64_t* devPivPtr;
+  if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
+    // Use GPU-resident pivots from deferred getrf (no sync needed)
+    devPivPtr = devDensePivots.ptr + lastGetrfPivotOff_;
+  } else {
     // Pivots not from recent getrf — upload from CPU
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    devPivPtr = devPivotBuf.ptr;
   }
-  // else: devPivotBuf already has converted pivots from getrf
 
   // Single block launch (sequential pivot dependency requires __syncthreads)
   int wgs = std::min((int64_t)256, numCols);
-  applyRowPermKernel<<<1, wgs>>>(devPivotBuf.ptr, n, data, offData, ld, numCols);
+  applyRowPermKernel<<<1, wgs>>>(devPivPtr, n, data, offData, ld, numCols);
 }
 
 template <>
@@ -1286,15 +1348,19 @@ void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data
                                           int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
 
-  if (n != lastGetrfPivotN_) {
+  int64_t* devPivPtr;
+  if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
+    // Use GPU-resident pivots from deferred getrf (no sync needed)
+    devPivPtr = devDensePivots.ptr + lastGetrfPivotOff_;
+  } else {
     // Pivots not from recent getrf — upload from CPU
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    devPivPtr = devPivotBuf.ptr;
   }
-  // else: devPivotBuf already has converted pivots from getrf
 
   int wgs = std::min((int64_t)256, numCols);
-  applyRowPermKernel<<<1, wgs>>>(devPivotBuf.ptr, n, data, offData, ld, numCols);
+  applyRowPermKernel<<<1, wgs>>>(devPivPtr, n, data, offData, ld, numCols);
 }
 
 template <typename T>
