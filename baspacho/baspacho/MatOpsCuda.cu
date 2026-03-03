@@ -447,6 +447,14 @@ __global__ void perturbSmallDiagonalsKernel(int64_t n, T* data, int64_t offset, 
   }
 }
 
+// Convert cuSolver pivots (int, 1-based) to BaSpaCho format (int64_t, 0-based) on GPU
+__global__ void convertPivotsKernel(const int* src, int64_t* dst, int64_t count) {
+  int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < count) {
+    dst[tid] = (int64_t)(src[tid] - 1);
+  }
+}
+
 // Apply row permutation to matrix columns on GPU
 // Sequential swaps (data dependency), parallel across columns within one block.
 // IMPORTANT: Must launch with exactly 1 block since __syncthreads only syncs within a block.
@@ -914,6 +922,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   DevMirror<int> devGetrfPivots;       // cuSolver int pivots (1-based)
   DevMirror<int64_t> devPivotBuf;      // Our int64_t pivots (0-based)
   DevMirror<int64_t> devPerturbCount;  // Counter for perturbSmallDiagonals
+  int64_t lastGetrfPivotN_ = 0;       // Size of pivots in devPivotBuf from last getrf
 
   const CudaSymbolicCtx& sym;
 };
@@ -1005,6 +1014,9 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
 // ============ LU NumericCtx implementations ============
 
 // getrf: GPU implementation using cuSolver + transpose kernel
+// GPU-resident pivot conversion: avoids per-lump D→H sync for applyRowPerm.
+// Pivots are converted int→int64_t on GPU (stored in devPivotBuf), AND copied D→H
+// for CPU pivot storage (needed by solve path).
 template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                    int64_t* pivots) {
@@ -1042,13 +1054,18 @@ int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t of
     }
   }
 
-  // Step 4: Copy cuSolver pivots (int, 1-based) D→H, convert to our format (int64_t, 0-based)
-  vector<int> cuPivots(minMN);
-  cuCHECK(cudaMemcpy(cuPivots.data(), devGetrfPivots.ptr, minMN * sizeof(int),
-                      cudaMemcpyDeviceToHost));
-  for (int64_t i = 0; i < minMN; i++) {
-    pivots[i] = cuPivots[i] - 1;  // 1-based → 0-based
+  // Step 4: Convert pivots on GPU (int 1-based → int64_t 0-based) for applyRowPerm
+  devPivotBuf.resizeToAtLeast(minMN);
+  {
+    int wgs = 256;
+    int numGroups = (minMN + wgs - 1) / wgs;
+    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr, devPivotBuf.ptr, minMN);
   }
+  lastGetrfPivotN_ = minMN;
+
+  // Step 5: Copy converted pivots (int64_t, 0-based) from GPU to CPU for solve path
+  cuCHECK(cudaMemcpy(pivots, devPivotBuf.ptr, minMN * sizeof(int64_t),
+                      cudaMemcpyDeviceToHost));
 
   return 0;
 }
@@ -1090,13 +1107,18 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
     }
   }
 
-  // Step 4: Copy cuSolver pivots (int, 1-based) D→H, convert to our format (int64_t, 0-based)
-  vector<int> cuPivots(minMN);
-  cuCHECK(cudaMemcpy(cuPivots.data(), devGetrfPivots.ptr, minMN * sizeof(int),
-                      cudaMemcpyDeviceToHost));
-  for (int64_t i = 0; i < minMN; i++) {
-    pivots[i] = cuPivots[i] - 1;  // 1-based → 0-based
+  // Step 4: Convert pivots on GPU (int 1-based → int64_t 0-based) for applyRowPerm
+  devPivotBuf.resizeToAtLeast(minMN);
+  {
+    int wgs = 256;
+    int numGroups = (minMN + wgs - 1) / wgs;
+    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr, devPivotBuf.ptr, minMN);
   }
+  lastGetrfPivotN_ = minMN;
+
+  // Step 5: Copy converted pivots (int64_t, 0-based) from GPU to CPU for solve path
+  cuCHECK(cudaMemcpy(pivots, devPivotBuf.ptr, minMN * sizeof(int64_t),
+                      cudaMemcpyDeviceToHost));
 
   return 0;
 }
@@ -1159,14 +1181,19 @@ void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
   sym.gemmCalls++;
 }
 
-// applyRowPerm: GPU kernel - copy small pivots H→D, run kernel on device
+// applyRowPerm: GPU kernel - use GPU-resident pivots from getrf when available,
+// otherwise copy small pivots H→D. Run permutation kernel on device.
 template <>
 void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* data, int64_t offData,
                                            int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
 
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+  if (n != lastGetrfPivotN_) {
+    // Pivots not from recent getrf — upload from CPU
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+  }
+  // else: devPivotBuf already has converted pivots from getrf
 
   // Single block launch (sequential pivot dependency requires __syncthreads)
   int wgs = std::min((int64_t)256, numCols);
@@ -1178,8 +1205,12 @@ void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data
                                           int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
 
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+  if (n != lastGetrfPivotN_) {
+    // Pivots not from recent getrf — upload from CPU
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+  }
+  // else: devPivotBuf already has converted pivots from getrf
 
   int wgs = std::min((int64_t)256, numCols);
   applyRowPermKernel<<<1, wgs>>>(devPivotBuf.ptr, n, data, offData, ld, numCols);
