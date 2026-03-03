@@ -785,7 +785,9 @@ struct CudaNumericCtx : NumericCtx<T> {
     devSpanToChainOffset.resizeToAtLeast(spanToChainOffset.size());
   }
 
-  virtual ~CudaNumericCtx() override {}
+  virtual ~CudaNumericCtx() override {
+    if (pinnedBuf_) cudaFreeHost(pinnedBuf_);
+  }
 
   virtual void pseudoFactorSpans(T* data, int64_t spanBegin, int64_t spanEnd) override {
     auto timer = sym.pseudoFactorStat.instance<CudaSyncOps>();
@@ -946,13 +948,18 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void prepareAssemble(int64_t targetLump) override {
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
-    // FIXME: compute on CPU and copy, not ideal
+    // Compute spanToChainOffset into pinned buffer for async H→D copy.
+    // Using pinned memory avoids blocking the CPU (cudaMemcpy is synchronous
+    // for pageable memory, but cudaMemcpyAsync with pinned memory returns immediately).
     for (int64_t i = skel.chainColPtr[targetLump], iEnd = skel.chainColPtr[targetLump + 1];
          i < iEnd; i++) {
       spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
     }
-    cuCHECK(cudaMemcpy(devSpanToChainOffset.ptr, spanToChainOffset.data(),
-                       spanToChainOffset.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    size_t bytes = spanToChainOffset.size() * sizeof(int64_t);
+    ensurePinnedBuf(bytes);
+    memcpy(pinnedBuf_, spanToChainOffset.data(), bytes);
+    cuCHECK(cudaMemcpyAsync(devSpanToChainOffset.ptr, pinnedBuf_, bytes,
+                             cudaMemcpyHostToDevice, 0));
   }
 
   virtual void assemble(T* data, int64_t rectRowBegin,
@@ -974,15 +981,28 @@ struct CudaNumericCtx : NumericCtx<T> {
 
   void flushGemmBatch() {
     if (gemmBatch_.empty()) return;
-    devGemmWork_.resizeToAtLeast(gemmBatch_.size() * sizeof(GemmWorkItem) / sizeof(T) + 1);
-    cuCHECK(cudaMemcpy(devGemmWork_.ptr, gemmBatch_.data(),
-                        gemmBatch_.size() * sizeof(GemmWorkItem), cudaMemcpyHostToDevice));
+    size_t bytes = gemmBatch_.size() * sizeof(GemmWorkItem);
+    devGemmWork_.resizeToAtLeast(bytes / sizeof(T) + 1);
+    // Use pinned memory for async H→D copy (avoids blocking CPU)
+    ensurePinnedBuf(bytes);
+    memcpy(pinnedBuf_, gemmBatch_.data(), bytes);
+    cuCHECK(cudaMemcpyAsync(devGemmWork_.ptr, pinnedBuf_, bytes,
+                             cudaMemcpyHostToDevice, 0));
     int wgs = 64;  // threads per block — each handles output elements of one GEMM
     batchedSmallGemmKernel<T>
         <<<gemmBatch_.size(), wgs>>>(gemmDataPtr_, (GemmWorkItem*)devGemmWork_.ptr,
                                      (int64_t)gemmBatch_.size());
     gemmBatch_.clear();
     gemmDataPtr_ = nullptr;
+  }
+
+  // Ensure pinned staging buffer is large enough for async H→D copies.
+  // Pinned memory allows cudaMemcpyAsync to return immediately to the CPU.
+  void ensurePinnedBuf(size_t bytes) {
+    if (pinnedBufSize_ >= bytes) return;
+    if (pinnedBuf_) cuCHECK(cudaFreeHost(pinnedBuf_));
+    cuCHECK(cudaHostAlloc(&pinnedBuf_, bytes, cudaHostAllocDefault));
+    pinnedBufSize_ = bytes;
   }
 
   // Grow devDensePivots with data preservation (DevMirror::resizeToAtLeast destroys data).
@@ -1023,6 +1043,10 @@ struct CudaNumericCtx : NumericCtx<T> {
     int64_t count;
   };
   std::vector<DeferredPivotCopy> deferredPivotCopies_;
+
+  // Pinned host memory for async H→D copies (reusable staging buffer)
+  void* pinnedBuf_ = nullptr;
+  size_t pinnedBufSize_ = 0;
 
   // Batched small GEMM buffer
   vector<GemmWorkItem> gemmBatch_;
