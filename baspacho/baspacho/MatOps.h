@@ -245,6 +245,14 @@ struct NumericCtx : NumericCtxBase {
     throw std::runtime_error("applyRowPerm: LU not supported by this backend");
   }
 
+  // Signal start of dense LU operations — GPU backends can sync and copy data
+  // to host for CPU BLAS fallback (avoids per-op GPU dispatch overhead).
+  // Called before the dense loop in internalFactorRangeLU.
+  virtual void beginDenseOps(T* data, int64_t totalDataSize) {
+    (void)data;
+    (void)totalDataSize;
+  }
+
   // Scan diagonal of row-major n×n matrix at data+offset with given stride,
   // perturb elements with |value| < threshold. Returns count of perturbed elements.
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
