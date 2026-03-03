@@ -929,9 +929,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
       if (!pendingEncoder_ && !pendingCmdBuf_ && k <= getCpuBlasThreshold()) {
         tempBuffer.resizeToAtLeast(m * n);
-        // C(n,m) = B(n,k) * A^T(k,m), where A and B share data at offset
-        // Row-major: C = B * A^T => col-major: C^T = A * B^T => use col-major GEMM
-        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasConjTrans, (BLAS_INT)m, (BLAS_INT)n,
+        // C(n,m) = B(n,k) * A^T(k,m), where A and B are row-major at data+offset
+        // Row-major m×k = col-major k×m (lda=k). Result n×m row-major = m×n col-major (ldc=m).
+        // Fortran: C(m,n) = A^T(m,k) * B(k,n), transA='C', transB='N'
+        cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, (BLAS_INT)m, (BLAS_INT)n,
                     (BLAS_INT)k, 1.0f, data + offset, (BLAS_INT)k, data + offset, (BLAS_INT)k,
                     0.0f, tempBuffer.ptr(), (BLAS_INT)m);
         return;
