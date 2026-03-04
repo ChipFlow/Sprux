@@ -853,9 +853,18 @@ struct CudaNumericCtx : NumericCtx<T> {
 
   virtual T readValue(const T* data, int64_t offset) override {
     if (cpuBlasMode_) return hostData_[offset];
-    T val;
-    cuCHECK(cudaMemcpy(&val, data + offset, sizeof(T), cudaMemcpyDeviceToHost));
-    return val;
+    // Lazy cache: on first readValue, bulk-copy device data to host
+    // to avoid per-element cudaMemcpy overhead (~10μs × N = 250ms for 25K lumps).
+    // Cache is invalidated by beginDenseOps (which re-copies post-sparse-elim data).
+    if (!readCacheValid_) {
+      int64_t totalSize = sym.skel.totalDataSize();
+      if ((int64_t)hostData_.size() < totalSize) {
+        hostData_.resize(totalSize);
+      }
+      cuCHECK(cudaMemcpy(hostData_.data(), data, totalSize * sizeof(T), cudaMemcpyDeviceToHost));
+      readCacheValid_ = true;
+    }
+    return hostData_[offset];
   }
 
   virtual void potrf(int64_t n, T* data, int64_t offA) override;
@@ -884,12 +893,8 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void flush() override {
     if (cpuBlasMode_) {
       // Copy modified host data back to device
-      auto t0 = std::chrono::high_resolution_clock::now();
       cuCHECK(cudaMemcpy(devDataPtr_, hostData_.data(), totalDataSize_ * sizeof(T),
                           cudaMemcpyHostToDevice));
-      auto t1 = std::chrono::high_resolution_clock::now();
-      double copyMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      fprintf(stderr, "[CUDA] flush: H→D copy took %.2f ms\n", copyMs);
       cpuBlasMode_ = false;
       devDataPtr_ = nullptr;
       // Don't clear hostData_ (keep allocation for next factorization)
@@ -1114,9 +1119,10 @@ struct CudaNumericCtx : NumericCtx<T> {
   // in eliminateBoardLU with GPU-side GEMMs. Modeled after Metal's CPU BLAS fallback
   // (which uses unified memory; CUDA needs explicit D→H + H→D copies).
   bool cpuBlasMode_ = false;
+  bool readCacheValid_ = false;   // Lazy read cache for readValue (avoids per-element cudaMemcpy)
   T* devDataPtr_ = nullptr;       // Device data pointer (for H→D copy back in flush)
   int64_t totalDataSize_ = 0;     // Total data buffer size in elements
-  std::vector<T> hostData_;       // Host copy of data buffer for CPU BLAS operations
+  std::vector<T> hostData_;       // Host copy of data buffer (shared by readCache + cpuBlasMode)
   int64_t cpuPerturbCount_ = 0;   // Accumulated perturb count during CPU mode
 
   virtual void beginDenseOps(T* data, int64_t totalDataSize) override {
@@ -1124,18 +1130,15 @@ struct CudaNumericCtx : NumericCtx<T> {
     // Sync GPU to ensure all prior work (sparse elimination) is complete
     cuCHECK(cudaDeviceSynchronize());
 
+    // Invalidate lazy read cache (data changed by GPU sparse elimination)
+    readCacheValid_ = false;
+
     // Copy entire data buffer from device to host
     devDataPtr_ = data;
     totalDataSize_ = totalDataSize;
     hostData_.resize(totalDataSize);
-    fprintf(stderr, "[CUDA] beginDenseOps: copying %ld elements (%.1f MB) D→H\n",
-            (long)totalDataSize, (double)(totalDataSize * sizeof(T)) / (1024.0 * 1024.0));
-    auto t0 = std::chrono::high_resolution_clock::now();
     cuCHECK(cudaMemcpy(hostData_.data(), data, totalDataSize * sizeof(T),
                         cudaMemcpyDeviceToHost));
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double copyMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    fprintf(stderr, "[CUDA] beginDenseOps: D→H copy took %.2f ms, cpuBlasMode=true\n", copyMs);
     cpuBlasMode_ = true;
     cpuPerturbCount_ = 0;
 #else

@@ -729,7 +729,6 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   ValT effectiveThreshold =
       (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
 
-  auto tSparseElimStart = std::chrono::high_resolution_clock::now();
   if (!luElimCtxs.empty()) {
     for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
       if (sparseElimRanges[l + 1] > upToLump) {
@@ -751,9 +750,6 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       }
     }
   }
-  auto tSparseElimEnd = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "[LU] sparse elim dispatch took %.2f ms\n",
-          std::chrono::duration<double, std::milli>(tSparseElimEnd - tSparseElimStart).count());
 
   int64_t denseOpsFromLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
@@ -764,12 +760,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   // Signal GPU backends to enter CPU BLAS mode for dense operations.
   // On CUDA: syncs GPU, copies data buffer D→H, operates on host for all dense ops.
   // On Metal: no-op (unified memory already allows direct CPU access).
-  auto tBeginDense = std::chrono::high_resolution_clock::now();
   numCtx->beginDenseOps(data, factorSkel.totalDataSize());
-  auto tAfterBeginDense = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "[LU] beginDenseOps took %.2f ms, denseOpsFromLump=%ld\n",
-          std::chrono::duration<double, std::milli>(tAfterBeginDense - tBeginDense).count(),
-          (long)denseOpsFromLump);
 
   // Dense loop profiling: measure time per lump when verbose or BASPACHO_PROFILE_LU is set.
   // Note: profiling forces per-lump GPU sync (flush), so benchmark numbers will be worse.
@@ -830,12 +821,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
               << " factorMs=" << totalFactorMs << std::endl;
   }
 
-  auto tBeforeFlush = std::chrono::high_resolution_clock::now();
   numCtx->flush();
-  auto tAfterFlush = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "[LU] dense loop took %.2f ms, flush took %.2f ms\n",
-          std::chrono::duration<double, std::milli>(tBeforeFlush - tAfterBeginDense).count(),
-          std::chrono::duration<double, std::milli>(tAfterFlush - tBeforeFlush).count());
   // Collect deferred perturb count from GPU backends (Metal defers perturbSmallDiagonals
   // to GPU kernel, returning 0 inline and accumulating count on device).
   staticPivotPerturbCount_ += numCtx->deferredPerturbCount();
