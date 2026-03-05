@@ -73,9 +73,30 @@ static void transposeSquareInPlaceFloat(float* data, int64_t n) {
 }
 #endif
 
+// Binary search on CPU: find largest i such that array[i] <= needle
+// Mirrors GPU bisect() in MetalKernels.metal exactly.
+static int64_t cpuBisect(const int64_t* array, int64_t size, int64_t needle) {
+  int64_t a = 0, b = size;
+  while (b - a > 1) {
+    int64_t mid = (a + b) / 2;
+    if (needle >= array[mid])
+      a = mid;
+    else
+      b = mid;
+  }
+  return a;
+}
+
 // Synchronization ops for Metal
 struct MetalSyncOps {
   static void sync() { MetalContext::instance().synchronize(); }
+};
+
+// Pre-computed work item for LU sparse elimination (matches Metal shader struct)
+struct LUWorkItem {
+  int32_t L_offset;       // data offset for L value
+  int32_t U_offset;       // data offset for U value
+  int32_t target_offset;  // data offset for target
 };
 
 // Symbolic elimination context for Metal
@@ -86,6 +107,10 @@ struct MetalSymElimCtx : SymElimCtx {
   int64_t numColumns;
   int64_t numBlockPairs;
   MetalMirror<int64_t> makeBlockPairEnumStraight;
+
+  // Pre-computed work list for LU sparse elimination (Phase 1)
+  int64_t numWorkItems = 0;
+  MetalMirror<int32_t> devWorkItems;  // packed: 3 int32 per LUWorkItem
 };
 
 // Forward declarations
@@ -180,6 +205,69 @@ struct MetalSymbolicCtx : SymbolicCtx {
     elim->numColumns = lumpsEnd - lumpsBegin;
     elim->numBlockPairs = pairEnum[pairEnum.size() - 1];
     elim->makeBlockPairEnumStraight.load(pairEnum);
+
+    // Pre-compute work list: resolve all binary searches on CPU
+    int64_t upperDataBase = skel.dataSize();
+    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+
+    vector<LUWorkItem> workItems;
+    workItems.reserve(elim->numBlockPairs);
+
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t colStart = skel.chainColPtr[l] + 1;  // skip diagonal
+      int64_t n = skel.chainColPtr[l + 1] - colStart;
+      int64_t uRowStart = skel.upperChainRowPtr[l];
+
+      for (int64_t row_idx = 0; row_idx < n; row_idx++) {
+        for (int64_t col_idx = 0; col_idx < n; col_idx++) {
+          LUWorkItem item;
+          item.L_offset = (int32_t)skel.chainData[colStart + row_idx];
+          item.U_offset =
+              (int32_t)(upperDataBase + skel.upperChainData[uRowStart + col_idx]);
+
+          // Target: CPU bisect (mirrors GPU bisect in MetalKernels.metal)
+          int64_t aSpan = skel.chainRowSpan[colStart + row_idx];
+          int64_t bSpan = skel.chainRowSpan[colStart + col_idx];
+
+          if (aSpan >= bSpan) {
+            // Lower triangle target
+            int64_t bLump = skel.spanToLump[bSpan];
+            int64_t bSpanOff = skel.spanOffsetInLump[bSpan];
+            int64_t tStart = skel.chainColPtr[bLump];
+            int64_t tEnd = skel.chainColPtr[bLump + 1];
+            int64_t tPos =
+                cpuBisect(skel.chainRowSpan.data() + tStart, tEnd - tStart, aSpan);
+            item.target_offset = (int32_t)(skel.chainData[tStart + tPos] + bSpanOff);
+          } else {
+            // Upper triangle target
+            int64_t aLump = skel.spanToLump[aSpan];
+            int64_t uStart = skel.upperChainRowPtr[aLump];
+            int64_t uEnd = skel.upperChainRowPtr[aLump + 1];
+            int64_t tPos = cpuBisect(skel.upperChainColSpan.data() + uStart,
+                                     uEnd - uStart, bSpan);
+            item.target_offset =
+                (int32_t)(upperDataBase + skel.upperChainData[uStart + tPos]);
+          }
+          workItems.push_back(item);
+        }
+      }
+    }
+
+    // Note: sorting by target_offset was benchmarked but hurts performance
+    // by disrupting L/U read locality (consecutive threads from the same
+    // lump share L/U cache lines in natural order).
+
+    // Upload as packed int32 array (3 int32 per work item)
+    elim->numWorkItems = (int64_t)workItems.size();
+    if (elim->numWorkItems > 0) {
+      vector<int32_t> packed(3 * elim->numWorkItems);
+      for (int64_t i = 0; i < elim->numWorkItems; i++) {
+        packed[3 * i + 0] = workItems[i].L_offset;
+        packed[3 * i + 1] = workItems[i].U_offset;
+        packed[3 * i + 2] = workItems[i].target_offset;
+      }
+      elim->devWorkItems.load(packed);
+    }
 
     return SymElimCtxPtr(elim);
   }
@@ -666,56 +754,22 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       }
 
       // Step 2: LU Schur complement (L*U updates to both triangles)
-      if (elim.numBlockPairs > 0) {
+      if (elim.numWorkItems > 0) {
+        // Pre-computed work list path: no binary searches, 3 buffer bindings
         id<MTLComputePipelineState> pipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-                "lu_sparse_elim_kernel_float");
-
-        int64_t upperDataBase = sym.skel.dataSize();
+                "lu_sparse_elim_precomputed_float");
 
         dispatchKernel(
             sym.commandQueue, pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                          offset:0
-                         atIndex:0];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
                           offset:0
                          atIndex:1];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                          offset:0
-                         atIndex:2];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                          offset:0
-                         atIndex:3];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                          offset:0
-                         atIndex:4];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
-                          offset:0
-                         atIndex:5];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                          offset:0
-                         atIndex:6];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
-              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
-              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
-                          offset:0
-                         atIndex:10];
-              [encoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
-                          offset:0
-                         atIndex:12];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                          offset:0
-                         atIndex:13];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                          offset:0
-                         atIndex:14];
-              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:15];
+              [encoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
             },
-            (NSUInteger)elim.numBlockPairs);
+            (NSUInteger)elim.numWorkItems);
       }
 
       // Read back perturb count

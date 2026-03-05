@@ -505,6 +505,30 @@ kernel void lu_sparse_elim_kernel_float(
 }
 
 // ============================================================================
+// Kernel: lu_sparse_elim_precomputed (Pre-computed work list version)
+// Each thread loads one LUWorkItem: target -= L[L_offset] * U[U_offset]
+// No binary searches, 3 buffer bindings, uniform SIMD execution.
+// ============================================================================
+struct LUSparseWorkItem {
+  int32_t L_offset;
+  int32_t U_offset;
+  int32_t target_offset;
+};
+
+kernel void lu_sparse_elim_precomputed_float(
+    device float* data [[buffer(0)]],
+    constant LUSparseWorkItem* items [[buffer(1)]],
+    constant int64_t& numItems [[buffer(2)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= numItems) return;
+    LUSparseWorkItem w = items[tid];
+    float product = data[w.L_offset] * data[w.U_offset];
+    device atomic_uint* addr = (device atomic_uint*)&data[w.target_offset];
+    atomicSubFloat(addr, product);
+}
+
+// ============================================================================
 // Kernel 4: assemble_kernel (Assemble rectangular sections)
 // ============================================================================
 kernel void assemble_kernel_float(
