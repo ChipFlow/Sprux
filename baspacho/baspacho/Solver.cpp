@@ -18,6 +18,24 @@
 #include "baspacho/baspacho/EliminationTree.h"
 #include "baspacho/baspacho/Utils.h"
 
+#ifdef __APPLE__
+#include <os/signpost.h>
+static os_log_t baspachoSignpostLog() {
+  // OS_LOG_CATEGORY_POINTS_OF_INTEREST makes signposts appear in the
+  // "Points of Interest" track in Instruments without a custom template.
+  static os_log_t log =
+      os_log_create("com.baspacho.solver", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+  return log;
+}
+#define BASPACHO_SIGNPOST_BEGIN(name) \
+  os_signpost_interval_begin(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+#define BASPACHO_SIGNPOST_END(name) \
+  os_signpost_interval_end(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+#else
+#define BASPACHO_SIGNPOST_BEGIN(name) ((void)0)
+#define BASPACHO_SIGNPOST_END(name) ((void)0)
+#endif
+
 namespace BaSpaCho {
 
 using namespace std;
@@ -708,12 +726,15 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
+  BASPACHO_SIGNPOST_BEGIN("createNumericCtx");
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
+  BASPACHO_SIGNPOST_END("createNumericCtx");
 
   // Compute effective static pivot threshold scaled by matrix diagonal magnitude.
   // For auto mode (threshold == 0), use cbrt(eps) * max(|diag_ii|).
   // cbrt(eps) is more aggressive than sqrt(eps) but necessary to prevent cascading
   // growth in the L factor for matrices with many near-zero pivots.
+  BASPACHO_SIGNPOST_BEGIN("maxDiag");
   if (staticPivotThreshold_ >= 0) {
     using ValT = typename std::remove_pointer<decltype(data)>::type;
     ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
@@ -733,6 +754,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       effectiveStaticPivotThreshold_ = staticPivotThreshold_;
     }
   }
+  BASPACHO_SIGNPOST_END("maxDiag");
 
   // LU sparse elimination: use GPU-accelerated path for scalar lumps in sparse
   // elimination ranges, then fall back to dense LU for remaining lumps.
@@ -740,6 +762,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   ValT effectiveThreshold =
       (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
 
+  BASPACHO_SIGNPOST_BEGIN("sparseElim");
   if (!luElimCtxs.empty()) {
     if (startLump == 0 && upToLump >= sparseElimRanges.back()) {
       // Common case: full range — batch all levels in one GPU submission
@@ -776,6 +799,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       }
     }
   }
+  BASPACHO_SIGNPOST_END("sparseElim");
 
   int64_t denseOpsFromLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
@@ -788,6 +812,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   // On Metal: no-op (unified memory already allows direct CPU access).
   numCtx->beginDenseOps(data, factorSkel.totalDataSize());
 
+  BASPACHO_SIGNPOST_BEGIN("denseLoop");
   // Dense loop profiling: measure time per lump when verbose or BASPACHO_PROFILE_LU is set.
   // Note: profiling forces per-lump GPU sync (flush), so benchmark numbers will be worse.
   using ClockT = std::chrono::high_resolution_clock;
@@ -846,6 +871,8 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
     std::cout << "  Dense loop totals: boardMs=" << totalBoardMs
               << " factorMs=" << totalFactorMs << std::endl;
   }
+
+  BASPACHO_SIGNPOST_END("denseLoop");
 
   numCtx->flush();
   // Collect deferred perturb count from GPU backends (Metal defers perturbSmallDiagonals
