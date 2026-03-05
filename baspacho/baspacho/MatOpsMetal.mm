@@ -441,12 +441,19 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // Metal command queue ordering guarantees that command buffers execute in
   // submission order, so subsequent work on the same queue will see the results.
   // Tracks the last committed buffer so waitForGpu() can wait on it later.
+  // Signals the shared event for lower-overhead CPU waiting.
   void commitPending() {
     if (pendingCmdBuf_) {
       if (pendingEncoder_) {
         [pendingEncoder_ endEncoding];
         pendingEncoder_ = nil;
       }
+      // Signal shared event for lower-overhead waiting in waitForGpu()
+      if (!sharedEvent_) {
+        sharedEvent_ = [sym.device newSharedEvent];
+      }
+      sharedEventValue_++;
+      [pendingCmdBuf_ encodeSignalEvent:sharedEvent_ value:sharedEventValue_];
       [pendingCmdBuf_ commit];
       lastCommittedCmdBuf_ = pendingCmdBuf_;
       pendingCmdBuf_ = nil;
@@ -455,15 +462,21 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Wait for the most recently committed command buffer to complete.
-  // Since command buffers execute in submission order on the same queue,
-  // waiting for the last one implicitly waits for all prior work.
+  // Prefers MTLSharedEvent polling (lower overhead) when available,
+  // falls back to waitUntilCompleted on the command buffer.
   void waitForGpu() {
-    if (lastCommittedCmdBuf_) {
+    if (sharedEvent_ && sharedEventValue_ > 0) {
+      // Lower-overhead wait: polls a shared memory value instead of
+      // full command buffer lifecycle tracking.
+      [sharedEvent_ waitUntilSignaledValue:sharedEventValue_ timeoutMS:5000];
+      lastCommittedCmdBuf_ = nil;
+    } else if (lastCommittedCmdBuf_) {
       [lastCommittedCmdBuf_ waitUntilCompleted];
       lastCommittedCmdBuf_ = nil;
     }
     checkDeferredPotrfStatus();
     flushDeferredState();
+    collectDeferredElimPerturb();
   }
 
   // Check deferred potrf status after GPU work has completed.
@@ -484,6 +497,21 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       memcpy(allPivotsCpuBase_, devAllPivots.ptr(), allPivotsCount_ * sizeof(int64_t));
       pivotsOnGpu_ = false;
     }
+  }
+
+  // Collect deferred perturb count from sparse elimination GPU buffer.
+  void collectDeferredElimPerturb() {
+    if (deferredElimPerturbBuf_) {
+      deferredElimPerturbCount_ += *(uint32_t*)[deferredElimPerturbBuf_ contents];
+      deferredElimPerturbBuf_ = nil;
+    }
+  }
+
+  // Signal start of dense LU operations — wait for deferred sparse elim GPU work.
+  void beginDenseOps(float* data, int64_t totalDataSize) override {
+    (void)data;
+    (void)totalDataSize;
+    waitForGpu();
   }
 
   // Commit the pending command buffer and wait for all GPU work to complete.
@@ -859,9 +887,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         }
       }
 
-      // Single commit+wait for all levels
-      commitAndWait();
-      totalPerturbCount += *(uint32_t*)[perturbBuf contents];
+      // Commit without waiting — GPU runs while CPU does setup before dense loop.
+      // Signal shared event so beginDenseOps can wait with lower overhead.
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      if (pendingCmdBuf_) {
+        if (!sharedEvent_) {
+          sharedEvent_ = [sym.device newSharedEvent];
+        }
+        sharedEventValue_++;
+        [pendingCmdBuf_ encodeSignalEvent:sharedEvent_ value:sharedEventValue_];
+        [pendingCmdBuf_ commit];
+        lastCommittedCmdBuf_ = pendingCmdBuf_;
+        pendingCmdBuf_ = nil;
+        pendingDispatchCount_ = 0;
+      }
+      // Defer perturb count readback to beginDenseOps/waitForGpu
+      deferredElimPerturbBuf_ = perturbBuf;
     }
   }
 
@@ -958,8 +1002,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         }
       }
 
-      // Single commit+wait for all levels
-      commitAndWait();
+      // Commit without waiting — GPU runs while CPU does setup before dense loop.
+      // Metal command queue ordering guarantees subsequent work sees these results.
+      commitPending();
     }
   }
 
@@ -968,8 +1013,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (n <= 0) return;
 
 #ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
-      if (!pendingEncoder_ && !pendingCmdBuf_ && n <= getCpuBlasThreshold()) {
+      // CPU BLAS fallback when no pending or committed GPU work
+      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
+          n <= getCpuBlasThreshold()) {
         flushPendingGemms();
         LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
         return;
@@ -1063,8 +1109,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (n <= 0 || k <= 0) return;
 
 #ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
-      if (!pendingEncoder_ && !pendingCmdBuf_ && n <= getCpuBlasThreshold()) {
+      // CPU BLAS fallback when no pending or committed GPU work
+      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
+          n <= getCpuBlasThreshold()) {
         cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
                     1.0f, data + offA, n, data + offB, n);
         return;
@@ -1166,8 +1213,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
 #ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending GPU work (dense loop after sparse elim)
-      if (!pendingEncoder_ && !pendingCmdBuf_ && k <= getCpuBlasThreshold()) {
+      // CPU BLAS fallback when no pending or committed GPU work
+      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
+          k <= getCpuBlasThreshold()) {
         tempBuffer.resizeToAtLeast(m * n);
         // C(n,m) = B(n,k) * A^T(k,m), where A and B are row-major at data+offset
         // Row-major m×k = col-major k×m (lda=k). Result n×m row-major = m×n col-major (ldc=m).
@@ -1310,8 +1358,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
 
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
+      // CPU fallback when no pending or committed GPU work (avoids GPU dispatch overhead)
+      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_) {
         const int64_t* chainRowsTillEnd =
             sym.skel.chainRowsTillEnd.data() + srcColDataOffset;
         const int64_t* pToSpan = sym.skel.chainRowSpan.data() + srcColDataOffset;
@@ -1943,6 +1991,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Reset buffer for next factorization
       *(uint32_t*)[perturbCountBuf_ contents] = 0;
     }
+    // Include deferred sparse elimination perturb count
+    count += deferredElimPerturbCount_;
+    deferredElimPerturbCount_ = 0;
     return count;
   }
 
@@ -1982,6 +2033,14 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   int pendingDispatchCount_ = 0;
   id<MTLCommandBuffer> lastCommittedCmdBuf_ = nil;  // For deferred GPU sync
   bool potrfStatusPending_ = false;                 // Deferred potrf status check
+
+  // MTLSharedEvent for lower-overhead CPU-GPU synchronization
+  id<MTLSharedEvent> sharedEvent_ = nil;
+  uint64_t sharedEventValue_ = 0;
+
+  // Deferred sparse elimination perturb count (read after GPU completion)
+  id<MTLBuffer> deferredElimPerturbBuf_ = nil;
+  int64_t deferredElimPerturbCount_ = 0;
 
 };
 

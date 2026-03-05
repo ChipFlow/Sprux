@@ -717,6 +717,13 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
 template <typename T>
 void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
                                    int64_t endSpanIndex, bool verbose) const {
+  beginInternalFactorRangeLU(data, pivots, startSpanIndex, endSpanIndex, verbose);
+  finishInternalFactorRangeLU(data, pivots, startSpanIndex, endSpanIndex, verbose);
+}
+
+template <typename T>
+void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
+                                        int64_t endSpanIndex, bool verbose) const {
   BASPACHO_CHECK_GE(startSpanIndex, 0);
   BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
   BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
@@ -731,9 +738,6 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   BASPACHO_SIGNPOST_END("createNumericCtx");
 
   // Compute effective static pivot threshold scaled by matrix diagonal magnitude.
-  // For auto mode (threshold == 0), use cbrt(eps) * max(|diag_ii|).
-  // cbrt(eps) is more aggressive than sqrt(eps) but necessary to prevent cascading
-  // growth in the L factor for matrices with many near-zero pivots.
   BASPACHO_SIGNPOST_BEGIN("maxDiag");
   if (staticPivotThreshold_ >= 0) {
     using ValT = typename std::remove_pointer<decltype(data)>::type;
@@ -756,8 +760,7 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   }
   BASPACHO_SIGNPOST_END("maxDiag");
 
-  // LU sparse elimination: use GPU-accelerated path for scalar lumps in sparse
-  // elimination ranges, then fall back to dense LU for remaining lumps.
+  // LU sparse elimination: submit to GPU (deferred commit, not waited).
   using ValT = typename std::remove_pointer<decltype(data)>::type;
   ValT effectiveThreshold =
       (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
@@ -765,7 +768,6 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   BASPACHO_SIGNPOST_BEGIN("sparseElim");
   if (!luElimCtxs.empty()) {
     if (startLump == 0 && upToLump >= sparseElimRanges.back()) {
-      // Common case: full range — batch all levels in one GPU submission
       if (verbose) {
         for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
           if (luElimCtxs[l]) {
@@ -777,7 +779,6 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       numCtx->doAllEliminationsLU(luElimCtxs, sparseElimRanges, data, effectiveThreshold,
                                   staticPivotPerturbCount_);
     } else {
-      // Partial factorization: per-level calls with range clipping
       for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
         if (sparseElimRanges[l + 1] > upToLump) {
           BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
@@ -801,20 +802,34 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
   }
   BASPACHO_SIGNPOST_END("sparseElim");
 
+  // Store the numeric context for finishInternalFactorRangeLU to pick up.
+  // Transfer ownership: NumericCtxPtr<T> (unique_ptr<NumericCtx<T>>) → unique_ptr<NumericCtxBase>.
+  pendingNumCtx_.reset(numCtx.release());
+}
+
+template <typename T>
+void Solver::finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
+                                         int64_t endSpanIndex, bool verbose) const {
+  BASPACHO_CHECK(pendingNumCtx_ != nullptr);
+  // Recover the typed NumericCtx from the type-erased base pointer.
+  NumericCtx<T>* numCtxRaw = dynamic_cast<NumericCtx<T>*>(pendingNumCtx_.get());
+  BASPACHO_CHECK(numCtxRaw != nullptr);
+
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
   int64_t denseOpsFromLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
   if (verbose) {
     std::cout << "LU Block-Fact from: " << denseOpsFromLump << std::endl;
   }
 
-  // Signal GPU backends to enter CPU BLAS mode for dense operations.
-  // On CUDA: syncs GPU, copies data buffer D→H, operates on host for all dense ops.
-  // On Metal: no-op (unified memory already allows direct CPU access).
-  numCtx->beginDenseOps(data, factorSkel.totalDataSize());
+  // Wait for GPU sparse elimination to complete, enter CPU BLAS mode.
+  BASPACHO_SIGNPOST_BEGIN("beginDenseOps");
+  numCtxRaw->beginDenseOps(data, factorSkel.totalDataSize());
+  BASPACHO_SIGNPOST_END("beginDenseOps");
 
   BASPACHO_SIGNPOST_BEGIN("denseLoop");
-  // Dense loop profiling: measure time per lump when verbose or BASPACHO_PROFILE_LU is set.
-  // Note: profiling forces per-lump GPU sync (flush), so benchmark numbers will be worse.
   using ClockT = std::chrono::high_resolution_clock;
   double totalBoardMs = 0, totalFactorMs = 0;
   static const bool profileLU = std::getenv("BASPACHO_PROFILE_LU") != nullptr;
@@ -824,17 +839,13 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
        l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
     auto tLumpStart = verbose ? ClockT::now() : ClockT::time_point{};
 
-    numCtx->prepareAssemble(l);
+    numCtxRaw->prepareAssemble(l);
 
-    //  iterate over columns having a non-trivial a-block
-    // When sparse elimination was used (denseOpsFromLump > 0), startElimRowPtr
-    // skips board entries pointing to already-eliminated lumps.
-    // When no sparse elimination (denseOpsFromLump == 0), use boardRowPtr directly.
     int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
                                                : factorSkel.boardRowPtr[l];
     int64_t boardCount = 0;
     for (int64_t rPtr = rPtrStart,
-                 rEnd = factorSkel.boardRowPtr[l + 1] - 1;  // skip last (diag block)
+                 rEnd = factorSkel.boardRowPtr[l + 1] - 1;
          rPtr < rEnd; rPtr++) {
       int64_t origLump = factorSkel.boardColLump[rPtr];
       if (origLump >= upToLump) {
@@ -842,18 +853,18 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       } else if (origLump < startLump) {
         continue;
       }
-      eliminateBoardLU(*numCtx, data, rPtr);
+      eliminateBoardLU(*numCtxRaw, data, rPtr);
       boardCount++;
     }
 
     auto tBoardEnd = verbose ? ClockT::now() : ClockT::time_point{};
 
     if (l < upToLump) {
-      factorLumpLU(*numCtx, data, pivots, l);
+      factorLumpLU(*numCtxRaw, data, pivots, l);
     }
 
     if (verbose) {
-      numCtx->flush();  // sync GPU for accurate timing
+      numCtxRaw->flush();
       auto tEnd = ClockT::now();
       int64_t lumpSize = factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l];
       double boardMs = std::chrono::duration<double, std::milli>(tBoardEnd - tLumpStart).count();
@@ -874,21 +885,37 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
 
   BASPACHO_SIGNPOST_END("denseLoop");
 
-  numCtx->flush();
-  // Collect deferred perturb count from GPU backends (Metal defers perturbSmallDiagonals
-  // to GPU kernel, returning 0 inline and accumulating count on device).
-  staticPivotPerturbCount_ += numCtx->deferredPerturbCount();
+  BASPACHO_SIGNPOST_BEGIN("flush");
+  numCtxRaw->flush();
+  staticPivotPerturbCount_ += numCtxRaw->deferredPerturbCount();
+  BASPACHO_SIGNPOST_END("flush");
+
+  // Release the pending context.
+  pendingNumCtx_.reset();
 }
 
 template <typename T>
 void Solver::factorLU(T* data, int64_t* pivots, bool verbose) const {
   staticPivotPerturbCount_ = 0;
-  internalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
+  beginInternalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
+  finishInternalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
+}
+
+template <typename T>
+void Solver::beginFactorLU(T* data, int64_t* pivots, bool verbose) const {
+  staticPivotPerturbCount_ = 0;
+  beginInternalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
+}
+
+template <typename T>
+void Solver::finishFactorLU(T* data, int64_t* pivots, bool verbose) const {
+  finishInternalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
 }
 
 template <typename T>
 void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride,
                      int nRHS) const {
+  BASPACHO_SIGNPOST_BEGIN("solveSetup");
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
   // With transpose workaround in getrf, we have P * A = L * U (standard form).
@@ -899,10 +926,12 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
 
   // Pre-upload all pivots to GPU (avoids per-lump sync on GPU backends)
   slvCtx->uploadPivots(pivots, factorSkel.lumpStart[factorSkel.numLumps()]);
+  BASPACHO_SIGNPOST_END("solveSetup");
 
   // Step 1: Apply row permutation P: y = P * b
   // Skip sparse-elim lumps when LU sparse elimination is active —
   // their pivots are identity (1x1 scalar blocks, no pivoting needed)
+  BASPACHO_SIGNPOST_BEGIN("solvePerm");
   int64_t pivotStartLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
   for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
@@ -912,15 +941,19 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
     slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
   }
   slvCtx->flush();  // Ensure permutation visible before L solve
+  BASPACHO_SIGNPOST_END("solvePerm");
 
   // Step 2: Solve L * z = y (forward substitution with unit lower triangular L)
+  BASPACHO_SIGNPOST_BEGIN("solveL");
   internalSolveLRangeUnit(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   slvCtx->flush();  // Ensure L solve complete before U solve
+  BASPACHO_SIGNPOST_END("solveL");
 
   // Step 3: Solve U * x = z (backward substitution with U factor)
+  BASPACHO_SIGNPOST_BEGIN("solveU");
   internalSolveURange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-
   slvCtx->flush();
+  BASPACHO_SIGNPOST_END("solveU");
 }
 
 // Forward substitution for LU with unit lower triangular L
@@ -1056,6 +1089,10 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
 
 template void Solver::factorLU<double>(double* data, int64_t* pivots, bool verbose) const;
 template void Solver::factorLU<float>(float* data, int64_t* pivots, bool verbose) const;
+template void Solver::beginFactorLU<double>(double* data, int64_t* pivots, bool verbose) const;
+template void Solver::beginFactorLU<float>(float* data, int64_t* pivots, bool verbose) const;
+template void Solver::finishFactorLU<double>(double* data, int64_t* pivots, bool verbose) const;
+template void Solver::finishFactorLU<float>(float* data, int64_t* pivots, bool verbose) const;
 template void Solver::solveLU<double>(const double* matData, const int64_t* pivots, double* vecData,
                                       int64_t stride, int nRHS) const;
 template void Solver::solveLU<float>(const float* matData, const int64_t* pivots, float* vecData,

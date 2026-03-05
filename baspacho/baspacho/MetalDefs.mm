@@ -21,7 +21,8 @@ namespace BaSpaCho {
 class MetalContextImpl {
  public:
   id<MTLDevice> device;
-  id<MTLCommandQueue> commandQueue;
+  id<MTLCommandQueue> commandQueue;    // Primary queue for solve/factor
+  id<MTLCommandQueue> asyncQueue;      // Async queue for pipelined sparse elim
   id<MTLLibrary> library;
   std::unordered_map<std::string, id<MTLComputePipelineState>> pipelineCache;
   std::mutex pipelineMutex;
@@ -32,9 +33,13 @@ class MetalContextImpl {
       device = MTLCreateSystemDefaultDevice();
       mtlCHECK(device != nil, "Failed to create Metal device");
 
-      // Create command queue
+      // Create primary command queue (for main solve/factor work)
       commandQueue = [device newCommandQueue];
       mtlCHECK(commandQueue != nil, "Failed to create Metal command queue");
+
+      // Create async command queue (for pipelined sparse elimination)
+      asyncQueue = [device newCommandQueue];
+      mtlCHECK(asyncQueue != nil, "Failed to create Metal async command queue");
 
       // Load the compiled shader library
 #ifdef BASPACHO_METAL_LIBRARY_PATH
@@ -60,6 +65,7 @@ class MetalContextImpl {
     @autoreleasepool {
       pipelineCache.clear();
       library = nil;
+      asyncQueue = nil;
       commandQueue = nil;
       device = nil;
     }
@@ -113,6 +119,8 @@ MetalContext::~MetalContext() { delete impl; }
 void* MetalContext::device() { return (__bridge void*)impl->device; }
 
 void* MetalContext::commandQueue() { return (__bridge void*)impl->commandQueue; }
+
+void* MetalContext::asyncQueue() { return (__bridge void*)impl->asyncQueue; }
 
 void* MetalContext::library() { return (__bridge void*)impl->library; }
 

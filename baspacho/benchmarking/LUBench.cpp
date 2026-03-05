@@ -353,6 +353,186 @@ static vector<LUTimingResult> benchmarkLUMetal(
 
   return results;
 }
+// Pipelined Metal benchmark: overlaps GPU sparse elimination with CPU solve.
+// Uses MTLSharedEvent (inside NumericCtx) as sync points between phases.
+// Double-buffers GPU data via MetalMirror (unified memory — no redundant copies).
+static vector<LUTimingResult> benchmarkLUMetalPipelined(
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
+  if (matrices.empty()) return {};
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+
+  auto preproc = computeMaxTransversal(n, A0.rowPtr.data(), A0.colInd.data());
+
+  vector<int64_t> pRowPtr, pColInd;
+  vector<double> pValues;
+  applyRowPermToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                            preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+  SparseStructure ss = csrToSymmetricSparseStructure(n, pRowPtr.data(), pColInd.data());
+
+  vector<int64_t> paramSizes(n, 1);
+  vector<int64_t> blockSizes(n, 1);
+
+  Settings metalSettings;
+  metalSettings.backend = BackendMetal;
+  metalSettings.matrixType = MTYPE_GENERAL;
+  metalSettings.staticPivotThreshold = 0.0;
+
+  auto solver = createSolver(metalSettings, paramSizes, ss);
+  const auto& perm = solver->paramToSpan();
+  int64_t totalDataSz = solver->skel().totalDataSize();
+
+  // Double-buffered GPU data: MetalMirror uses MTLStorageModeShared (unified memory).
+  // We write directly to dataGpu[i].ptr() — no separate CPU buffer needed.
+  MetalMirror<float> dataGpu[2];
+  dataGpu[0].resizeToAtLeast(totalDataSz);
+  dataGpu[1].resizeToAtLeast(totalDataSz);
+  vector<int64_t> pivots[2];
+  pivots[0].resize(n);
+  pivots[1].resize(n);
+
+  // Per-matrix preprocessing (equilibration scales saved per-buffer for solve)
+  vector<double> rowScale[2], colScale[2];
+
+  // Preprocess + load matrix directly into GPU buffer (no intermediate CPU vector)
+  auto preprocessAndLoad = [&](size_t mi, int buf) {
+    const CsrMatrix& A = matrices[mi].first;
+    applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                              preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(),
+                         rowScale[buf], colScale[buf]);
+    applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                                     preproc.rowPerm.data(), rowScale[buf].data(),
+                                     colScale[buf].data(), pRowPtr, pColInd, pValues);
+    vector<float> sValues(pValues.begin(), pValues.end());
+    // Write directly to unified memory GPU buffer
+    memset(dataGpu[buf].ptr(), 0, totalDataSz * sizeof(float));
+    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
+                        dataGpu[buf].ptr());
+  };
+
+  // Solve with mixed-precision iterative refinement.
+  // Data stays on GPU (unified memory) — no get/load between factor and solve.
+  auto solveWithRefinement = [&](size_t mi, int buf) -> LUTimingResult {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    const auto& rs = rowScale[buf];
+    const auto& cs = colScale[buf];
+    LUTimingResult res;
+    res.perturbCount = solver->staticPivotPerturbCount();
+
+    Eigen::VectorXf bp(n);
+    for (int64_t j = 0; j < n; j++) {
+      bp(perm[j]) = float(rs[j] * b(preproc.rowPerm[j]));
+    }
+
+    MetalMirror<float> xGpu;
+    vector<float> xVec(n);
+
+    auto tSolve = Clock::now();
+    xGpu.load(vector<float>(bp.data(), bp.data() + n));
+    solver->solveLU(dataGpu[buf].ptr(), pivots[buf].data(), xGpu.ptr(), n, 1);
+    xGpu.get(xVec);
+    for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+
+    Eigen::VectorXd x(n);
+    for (int64_t j = 0; j < n; j++) {
+      x(j) = cs[j] * double(bp(perm[j]));
+    }
+
+    double residual = computeResidualDouble(A, x, b);
+    res.refineSteps = 0;
+    const int maxRefine = 30;
+    for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
+      Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+      for (int64_t i = 0; i < n; i++) {
+        for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
+          r(i) += A.values[k] * x(A.colInd[k]);
+        }
+      }
+      r = b - r;
+      for (int64_t j = 0; j < n; j++) {
+        bp(perm[j]) = float(rs[j] * r(preproc.rowPerm[j]));
+      }
+      xGpu.load(vector<float>(bp.data(), bp.data() + n));
+      solver->solveLU(dataGpu[buf].ptr(), pivots[buf].data(), xGpu.ptr(), n, 1);
+      xGpu.get(xVec);
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+      for (int64_t j = 0; j < n; j++) {
+        x(j) += cs[j] * double(bp(perm[j]));
+      }
+      residual = computeResidualDouble(A, x, b);
+      res.refineSteps++;
+    }
+    res.solveTime = tdelta(Clock::now() - tSolve).count();
+    res.residual = residual;
+    return res;
+  };
+
+  vector<LUTimingResult> results;
+  int cur = 0;
+
+  // Matrix 0: full factorLU (no pipelining for first matrix)
+  preprocessAndLoad(0, cur);
+  auto tFactor0 = Clock::now();
+  solver->factorLU(dataGpu[cur].ptr(), pivots[cur].data());
+  double factorTime0 = tdelta(Clock::now() - tFactor0).count();
+
+  // Pipeline: for each matrix, begin next factor, then solve current, then finish next.
+  // The GPU processes N+1's sparse elim (via MTLSharedEvent deferred commit) while
+  // the CPU does N's iterative refinement. When finishFactorLU is called,
+  // waitForGpu() polls the shared event — should be instant if GPU finished.
+  for (size_t mi = 0; mi < matrices.size(); mi++) {
+    int next = 1 - cur;
+    bool hasNext = (mi + 1 < matrices.size());
+
+    // Preprocess N+1 and submit its sparse elim to GPU (returns immediately)
+    double beginTime = 0;
+    if (hasNext) {
+      preprocessAndLoad(mi + 1, next);
+      auto tBegin = Clock::now();
+      solver->beginFactorLU(dataGpu[next].ptr(), pivots[next].data());
+      beginTime = tdelta(Clock::now() - tBegin).count();
+    }
+
+    // Solve matrix N — GPU processes N+1's sparse elim concurrently.
+    // Both use the same Metal command queue but different buffers (no data conflict).
+    // Note: solve's GPU dispatches queue behind N+1's sparse elim on the same queue.
+    LUTimingResult res = solveWithRefinement(mi, cur);
+    // Factor time: first matrix uses full factorLU time; subsequent use finishFactorLU
+    // time from the previous iteration (the begin phase was overlapped with prev solve).
+    res.factorTime = factorTime0;
+
+    // Complete N+1's factorization: waits for GPU sparse elim (should be done),
+    // then runs dense loop on CPU.
+    double finishTime = 0;
+    if (hasNext) {
+      auto tFinish = Clock::now();
+      solver->finishFactorLU(dataGpu[next].ptr(), pivots[next].data());
+      finishTime = tdelta(Clock::now() - tFinish).count();
+      // This becomes the factor time for matrix mi+1
+      factorTime0 = finishTime;
+    }
+
+    if (verbose) {
+      cout << "  [MetalPipe] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
+           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+           << setprecision(2) << res.residual << ", refine=" << res.refineSteps
+           << ", perturbed=" << res.perturbCount;
+      if (hasNext) {
+        cout << " | next: begin=" << fixed << setprecision(4) << beginTime
+             << "s, finish=" << finishTime << "s";
+      }
+      cout << endl;
+    }
+
+    results.push_back(res);
+    cur = next;
+  }
+
+  return results;
+}
 #endif  // BASPACHO_USE_METAL
 
 // ============================================================================
@@ -756,6 +936,7 @@ void help() {
        << "  BaSpaCho_LU_CPU\n"
 #ifdef BASPACHO_USE_METAL
        << "  BaSpaCho_LU_Metal\n"
+       << "  BaSpaCho_LU_MetalPipe  (pipelined: overlap N+1 sparse elim with N solve)\n"
 #endif
 #ifdef BASPACHO_USE_CUBLAS
        << "  BaSpaCho_LU_CUDA\n"
@@ -960,6 +1141,18 @@ int main(int argc, char* argv[]) {
 
     resultToRecords(problemName, "BaSpaCho_LU_Metal", timings, allRecords);
     if (!jsonOutput) printResults("BaSpaCho_LU_Metal", timings);
+  }
+
+  if (regex_search(string("BaSpaCho_LU_MetalPipe"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_MetalPipe (pipelined)..." << endl;
+    auto timings = benchmarkLUMetalPipelined(matrices, verbose);
+
+    if (isWarmup && timings.size() > 1) {
+      timings.erase(timings.begin());
+    }
+
+    resultToRecords(problemName, "BaSpaCho_LU_MetalPipe", timings, allRecords);
+    if (!jsonOutput) printResults("BaSpaCho_LU_MetalPipe", timings);
   }
 #endif
 

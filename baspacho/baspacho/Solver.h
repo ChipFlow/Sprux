@@ -68,6 +68,38 @@ class Solver {
   template <typename T>
   void factorLU(T* data, int64_t* pivots, bool verbose = false) const;
 
+  /**
+   * @brief Begin LU factorization (phase 1): submit sparse elimination to GPU.
+   *
+   * Creates the numeric context, computes the static pivot threshold, and
+   * dispatches sparse elimination kernels to the GPU. The GPU work is submitted
+   * but NOT waited on — it runs asynchronously.
+   *
+   * Call finishFactorLU() to complete the factorization (waits for GPU, runs
+   * dense loop). Between beginFactorLU and finishFactorLU, the GPU is busy
+   * processing sparse elimination while the CPU is free for other work (e.g.,
+   * solving the previous matrix).
+   *
+   * @param data Matrix data buffer
+   * @param pivots Pivot array (sized to numSpans())
+   * @param verbose If true, prints timing information
+   */
+  template <typename T>
+  void beginFactorLU(T* data, int64_t* pivots, bool verbose = false) const;
+
+  /**
+   * @brief Finish LU factorization (phase 2): wait for GPU, run dense loop.
+   *
+   * Must be called after beginFactorLU(). Waits for the GPU sparse elimination
+   * to complete, then runs the dense factorization loop on CPU.
+   *
+   * @param data Same data buffer passed to beginFactorLU
+   * @param pivots Same pivots array passed to beginFactorLU
+   * @param verbose If true, prints timing information
+   */
+  template <typename T>
+  void finishFactorLU(T* data, int64_t* pivots, bool verbose = false) const;
+
   // solve in place with LLt (vector must be permuted)
   template <typename T>
   void solve(const T* matData, T* vecData, int64_t stride, int nRHS) const;
@@ -287,6 +319,15 @@ class Solver {
   void internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex, int64_t endSpanIndex,
                              bool verbose = false) const;
 
+  // Split-phase internal methods for pipelined LU factorization
+  template <typename T>
+  void beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
+                                  int64_t endSpanIndex, bool verbose = false) const;
+
+  template <typename T>
+  void finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
+                                   int64_t endSpanIndex, bool verbose = false) const;
+
   template <typename T>
   void internalSolveURange(SolveCtx<T>& slvCtx, const T* data, int64_t startSpanIndex,
                            int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const;
@@ -322,6 +363,10 @@ class Solver {
   double staticPivotThreshold_;
   mutable int64_t staticPivotPerturbCount_ = 0;
   mutable double effectiveStaticPivotThreshold_ = 0.0;
+
+  // Pending numeric context for split-phase factorization (beginFactorLU/finishFactorLU).
+  // Type-erased to support both float and double template instantiations.
+  mutable std::unique_ptr<NumericCtxBase> pendingNumCtx_;
 
   OpsPtr ops;
   SymbolicCtxPtr symCtx;

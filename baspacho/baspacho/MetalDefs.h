@@ -79,9 +79,10 @@ class MetalContext {
   static MetalContext& instance();
 
   // Get raw pointers to Metal objects (cast to appropriate type in .mm files)
-  void* device();        // Returns id<MTLDevice>
-  void* commandQueue();  // Returns id<MTLCommandQueue>
-  void* library();       // Returns id<MTLLibrary>
+  void* device();         // Returns id<MTLDevice>
+  void* commandQueue();   // Returns id<MTLCommandQueue> (primary queue)
+  void* asyncQueue();     // Returns id<MTLCommandQueue> (async queue for pipelined sparse elim)
+  void* library();        // Returns id<MTLLibrary>
 
   // Wait for all GPU operations to complete
   void synchronize();
