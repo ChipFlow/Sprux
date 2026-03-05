@@ -777,6 +777,192 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
+  // Batch all LU sparse elimination levels into a single command buffer.
+  // Encodes all factor+elim kernels with memory barriers, single commit+wait.
+  void doAllEliminationsLU(const std::vector<SymElimCtxPtr>& elimCtxs,
+                           const std::vector<int64_t>& ranges, float* data,
+                           float staticPivotThreshold,
+                           int64_t& totalPerturbCount) override {
+    @autoreleasepool {
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error(
+            "MetalNumericCtx<float>::doAllEliminationsLU: data buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      // Single perturb counter for all levels
+      id<MTLBuffer> perturbBuf = [sym.device newBufferWithLength:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+      *(uint32_t*)[perturbBuf contents] = 0;
+
+      id<MTLComputePipelineState> factorPipeline =
+          getProfiledPipeline("lu_factor_lumps_kernel_float");
+      id<MTLComputePipelineState> elimPipeline =
+          getProfiledPipeline("lu_sparse_elim_precomputed_float");
+
+      for (size_t l = 0; l + 1 < ranges.size(); l++) {
+        if (!elimCtxs[l]) continue;
+        const MetalSymElimCtx& elim =
+            *dynamic_cast<const MetalSymElimCtx*>(elimCtxs[l].get());
+
+        int64_t lumpsBegin = ranges[l];
+        int64_t lumpsEnd = ranges[l + 1];
+        int64_t numLumps = lumpsEnd - lumpsBegin;
+        if (numLumps <= 0) continue;
+
+        float threshold = staticPivotThreshold;
+
+        // LU factor lumps (divide below-diag by diagonal)
+        encodeKernel(
+            factorPipeline,
+            ^(id<MTLComputeCommandEncoder> enc) {
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                      offset:0
+                     atIndex:0];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                      offset:0
+                     atIndex:1];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                      offset:0
+                     atIndex:2];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
+                      offset:0
+                     atIndex:3];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
+                      offset:0
+                     atIndex:4];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                      offset:0
+                     atIndex:5];
+              [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
+              [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+              [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+              [enc setBytes:&threshold length:sizeof(float) atIndex:9];
+              [enc setBuffer:perturbBuf offset:0 atIndex:10];
+            },
+            (NSUInteger)numLumps);
+
+        // LU Schur complement
+        if (elim.numWorkItems > 0) {
+          encodeKernel(
+              elimPipeline,
+              ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+                [enc setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
+                        offset:0
+                       atIndex:1];
+                [enc setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
+              },
+              (NSUInteger)elim.numWorkItems);
+        }
+      }
+
+      // Single commit+wait for all levels
+      commitAndWait();
+      totalPerturbCount += *(uint32_t*)[perturbBuf contents];
+    }
+  }
+
+  // Batch all Cholesky sparse elimination levels into a single command buffer.
+  void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
+                         const std::vector<int64_t>& ranges, float* data) override {
+    @autoreleasepool {
+      auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!bufferInfo.first) {
+        throw std::runtime_error(
+            "MetalNumericCtx<float>::doAllEliminations: data buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
+      size_t dataBaseOffset = bufferInfo.second;
+
+      id<MTLComputePipelineState> factorPipeline =
+          getProfiledPipeline("factor_lumps_kernel_float");
+      id<MTLComputePipelineState> elimStraightPipeline =
+          getProfiledPipeline("sparse_elim_straight_kernel_float");
+
+      for (size_t l = 0; l + 1 < ranges.size(); l++) {
+        if (!elimCtxs[l]) continue;
+        const MetalSymElimCtx& elim =
+            *dynamic_cast<const MetalSymElimCtx*>(elimCtxs[l].get());
+
+        int64_t lumpsBegin = ranges[l];
+        int64_t lumpsEnd = ranges[l + 1];
+        int64_t numLumps = lumpsEnd - lumpsBegin;
+        if (numLumps <= 0) continue;
+
+        // Factor lumps (Cholesky on diagonal blocks + below-diagonal solve)
+        encodeKernel(
+            factorPipeline,
+            ^(id<MTLComputeCommandEncoder> enc) {
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                      offset:0
+                     atIndex:0];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                      offset:0
+                     atIndex:1];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                      offset:0
+                     atIndex:2];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
+                      offset:0
+                     atIndex:3];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
+                      offset:0
+                     atIndex:4];
+              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                      offset:0
+                     atIndex:5];
+              [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
+              [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+              [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+            },
+            (NSUInteger)numLumps);
+
+        // Sparse elimination
+        if (elim.numBlockPairs > 0) {
+          encodeKernel(
+              elimStraightPipeline,
+              ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                        offset:0
+                       atIndex:0];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                        offset:0
+                       atIndex:1];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:0
+                       atIndex:2];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0
+                       atIndex:3];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                        offset:0
+                       atIndex:4];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
+                        offset:0
+                       atIndex:5];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
+                        offset:0
+                       atIndex:6];
+                [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
+                [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
+                [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
+                [enc setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
+                        offset:0
+                       atIndex:10];
+                [enc setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
+              },
+              (NSUInteger)elim.numBlockPairs);
+        }
+      }
+
+      // Single commit+wait for all levels
+      commitAndWait();
+    }
+  }
+
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
     @autoreleasepool {
       if (n <= 0) return;

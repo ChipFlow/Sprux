@@ -195,19 +195,30 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
 
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
 
-  for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
-    if (sparseElimRanges[l + 1] > upToLump) {
-      BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
-      return;
-    } else if (startLump > sparseElimRanges[l]) {
-      BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
-      continue;
-    }
+  if (!sparseElimRanges.empty() && startLump == 0 && upToLump >= sparseElimRanges.back()) {
+    // Common case: full range — batch all levels in one GPU submission
     if (verbose) {
-      std::cout << "Elim set: " << l << " (" << sparseElimRanges[l] << ".."
-                << sparseElimRanges[l + 1] << ")" << std::endl;
+      for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+        std::cout << "Elim set: " << l << " (" << sparseElimRanges[l] << ".."
+                  << sparseElimRanges[l + 1] << ")" << std::endl;
+      }
     }
-    numCtx->doElimination(*elimCtxs[l], data, sparseElimRanges[l], sparseElimRanges[l + 1]);
+    numCtx->doAllEliminations(elimCtxs, sparseElimRanges, data);
+  } else {
+    for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+      if (sparseElimRanges[l + 1] > upToLump) {
+        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        return;
+      } else if (startLump > sparseElimRanges[l]) {
+        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        continue;
+      }
+      if (verbose) {
+        std::cout << "Elim set: " << l << " (" << sparseElimRanges[l] << ".."
+                  << sparseElimRanges[l + 1] << ")" << std::endl;
+      }
+      numCtx->doElimination(*elimCtxs[l], data, sparseElimRanges[l], sparseElimRanges[l + 1]);
+    }
   }
 
   int64_t denseOpsFromLump = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
@@ -730,23 +741,38 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
       (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
 
   if (!luElimCtxs.empty()) {
-    for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
-      if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
-        break;
-      } else if (startLump > sparseElimRanges[l]) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
-        continue;
-      }
-      if (luElimCtxs[l]) {
-        if (verbose) {
-          std::cout << "LU Elim set: " << l << " (" << sparseElimRanges[l] << ".."
-                    << sparseElimRanges[l + 1] << ")" << std::endl;
+    if (startLump == 0 && upToLump >= sparseElimRanges.back()) {
+      // Common case: full range — batch all levels in one GPU submission
+      if (verbose) {
+        for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+          if (luElimCtxs[l]) {
+            std::cout << "LU Elim set: " << l << " (" << sparseElimRanges[l] << ".."
+                      << sparseElimRanges[l + 1] << ")" << std::endl;
+          }
         }
-        int64_t perturbCount = 0;
-        numCtx->doEliminationLU(*luElimCtxs[l], data, sparseElimRanges[l],
-                                sparseElimRanges[l + 1], effectiveThreshold, perturbCount);
-        staticPivotPerturbCount_ += perturbCount;
+      }
+      numCtx->doAllEliminationsLU(luElimCtxs, sparseElimRanges, data, effectiveThreshold,
+                                  staticPivotPerturbCount_);
+    } else {
+      // Partial factorization: per-level calls with range clipping
+      for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+        if (sparseElimRanges[l + 1] > upToLump) {
+          BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+          break;
+        } else if (startLump > sparseElimRanges[l]) {
+          BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+          continue;
+        }
+        if (luElimCtxs[l]) {
+          if (verbose) {
+            std::cout << "LU Elim set: " << l << " (" << sparseElimRanges[l] << ".."
+                      << sparseElimRanges[l + 1] << ")" << std::endl;
+          }
+          int64_t perturbCount = 0;
+          numCtx->doEliminationLU(*luElimCtxs[l], data, sparseElimRanges[l],
+                                  sparseElimRanges[l + 1], effectiveThreshold, perturbCount);
+          staticPivotPerturbCount_ += perturbCount;
+        }
       }
     }
   }

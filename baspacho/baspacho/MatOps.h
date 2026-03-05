@@ -10,6 +10,7 @@
 #include <cxxabi.h>
 #include <memory>
 #include <typeindex>
+#include <vector>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
 
 namespace BaSpaCho {
@@ -140,6 +141,17 @@ struct NumericCtx : NumericCtxBase {
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) = 0;
 
+  // Batch all Cholesky sparse elimination levels into a single GPU submission.
+  // Default: calls doElimination per level (CPU/non-batching backends).
+  virtual void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
+                                 const std::vector<int64_t>& ranges, T* data) {
+    for (size_t l = 0; l + 1 < ranges.size(); l++) {
+      if (elimCtxs[l]) {
+        doElimination(*elimCtxs[l], data, ranges[l], ranges[l + 1]);
+      }
+    }
+  }
+
   // LU sparse elimination for non-symmetric matrices (1x1 scalar lumps)
   // Uses L from lower chain and U from upper chain for Schur complement
   virtual void doEliminationLU(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
@@ -152,6 +164,21 @@ struct NumericCtx : NumericCtxBase {
     (void)staticPivotThreshold;
     (void)perturbCount;
     throw std::runtime_error("doEliminationLU: LU sparse elimination not supported by this backend");
+  }
+
+  // Batch all LU sparse elimination levels into a single GPU submission.
+  // Default: calls doEliminationLU per level (CPU/non-batching backends).
+  virtual void doAllEliminationsLU(const std::vector<SymElimCtxPtr>& elimCtxs,
+                                   const std::vector<int64_t>& ranges, T* data,
+                                   T staticPivotThreshold, int64_t& totalPerturbCount) {
+    for (size_t l = 0; l + 1 < ranges.size(); l++) {
+      if (elimCtxs[l]) {
+        int64_t perturbCount = 0;
+        doEliminationLU(*elimCtxs[l], data, ranges[l], ranges[l + 1], staticPivotThreshold,
+                        perturbCount);
+        totalPerturbCount += perturbCount;
+      }
+    }
   }
 
   // Read a single value from data buffer. Default: direct CPU read.
