@@ -129,6 +129,7 @@ struct MetalSymbolicCtx : SymbolicCtx {
     @autoreleasepool {
       device = (__bridge id<MTLDevice>)MetalContext::instance().device();
       commandQueue = (__bridge id<MTLCommandQueue>)MetalContext::instance().commandQueue();
+      asyncCommandQueue = (__bridge id<MTLCommandQueue>)MetalContext::instance().asyncQueue();
 
       // Load all skeleton data to GPU buffers
       devLumpToSpan.load(skel.lumpToSpan);
@@ -280,7 +281,8 @@ struct MetalSymbolicCtx : SymbolicCtx {
   const CoalescedBlockMatrixSkel& skel;
 
   id<MTLDevice> device;
-  id<MTLCommandQueue> commandQueue;
+  id<MTLCommandQueue> commandQueue;       // Primary queue (solve, dense factor, MPS)
+  id<MTLCommandQueue> asyncCommandQueue;  // Async queue (pipelined sparse elimination)
 
   // Device buffers (mirrors of skeleton data)
   MetalMirror<int64_t> devLumpToSpan;
@@ -805,8 +807,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  // Batch all LU sparse elimination levels into a single command buffer.
-  // Encodes all factor+elim kernels with memory barriers, single commit+wait.
+  // Batch all LU sparse elimination levels into a single command buffer
+  // on the ASYNC queue. This allows sparse elim to run concurrently with
+  // solve operations on the primary queue when pipelining across matrices.
+  // Signals the shared event so beginDenseOps/waitForGpu can synchronize.
   void doAllEliminationsLU(const std::vector<SymElimCtxPtr>& elimCtxs,
                            const std::vector<int64_t>& ranges, float* data,
                            float staticPivotThreshold,
@@ -830,6 +834,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> elimPipeline =
           getProfiledPipeline("lu_sparse_elim_precomputed_float");
 
+      // Create a dedicated command buffer on the ASYNC queue.
+      // This is separate from pendingCmdBuf_ (primary queue) so that
+      // sparse elim can run concurrently with solve on the primary queue.
+      id<MTLCommandBuffer> asyncCmdBuf = [sym.asyncCommandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> asyncEncoder = [asyncCmdBuf computeCommandEncoder];
+      int dispatchCount = 0;
+
       for (size_t l = 0; l + 1 < ranges.size(); l++) {
         if (!elimCtxs[l]) continue;
         const MetalSymElimCtx& elim =
@@ -842,74 +853,75 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
         float threshold = staticPivotThreshold;
 
+        // Memory barrier between dispatches
+        if (dispatchCount > 0) {
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
         // LU factor lumps (divide below-diag by diagonal)
-        encodeKernel(
-            factorPipeline,
-            ^(id<MTLComputeCommandEncoder> enc) {
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                      offset:0
-                     atIndex:0];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                      offset:0
-                     atIndex:1];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                      offset:0
-                     atIndex:2];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
-                      offset:0
-                     atIndex:3];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
-                      offset:0
-                     atIndex:4];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
-                      offset:0
-                     atIndex:5];
-              [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
-              [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-              [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-              [enc setBytes:&threshold length:sizeof(float) atIndex:9];
-              [enc setBuffer:perturbBuf offset:0 atIndex:10];
-            },
-            (NSUInteger)numLumps);
+        [asyncEncoder setComputePipelineState:factorPipeline];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                         offset:0 atIndex:0];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                         offset:0 atIndex:1];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                         offset:0 atIndex:2];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
+                         offset:0 atIndex:3];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
+                         offset:0 atIndex:4];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                         offset:0 atIndex:5];
+        [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
+        [asyncEncoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+        [asyncEncoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+        [asyncEncoder setBytes:&threshold length:sizeof(float) atIndex:9];
+        [asyncEncoder setBuffer:perturbBuf offset:0 atIndex:10];
+
+        NSUInteger tgs = MIN(factorPipeline.maxTotalThreadsPerThreadgroup, 256);
+        tgs = MIN(tgs, (NSUInteger)numLumps);
+        [asyncEncoder dispatchThreadgroups:MTLSizeMake(((NSUInteger)numLumps + tgs - 1) / tgs, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        dispatchCount++;
 
         // LU Schur complement
         if (elim.numWorkItems > 0) {
-          encodeKernel(
-              elimPipeline,
-              ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-                [enc setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
-                        offset:0
-                       atIndex:1];
-                [enc setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
-              },
-              (NSUInteger)elim.numWorkItems);
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+          [asyncEncoder setComputePipelineState:elimPipeline];
+          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
+                           offset:0 atIndex:1];
+          [asyncEncoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
+
+          NSUInteger etgs = MIN(elimPipeline.maxTotalThreadsPerThreadgroup, 256);
+          etgs = MIN(etgs, (NSUInteger)elim.numWorkItems);
+          [asyncEncoder dispatchThreadgroups:
+              MTLSizeMake(((NSUInteger)elim.numWorkItems + etgs - 1) / etgs, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(etgs, 1, 1)];
+          dispatchCount++;
         }
       }
 
-      // Commit without waiting — GPU runs while CPU does setup before dense loop.
-      // Signal shared event so beginDenseOps can wait with lower overhead.
-      if (pendingEncoder_) {
-        [pendingEncoder_ endEncoding];
-        pendingEncoder_ = nil;
-      }
-      if (pendingCmdBuf_) {
+      [asyncEncoder endEncoding];
+
+      // Signal shared event on the async queue so waitForGpu() can detect completion.
+      // This works across queues — MTLSharedEvent is device-wide, not queue-specific.
+      if (dispatchCount > 0) {
         if (!sharedEvent_) {
           sharedEvent_ = [sym.device newSharedEvent];
         }
         sharedEventValue_++;
-        [pendingCmdBuf_ encodeSignalEvent:sharedEvent_ value:sharedEventValue_];
-        [pendingCmdBuf_ commit];
-        lastCommittedCmdBuf_ = pendingCmdBuf_;
-        pendingCmdBuf_ = nil;
-        pendingDispatchCount_ = 0;
+        [asyncCmdBuf encodeSignalEvent:sharedEvent_ value:sharedEventValue_];
+        [asyncCmdBuf commit];
+        lastCommittedCmdBuf_ = asyncCmdBuf;
       }
       // Defer perturb count readback to beginDenseOps/waitForGpu
       deferredElimPerturbBuf_ = perturbBuf;
     }
   }
 
-  // Batch all Cholesky sparse elimination levels into a single command buffer.
+  // Batch all Cholesky sparse elimination levels into a single command buffer
+  // on the ASYNC queue. Same pattern as doAllEliminationsLU.
   void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
                          const std::vector<int64_t>& ranges, float* data) override {
     @autoreleasepool {
@@ -926,6 +938,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> elimStraightPipeline =
           getProfiledPipeline("sparse_elim_straight_kernel_float");
 
+      // Create a dedicated command buffer on the ASYNC queue.
+      id<MTLCommandBuffer> asyncCmdBuf = [sym.asyncCommandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> asyncEncoder = [asyncCmdBuf computeCommandEncoder];
+      int dispatchCount = 0;
+
       for (size_t l = 0; l + 1 < ranges.size(); l++) {
         if (!elimCtxs[l]) continue;
         const MetalSymElimCtx& elim =
@@ -936,75 +953,80 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         int64_t numLumps = lumpsEnd - lumpsBegin;
         if (numLumps <= 0) continue;
 
+        if (dispatchCount > 0) {
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
         // Factor lumps (Cholesky on diagonal blocks + below-diagonal solve)
-        encodeKernel(
-            factorPipeline,
-            ^(id<MTLComputeCommandEncoder> enc) {
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                      offset:0
-                     atIndex:0];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                      offset:0
-                     atIndex:1];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                      offset:0
-                     atIndex:2];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
-                      offset:0
-                     atIndex:3];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
-                      offset:0
-                     atIndex:4];
-              [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
-                      offset:0
-                     atIndex:5];
-              [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
-              [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-              [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-            },
-            (NSUInteger)numLumps);
+        [asyncEncoder setComputePipelineState:factorPipeline];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                         offset:0 atIndex:0];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                         offset:0 atIndex:1];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                         offset:0 atIndex:2];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardColPtr.buffer()
+                         offset:0 atIndex:3];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devBoardChainColOrd.buffer()
+                         offset:0 atIndex:4];
+        [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                         offset:0 atIndex:5];
+        [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:6];
+        [asyncEncoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+        [asyncEncoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+
+        NSUInteger tgs = MIN(factorPipeline.maxTotalThreadsPerThreadgroup, 256);
+        tgs = MIN(tgs, (NSUInteger)numLumps);
+        [asyncEncoder dispatchThreadgroups:MTLSizeMake(((NSUInteger)numLumps + tgs - 1) / tgs, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        dispatchCount++;
 
         // Sparse elimination
         if (elim.numBlockPairs > 0) {
-          encodeKernel(
-              elimStraightPipeline,
-              ^(id<MTLComputeCommandEncoder> enc) {
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                        offset:0
-                       atIndex:0];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                        offset:0
-                       atIndex:1];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                        offset:0
-                       atIndex:2];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                        offset:0
-                       atIndex:3];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                        offset:0
-                       atIndex:4];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
-                        offset:0
-                       atIndex:5];
-                [enc setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                        offset:0
-                       atIndex:6];
-                [enc setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
-                [enc setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
-                [enc setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
-                [enc setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
-                        offset:0
-                       atIndex:10];
-                [enc setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
-              },
-              (NSUInteger)elim.numBlockPairs);
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+          [asyncEncoder setComputePipelineState:elimStraightPipeline];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                           offset:0 atIndex:0];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                           offset:0 atIndex:1];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                           offset:0 atIndex:2];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                           offset:0 atIndex:3];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                           offset:0 atIndex:4];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
+                           offset:0 atIndex:5];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
+                           offset:0 atIndex:6];
+          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
+          [asyncEncoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
+          [asyncEncoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
+                           offset:0 atIndex:10];
+          [asyncEncoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
+
+          NSUInteger etgs = MIN(elimStraightPipeline.maxTotalThreadsPerThreadgroup, 256);
+          etgs = MIN(etgs, (NSUInteger)elim.numBlockPairs);
+          [asyncEncoder dispatchThreadgroups:
+              MTLSizeMake(((NSUInteger)elim.numBlockPairs + etgs - 1) / etgs, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(etgs, 1, 1)];
+          dispatchCount++;
         }
       }
 
-      // Commit without waiting — GPU runs while CPU does setup before dense loop.
-      // Metal command queue ordering guarantees subsequent work sees these results.
-      commitPending();
+      [asyncEncoder endEncoding];
+
+      // Signal shared event and commit on async queue — same pattern as LU.
+      if (dispatchCount > 0) {
+        if (!sharedEvent_) {
+          sharedEvent_ = [sym.device newSharedEvent];
+        }
+        sharedEventValue_++;
+        [asyncCmdBuf encodeSignalEvent:sharedEvent_ value:sharedEventValue_];
+        [asyncCmdBuf commit];
+        lastCommittedCmdBuf_ = asyncCmdBuf;
+      }
     }
   }
 
