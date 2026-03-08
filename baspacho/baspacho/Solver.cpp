@@ -271,9 +271,8 @@ template <typename T>
 void Solver::solve(const T* matData, T* vecData, int64_t stride, int nRHS) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
   internalSolveLRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-  slvCtx->flush();  // Ensure L solve complete before Lt solve
   internalSolveLtRange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-  slvCtx->flush();
+  slvCtx->flush();  // Final flush: ensure all GPU solve work is complete
 }
 
 template <typename T>
@@ -933,19 +932,17 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
     int64_t pivotOffset = factorSkel.lumpStart[l];  // Row-based pivot index
     slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
   }
-  slvCtx->flush();  // Ensure permutation visible before L solve
   BASPACHO_SIGNPOST_END("solvePerm");
 
   // Step 2: Solve L * z = y (forward substitution with unit lower triangular L)
   BASPACHO_SIGNPOST_BEGIN("solveL");
   internalSolveLRangeUnit(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-  slvCtx->flush();  // Ensure L solve complete before U solve
   BASPACHO_SIGNPOST_END("solveL");
 
   // Step 3: Solve U * x = z (backward substitution with U factor)
   BASPACHO_SIGNPOST_BEGIN("solveU");
   internalSolveURange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-  slvCtx->flush();
+  slvCtx->flush();  // Final flush: ensure all GPU solve work is complete
   BASPACHO_SIGNPOST_END("solveU");
 }
 
