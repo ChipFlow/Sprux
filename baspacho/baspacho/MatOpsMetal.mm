@@ -22,9 +22,6 @@
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Utils.h"
-#ifdef BASPACHO_USE_BLAS
-#include "baspacho/baspacho/BlasDefs.h"
-#endif
 
 namespace BaSpaCho {
 
@@ -53,25 +50,6 @@ struct LUGemmWorkItem {
   int64_t m, n, k;
 };
 
-// Threshold for CPU BLAS fallback: when lump size is below this, dense
-// operations (getrf, trsm, gemm, applyRowPerm) use Accelerate BLAS on CPU
-// instead of MPS/GPU kernels. This avoids GPU dispatch overhead for small
-// matrices where CPU BLAS is faster (e.g., c6288 has max lump n=111).
-static int64_t getCpuBlasThreshold() {
-  static int64_t val = getMpsThreshold("BASPACHO_METAL_CPU_BLAS_THRESHOLD", 256);
-  return val;
-}
-
-#ifdef BASPACHO_USE_BLAS
-// Transpose square matrix in-place (for row-major ↔ col-major conversion)
-static void transposeSquareInPlaceFloat(float* data, int64_t n) {
-  for (int64_t i = 0; i < n; i++) {
-    for (int64_t j = i + 1; j < n; j++) {
-      std::swap(data[i * n + j], data[j * n + i]);
-    }
-  }
-}
-#endif
 
 // Binary search on CPU: find largest i such that array[i] <= needle
 // Mirrors GPU bisect() in MetalKernels.metal exactly.
@@ -1034,48 +1012,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending or committed GPU work
-      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
-          n <= getCpuBlasThreshold()) {
-        flushPendingGemms();
-        LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
-        return;
-      }
-#endif
-
-      // Three-tier threshold for Cholesky factorization:
-      // - n < kMinN: CPU Eigen (tiny matrices, MPS dispatch overhead dominates)
-      // - n > kMaxN: CPU BLAS (large matrices, multi-threaded BLAS >> MPS)
-      // - otherwise: MPS Cholesky (GPU acceleration for medium matrices)
-      static const int64_t kMpsPotrfMinN =
-          getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 4);
-      static const int64_t kMpsPotrfMaxN =
-          getMpsThreshold("BASPACHO_MPS_POTRF_MAX_N", 128);
-
-      if (n < kMpsPotrfMinN) {
-        // Very small matrix (1-3) — MPS dispatch overhead exceeds computation
-        commitAndWait();
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        Eigen::Map<MatRMaj> matA(data + offA, n, n);
-        Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
-        if (llt.info() != Eigen::Success) {
-          fprintf(stderr, "Metal potrf: Cholesky failed\n");
-        }
-        return;
-      }
-
-#ifdef BASPACHO_USE_BLAS
-      if (n > kMpsPotrfMaxN) {
-        // Large matrix — multi-threaded CPU BLAS is faster than MPS.
-        // col-major upper = row-major lower, matching BaSpaCho's storage.
-        commitAndWait();
-        LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, data + offA, n);
-        return;
-      }
-#endif
-
-      // Medium matrix — use MPS Cholesky on GPU
+      // MPS Cholesky on GPU for all sizes
       flushPendingGemms();
       // If a previous potrf status hasn't been checked yet, wait and check now
       // before reusing the status buffer.
@@ -1130,49 +1067,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending or committed GPU work
-      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
-          n <= getCpuBlasThreshold()) {
-        cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
-                    1.0f, data + offA, n, data + offB, n);
-        return;
-      }
-#endif
-
-      // Two-tier threshold for triangular solve:
-      // - n*n*k > kMaxThreshold: CPU BLAS (multi-threaded, better for large ops)
-      // - otherwise: MPS triangular solve (GPU acceleration)
-      // Set BASPACHO_MPS_TRSM_THRESHOLD > 0 to add a minimum for MPS (Eigen below).
-      // Set BASPACHO_MPS_TRSM_MAX_THRESHOLD to control the BLAS upper threshold.
-      static const int64_t kMpsTrsmThreshold =
-          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 0);
-      static const int64_t kMpsTrsmMaxThreshold =
-          getMpsThreshold("BASPACHO_MPS_TRSM_MAX_THRESHOLD", 128LL * 128 * 128);
-
-      if ((int64_t)n * n * k < kMpsTrsmThreshold) {
-        // CPU Eigen fallback — only used when env override sets threshold > 0
-        commitAndWait();
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-        // col-major's upper = (row-major's lower).transpose()
-        Eigen::Map<const MatCMaj> matA(data + offA, n, n);
-        Eigen::Map<MatRMaj> matB(data + offB, k, n);
-        matA.template triangularView<Eigen::Upper>().template solveInPlace<Eigen::OnTheRight>(matB);
-        return;
-      }
-
-#ifdef BASPACHO_USE_BLAS
-      if ((int64_t)n * n * k > kMpsTrsmMaxThreshold) {
-        // Large triangular solve — multi-threaded CPU BLAS is faster than MPS.
-        // col-major upper = row-major lower, matching BaSpaCho's storage.
-        commitAndWait();
-        cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
-                    1.0f, data + offA, n, data + offB, n);
-        return;
-      }
-#endif
-
+      // MPS triangular solve on GPU for all sizes.
       // Flush pending work, end compute encoder (MPS needs its own encoding)
       flushPendingGemms();
       if (pendingEncoder_) {
@@ -1234,21 +1129,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback when no pending or committed GPU work
-      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_ &&
-          k <= getCpuBlasThreshold()) {
-        tempBuffer.resizeToAtLeast(m * n);
-        // C(n,m) = B(n,k) * A^T(k,m), where A and B are row-major at data+offset
-        // Row-major m×k = col-major k×m (lda=k). Result n×m row-major = m×n col-major (ldc=m).
-        // Fortran: C(m,n) = A^T(m,k) * B(k,n), transA='C', transB='N'
-        cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, (BLAS_INT)m, (BLAS_INT)n,
-                    (BLAS_INT)k, 1.0f, data + offset, (BLAS_INT)k, data + offset, (BLAS_INT)k,
-                    0.0f, tempBuffer.ptr(), (BLAS_INT)m);
-        return;
-      }
-#endif
-
       // End compute encoder if active (MPS needs its own encoding pass)
       // but keep the same command buffer — Metal guarantees sequential execution
       // within a buffer, so assembly + GEMM can share one submission.
@@ -1260,24 +1140,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Ensure temp buffer is large enough
       tempBuffer.resizeToAtLeast(m * n);
 
-      // Always use MPS GEMM by default — single-threaded Eigen CPU fallback is
-      // far slower than MPS dispatch overhead for supernodal Cholesky workloads.
-      // Set BASPACHO_MPS_GEMM_THRESHOLD > 0 to revert to size-based routing.
-      static const int64_t kMpsThreshold =
-          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 0);
-      bool useMps = (m * n * k >= kMpsThreshold);
-
-      if (useMps) {
-        // Use MPS matrix multiplication: C = B * A^T
-        // Input: data[offset] is row-major with dims (m, k) for A and (n, k) for B (same memory)
-        // Output: tempBuffer is row-major with dims (n, m)
-        //
-        // MPS uses row-major storage. MPSMatrixMultiplication computes:
-        //   result = alpha * op(left) * op(right) + beta * result
-        //
-        // We want: C(n,m) = B(n,k) * A^T(k,m)
-        // So: left=B, right=A with transposeRight=YES
-
+      // MPS GEMM on GPU for all sizes.
+      // C(n,m) = B(n,k) * A^T(k,m), where A and B are row-major at data+offset
+      {
         auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
         if (!dataBufferInfo.first) {
           throw std::runtime_error("MetalNumericCtx<float>::saveSyrkGemm: data buffer not found");
@@ -1335,17 +1200,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         }
         [gemm encodeToCommandBuffer:pendingCmdBuf_ leftMatrix:mpsB rightMatrix:mpsA
                        resultMatrix:mpsC];
-      } else {
-        // CPU fallback — commit pending GPU work and wait before CPU accesses
-        commitAndWait();
-
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-
-        const float* AB = data + offset;
-        Eigen::Map<const MatRMaj> matA(AB, m, k);
-        Eigen::Map<const MatRMaj> matB(AB, n, k);
-        Eigen::Map<MatRMaj> matC(tempBuffer.ptr(), n, m);
-        matC.noalias() = matB * matA.transpose();
       }
     }
   }
@@ -1380,37 +1234,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
 
-      // CPU fallback when no pending or committed GPU work (avoids GPU dispatch overhead)
-      if (!pendingEncoder_ && !pendingCmdBuf_ && !lastCommittedCmdBuf_) {
-        const int64_t* chainRowsTillEnd =
-            sym.skel.chainRowsTillEnd.data() + srcColDataOffset;
-        const int64_t* pToSpan = sym.skel.chainRowSpan.data() + srcColDataOffset;
-        const int64_t* pSpanToChainOffset = spanToChainOffset.data();
-        const int64_t* pSpanOffsetInLump = sym.skel.spanOffsetInLump.data();
-        const float* matRectPtr = tempBuffer.ptr();
-        for (int64_t r = 0; r < numBlockRows; r++) {
-          int64_t rBegin = chainRowsTillEnd[r - 1] - rectRowBegin;
-          int64_t rSize = chainRowsTillEnd[r] - rBegin - rectRowBegin;
-          int64_t rParam = pToSpan[r];
-          int64_t rOffset = pSpanToChainOffset[rParam];
-          const float* matRowPtr = matRectPtr + rBegin * srcRectWidth;
-          int64_t cEnd = std::min(numBlockCols, r + 1);
-          for (int64_t c = 0; c < cEnd; c++) {
-            int64_t cStart = chainRowsTillEnd[c - 1] - rectRowBegin;
-            int64_t cSize = chainRowsTillEnd[c] - cStart - rectRowBegin;
-            int64_t offset = rOffset + pSpanOffsetInLump[pToSpan[c]];
-            float* dst = data + offset;
-            const float* src = matRowPtr + cStart;
-            for (int64_t i = 0; i < rSize; i++) {
-              for (int64_t j = 0; j < cSize; j++) {
-                dst[i * dstStride + j] -= src[i * srcRectWidth + j];
-              }
-            }
-          }
-        }
-        return;
-      }
-
+      // GPU assembly kernel for all sizes
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1582,45 +1406,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         return 0;
       }
 
-      // CPU BLAS path: for small matrices, use Accelerate sgetrf directly.
-      // On Apple Silicon shared memory, CPU can access the Metal buffer without copy.
-      // This avoids MPS dispatch overhead which dominates for small blocks.
-#ifdef BASPACHO_USE_BLAS
-      if (minMN <= getCpuBlasThreshold()) {
-        // Flush any pending GPU work to ensure data is visible to CPU
-        flushPendingGemms();
-        if (pendingEncoder_ || pendingCmdBuf_) {
-          commitPending();
-          waitForGpu();
-        }
-
-        // Transpose row-major → col-major for LAPACK
-        if (m == n) {
-          transposeSquareInPlaceFloat(data + offA, n);
-        }
-
-        std::vector<BLAS_INT> ipiv(minMN);
-        int info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, (BLAS_INT)m, (BLAS_INT)n,
-                                  data + offA, (BLAS_INT)m, ipiv.data());
-
-        // Transpose col-major → row-major
-        if (m == n) {
-          transposeSquareInPlaceFloat(data + offA, n);
-        }
-
-        // Convert pivots: LAPACK 1-based → 0-based
-        for (int64_t i = 0; i < minMN; i++) {
-          pivots[i] = ipiv[i] - 1;
-        }
-
-        // Pivots are on CPU — mark as not GPU-resident
-        pivotsOnGpu_ = false;
-
-        return info;
-      }
-#endif
-
-      // MPS path: use MPSMatrixDecompositionLU for parallel GPU factorization.
+      // MPS LU factorization on GPU for all sizes.
       // Flush pending saveGemm work items first — ensures all Schur
       // complement updates are dispatched before factorization of this lump.
       flushPendingGemms();
@@ -1709,15 +1495,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
-      // CPU BLAS path for small operations
-#ifdef BASPACHO_USE_BLAS
-      if (m <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
-        cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit,
-                    (BLAS_INT)n, (BLAS_INT)m, 1.0f, L + offL, (BLAS_INT)m, B + offB, (BLAS_INT)ldb);
-        return;
-      }
-#endif
-
+      // GPU kernel for all sizes
       auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!lBufferInfo.first || !bBufferInfo.first) {
@@ -1767,16 +1545,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
-      // CPU BLAS path for small operations
-#ifdef BASPACHO_USE_BLAS
-      if (n <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
-        (void)ldb;
-        cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
-                    (BLAS_INT)n, (BLAS_INT)m, 1.0f, U + offU, (BLAS_INT)n, B + offB, (BLAS_INT)n);
-        return;
-      }
-#endif
-
+      // GPU kernel for all sizes
       auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!uBufferInfo.first || !bBufferInfo.first) {
@@ -1867,20 +1636,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         return;
       }
 
-      // CPU BLAS path: immediate GEMM for small operations
-#ifdef BASPACHO_USE_BLAS
-      if (k <= getCpuBlasThreshold() && !pendingEncoder_ && !pendingCmdBuf_) {
-        // C -= L * U (row-major: in col-major view, C^T -= U^T * L^T)
-        cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
-                    (BLAS_INT)n, (BLAS_INT)m, (BLAS_INT)k, -1.0f,
-                    U + offU, (BLAS_INT)ldU, L + offL, (BLAS_INT)ldL,
-                    1.0f, C + offC, (BLAS_INT)ldC);
-        sym.luGemmCalls++;
-        return;
-      }
-#endif
-
-      // Batched path: buffer work items, flush later in flushPendingGemms()
+      // Batched GPU path: buffer work items, flush later in flushPendingGemms()
       // On first call, cache the data buffer info (L, U, C all share the same buffer)
       if (!cachedDataBuffer_) {
         auto bufferInfo = MetalBufferRegistry::instance().findBuffer(C);
@@ -1916,20 +1672,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0 || numCols <= 0) return;
 
-      // CPU path: pivots on CPU, no pending GPU work
-      if (!pivotsOnGpu_ && !pendingEncoder_ && !pendingCmdBuf_) {
-        float* d = data + offData;
-        for (int64_t i = 0; i < n; i++) {
-          int64_t swapRow = pivots[i];
-          if (swapRow != i) {
-            for (int64_t c = 0; c < numCols; c++) {
-              std::swap(d[i + c * ld], d[swapRow + c * ld]);
-            }
-          }
-        }
-        return;
-      }
-
+      // GPU kernel for all sizes
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
         throw std::runtime_error("MetalNumericCtx<float>::applyRowPerm: data buffer not found");
@@ -3097,42 +2840,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (n <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback: faster than MPS dispatch for small/medium matrices
-      if (n <= getCpuBlasThreshold()) {
-        for (int b = 0; b < batchSize; b++) {
-          LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, (*data)[b] + offA, n);
-        }
-        return;
-      }
-#endif
-
-      static const int64_t kMpsPotrfMinN = getMpsThreshold("BASPACHO_MPS_POTRF_MIN_N", 4);
-      static const int64_t kMpsPotrfMaxN = getMpsThreshold("BASPACHO_MPS_POTRF_MAX_N", 128);
-
-      if (n < kMpsPotrfMinN) {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        for (int b = 0; b < batchSize; b++) {
-          Eigen::Map<MatRMaj> matA((*data)[b] + offA, n, n);
-          Eigen::LLT<Eigen::Ref<MatRMaj>> llt(matA);
-          if (llt.info() != Eigen::Success) {
-            fprintf(stderr, "Metal batched potrf: Cholesky failed (batch %d)\n", b);
-          }
-        }
-        return;
-      }
-
-#ifdef BASPACHO_USE_BLAS
-      if (n > kMpsPotrfMaxN) {
-        // Large matrix — multi-threaded CPU BLAS is faster than MPS.
-        for (int b = 0; b < batchSize; b++) {
-          LAPACKE_spotrf(LAPACK_COL_MAJOR, 'U', n, (*data)[b] + offA, n);
-        }
-        return;
-      }
-#endif
-
-      // MPS path: encode all batch items into one command buffer
+      // MPS Cholesky on GPU for all sizes — encode all batch items into one command buffer
       id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
       NSMutableArray<id<MTLBuffer>>* statusBufs =
           [NSMutableArray arrayWithCapacity:batchSize];
@@ -3185,35 +2893,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback: faster than MPS for small/medium operations
-      if (n <= getCpuBlasThreshold()) {
-        for (int b = 0; b < batchSize; b++) {
-          float* batchData = (*data)[b];
-          cblas_strsm(CblasColMajor, CblasLeft, CblasUpper, CblasConjTrans, CblasNonUnit, n, k,
-                      1.0f, batchData + offA, n, batchData + offB, n);
-        }
-        return;
-      }
-#endif
-
-      static const int64_t kMpsTrsmThreshold =
-          getMpsThreshold("BASPACHO_MPS_TRSM_THRESHOLD", 0);
-
-      if ((int64_t)n * n * k < kMpsTrsmThreshold) {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        using MatCMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
-        for (int b = 0; b < batchSize; b++) {
-          float* batchData = (*data)[b];
-          Eigen::Map<const MatCMaj> matA(batchData + offA, n, n);
-          Eigen::Map<MatRMaj> matB(batchData + offB, k, n);
-          matA.template triangularView<Eigen::Upper>()
-              .template solveInPlace<Eigen::OnTheRight>(matB);
-        }
-        return;
-      }
-
-      // MPS path: encode all batch items into one command buffer
+      // MPS triangular solve on GPU for all sizes — encode all batch items
       id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
 
       for (int b = 0; b < batchSize; b++) {
@@ -3265,26 +2945,8 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-#ifdef BASPACHO_USE_BLAS
-      // CPU BLAS fallback: faster than MPS for small/medium operations
-      if (k <= getCpuBlasThreshold()) {
-        for (int b = 0; b < batchSize; b++) {
-          const float* batchData = (*data)[b];
-          // C(n,m) = B(n,k) * A^T(k,m), row-major at data+offset
-          // Fortran col-major: C(m,n) = A^T(m,k) * B(k,n)
-          cblas_sgemm(CblasColMajor, CblasConjTrans, CblasNoTrans, (BLAS_INT)m, (BLAS_INT)n,
-                      (BLAS_INT)k, 1.0f, batchData + offset, (BLAS_INT)k,
-                      batchData + offset, (BLAS_INT)k, 0.0f, tempBufPtrs[b], (BLAS_INT)m);
-        }
-        return;
-      }
-#endif
-
-      static const int64_t kMpsThreshold =
-          getMpsThreshold("BASPACHO_MPS_GEMM_THRESHOLD", 0);
-      bool useMps = (m * n * k >= kMpsThreshold);
-
-      if (useMps) {
+      // MPS GEMM on GPU for all sizes
+      {
         id<MTLBuffer> tempBuf = (__bridge id<MTLBuffer>)tempBuffer.buffer();
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
 
@@ -3339,15 +3001,6 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
 
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
-      } else {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        for (int b = 0; b < batchSize; b++) {
-          const float* AB = (*data)[b] + offset;
-          Eigen::Map<const MatRMaj> matA(AB, m, k);
-          Eigen::Map<const MatRMaj> matB(AB, n, k);
-          Eigen::Map<MatRMaj> matC(tempBufPtrs[b], n, m);
-          matC.noalias() = matB * matA.transpose();
-        }
       }
     }
   }
@@ -3375,39 +3028,8 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
 
-      // CPU fallback: scatter-subtract per batch item (avoids GPU dispatch overhead)
-      if (numBlockRows * numBlockCols <= getCpuBlasThreshold()) {
-        const int64_t* chainRowsTillEnd =
-            sym.skel.chainRowsTillEnd.data() + srcColDataOffset;
-        const int64_t* pToSpan = sym.skel.chainRowSpan.data() + srcColDataOffset;
-        const int64_t* pSpanToChainOffset = spanToChainOffset.data();
-        const int64_t* pSpanOffsetInLump = sym.skel.spanOffsetInLump.data();
-        for (int b = 0; b < batchSize; b++) {
-          float* batchData = (*data)[b];
-          const float* matRectPtr = tempBufPtrs[b];
-          for (int64_t r = 0; r < numBlockRows; r++) {
-            int64_t rBegin = chainRowsTillEnd[r - 1] - rectRowBegin;
-            int64_t rSize = chainRowsTillEnd[r] - rBegin - rectRowBegin;
-            int64_t rParam = pToSpan[r];
-            int64_t rOffset = pSpanToChainOffset[rParam];
-            const float* matRowPtr = matRectPtr + rBegin * srcRectWidth;
-            int64_t cEnd = std::min(numBlockCols, r + 1);
-            for (int64_t c = 0; c < cEnd; c++) {
-              int64_t cStart = chainRowsTillEnd[c - 1] - rectRowBegin;
-              int64_t cSize = chainRowsTillEnd[c] - cStart - rectRowBegin;
-              int64_t offset = rOffset + pSpanOffsetInLump[pToSpan[c]];
-              float* dst = batchData + offset;
-              const float* src = matRowPtr + cStart;
-              for (int64_t i = 0; i < rSize; i++)
-                for (int64_t j = 0; j < cSize; j++)
-                  dst[i * dstStride + j] -= src[i * srcRectWidth + j];
-            }
-          }
-        }
-        return;
-      }
-
-      // GPU path: upload spanToChainOffset if not yet done
+      // GPU assembly kernel for all sizes.
+      // Upload spanToChainOffset if not yet done
       if (!gpuAssemblyUsed_) {
         memcpy(devSpanToChainOffset.ptr(), spanToChainOffset.data(),
                spanToChainOffset.size() * sizeof(int64_t));
