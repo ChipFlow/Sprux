@@ -789,6 +789,31 @@ inline void solveLowerUnit_rm(device T* L, int ldl, int n, device T* v) {
     }
 }
 
+// Solves L * x = b in-place where L has non-unit diagonal (Cholesky)
+template <typename T>
+inline void solveLowerNonUnit_rm(device T* L, int ldl, int n, device T* v) {
+    for (int i = 0; i < n; i++) {
+        T x = v[i];
+        for (int j = 0; j < i; j++) {
+            x -= L[i * ldl + j] * v[j];
+        }
+        v[i] = x / L[i * ldl + i];  // Non-unit diagonal
+    }
+}
+
+// Backward substitution for L^T * x = b (L is row-major lower triangular, Cholesky)
+// L^T[i,j] = L[j,i] = L_rm[j*ldl+i], upper triangular
+template <typename T>
+inline void solveLtRM(device T* L, int ldl, int n, device T* v) {
+    for (int i = n - 1; i >= 0; i--) {
+        T x = v[i];
+        for (int j = i + 1; j < n; j++) {
+            x -= L[j * ldl + i] * v[j];  // L^T[i,j] = L[j*ldl+i]
+        }
+        v[i] = x / L[i * ldl + i];  // diagonal is same for L and L^T
+    }
+}
+
 // Backward substitution for upper triangular matrix (row-major)
 // Solves U * x = b in-place
 template <typename T>
@@ -1304,6 +1329,137 @@ kernel void lu_solveU_direct_kernel_float(
     device float* U = data + offM;
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
         solveUpperRM(U, int(n), int(n), C + offC + rhs * ldc);
+    }
+}
+
+// ============================================================================
+// Cholesky dense solve kernels
+// ============================================================================
+
+// Solve L * x = b where L is lower triangular with non-unit diagonal (row-major)
+// x is col-major at C+offC with stride ldc. Single-thread sequential solve.
+kernel void cholesky_solveL_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offM [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant int64_t& offC [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    device float* L = data + offM;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveLowerNonUnit_rm(L, int(n), int(n), C + offC + rhs * ldc);
+    }
+}
+
+// Solve L^T * x = b (backward substitution with L transpose, Cholesky)
+// L is row-major lower triangular at data+offset, x is col-major at C+offC with stride ldc.
+kernel void cholesky_solveLt_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offM [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    device float* C [[buffer(3)]],
+    constant int64_t& offC [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    device float* L = data + offM;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        solveLtRM(L, int(n), int(n), C + offC + rhs * ldc);
+    }
+}
+
+// Cholesky gemv: tempVec = alpha * M * A (below-diagonal matvec, forward solve)
+// M is row-major nRows×nCols at data+offset. A is col-major at A+offA with stride lda.
+// Result written to tempVecBuffer (row-major nRows×nRHS). One thread per row.
+kernel void cholesky_gemv_kernel_float(
+    constant float* data [[buffer(0)]],
+    constant int64_t& offset [[buffer(1)]],
+    constant int64_t& nRows [[buffer(2)]],
+    constant int64_t& nCols [[buffer(3)]],
+    constant float* A [[buffer(4)]],
+    constant int64_t& offA [[buffer(5)]],
+    constant int64_t& lda [[buffer(6)]],
+    constant float& alpha [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    device float* tempVec [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= nRows) return;
+
+    int64_t row = tid;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float sum = 0.0f;
+        for (int64_t col = 0; col < nCols; col++) {
+            sum += data[offset + row * nCols + col] * A[offA + col + rhs * lda];
+        }
+        tempVec[row * nRHS + rhs] = alpha * sum;  // assignment, not accumulation
+    }
+}
+
+// Cholesky gemvT: A += alpha * M^T * tempVec (transpose matvec, backward solve)
+// M is row-major nRows×nCols at data+offset. tempVec is row-major nRows×nRHS.
+// A is col-major at A+offA with stride lda. One thread per output column.
+kernel void cholesky_gemvT_kernel_float(
+    constant float* data [[buffer(0)]],
+    constant int64_t& offset [[buffer(1)]],
+    constant int64_t& nRows [[buffer(2)]],
+    constant int64_t& nCols [[buffer(3)]],
+    device float* A [[buffer(4)]],
+    constant int64_t& offA [[buffer(5)]],
+    constant int64_t& lda [[buffer(6)]],
+    constant float& alpha [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant float* tempVec [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= nCols) return;
+
+    int64_t col = tid;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float sum = 0.0f;
+        for (int64_t row = 0; row < nRows; row++) {
+            sum += data[offset + row * nCols + col] * tempVec[row * nRHS + rhs];
+        }
+        A[offA + col + rhs * lda] += alpha * sum;
+    }
+}
+
+// Cholesky symm: D += alpha * selfadjoint(A) * C
+// A is row-major n×n (lower triangle stored). C is col-major at C+offC with stride ldc.
+// D is col-major with stride ldd. One thread per row.
+kernel void cholesky_symm_kernel_float(
+    constant float* data [[buffer(0)]],
+    constant int64_t& offset [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    constant float* C [[buffer(3)]],
+    constant int64_t& offC [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    device float* D [[buffer(6)]],
+    constant int64_t& ldd [[buffer(7)]],
+    constant float& alpha [[buffer(8)]],
+    constant int64_t& nRHS [[buffer(9)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= n) return;
+
+    int64_t row = tid;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float sum = 0.0f;
+        for (int64_t col = 0; col < n; col++) {
+            // selfadjointView<Lower>: use lower triangle element
+            float val = (row >= col) ? data[offset + row * n + col]
+                                     : data[offset + col * n + row];
+            sum += val * C[offC + col + rhs * ldc];
+        }
+        D[row + rhs * ldd] += alpha * sum;
     }
 }
 

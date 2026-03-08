@@ -2153,24 +2153,39 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                     int64_t ldc, float* D, int64_t ldd, float alpha) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
-      if (pendingEncoder_ || pendingCmdBuf_) {
-        commitAndWait();  // Flush GPU work before CPU reads shared buffers
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      auto dBufferInfo = MetalBufferRegistry::instance().findBuffer(D);
+      if (!dataBufferInfo.first || !cBufferInfo.first || !dBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::symm: buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      id<MTLBuffer> dBuffer = (__bridge id<MTLBuffer>)dBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t cBaseOffset = cBufferInfo.second;
+      size_t dBaseOffset = dBufferInfo.second;
 
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatK =
-          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "cholesky_symm_kernel_float");
 
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatK matC(C + offC, n, nRHS, OuterStride(ldc));
-      OuterStridedCMajMatM matD(D, n, nRHS, OuterStride(ldd));
-      matD.noalias() += alpha * (MatRMaj(matA.template selfadjointView<Eigen::Lower>()) * matC);
+      int64_t nRHS64 = nRHS;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:cBuffer offset:cBaseOffset atIndex:3];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBuffer:dBuffer offset:dBaseOffset atIndex:6];
+            [encoder setBytes:&ldd length:sizeof(int64_t) atIndex:7];
+            [encoder setBytes:&alpha length:sizeof(float) atIndex:8];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:9];
+          },
+          (NSUInteger)n);
     }
   }
 
@@ -2178,20 +2193,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                       int64_t ldc) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
-      if (pendingEncoder_ || pendingCmdBuf_) {
-        commitAndWait();  // Flush GPU work before CPU reads shared buffers
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::solveL: buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
 
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "cholesky_solveL_kernel_float");
 
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::Lower>().solveInPlace(matC);
+      int64_t nRHS64 = nRHS;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:3];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
@@ -2199,23 +2227,38 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                     int64_t offA, int64_t lda, float alpha) override {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
-      if (pendingEncoder_ || pendingCmdBuf_) {
-        commitAndWait();  // Flush GPU work before CPU reads shared buffers
-      }
-
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatK =
-          Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
 
       tempVecBuffer.resizeToAtLeast(nRows * nRHS);
 
-      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-      OuterStridedCMajMatK matA(A + offA, nCols, nRHS, OuterStride(lda));
-      Eigen::Map<MatRMaj> matC(tempVecBuffer.ptr(), nRows, nRHS);
-      matC.noalias() = alpha * (matM * matA);
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto aBufferInfo = MetalBufferRegistry::instance().findBuffer(A);
+      if (!dataBufferInfo.first || !aBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::gemv: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> aBuffer = (__bridge id<MTLBuffer>)aBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t aBaseOffset = aBufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "cholesky_gemv_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&nRows length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nCols length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:aBuffer offset:aBaseOffset atIndex:4];
+            [encoder setBytes:&offA length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&lda length:sizeof(int64_t) atIndex:6];
+            [encoder setBytes:&alpha length:sizeof(float) atIndex:7];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer() offset:0 atIndex:9];
+          },
+          (NSUInteger)nRows);
     }
   }
 
@@ -2263,20 +2306,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                        int64_t ldc) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
-      if (pendingEncoder_ || pendingCmdBuf_) {
-        commitAndWait();  // Flush GPU work before CPU reads shared buffers
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+      if (!dataBufferInfo.first || !cBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::solveLt: buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+      size_t cOffset = cBufferInfo.second;
 
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "cholesky_solveLt_kernel_float");
 
-      Eigen::Map<const MatRMaj> matA(data + offset, n, n);
-      OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-      matA.template triangularView<Eigen::Lower>().adjoint().solveInPlace(matC);
+      int64_t nRHS64 = nRHS;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBuffer:cBuffer offset:cOffset atIndex:3];
+            [encoder setBytes:&offC length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+          },
+          1);
     }
   }
 
@@ -2284,21 +2340,36 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                      int64_t offA, int64_t lda, float alpha) override {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
-      if (pendingEncoder_ || pendingCmdBuf_) {
-        commitAndWait();  // Flush GPU work before CPU reads shared buffers
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto aBufferInfo = MetalBufferRegistry::instance().findBuffer(A);
+      if (!dataBufferInfo.first || !aBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::gemvT: buffer not found");
       }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> aBuffer = (__bridge id<MTLBuffer>)aBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t aBaseOffset = aBufferInfo.second;
 
-      // Use row-major for data buffer (matches CpuBaseSolveCtx)
-      using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-      using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-      using OuterStridedCMajMatM =
-          Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                     OuterStride>;
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "cholesky_gemvT_kernel_float");
 
-      Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-      OuterStridedCMajMatM matA(A + offA, nCols, nRHS, OuterStride(lda));
-      Eigen::Map<const MatRMaj> matC(tempVecBuffer.ptr(), nRows, nRHS);
-      matA.noalias() += alpha * (matM.transpose() * matC);
+      int64_t nRHS64 = nRHS;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&offset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&nRows length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nCols length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:aBuffer offset:aBaseOffset atIndex:4];
+            [encoder setBytes:&offA length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&lda length:sizeof(int64_t) atIndex:6];
+            [encoder setBytes:&alpha length:sizeof(float) atIndex:7];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer() offset:0 atIndex:9];
+          },
+          (NSUInteger)nCols);
     }
   }
 
