@@ -82,7 +82,7 @@ pixi run build_and_test # Full workflow
 - `factor()`: Cholesky factorization
 - `solve()`, `solveL()`, `solveLt()`: triangular solves
 - `factorUpTo()`, `solveLUpTo()`: partial factorization for marginals
-- Backends: `BackendRef`, `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`
+- Backends: `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`
 
 ### Directory Structure
 
@@ -108,6 +108,8 @@ baspacho/
 - `BLA_VENDOR`: BLAS implementation (ATLAS, OpenBLAS, Intel10_64lp_seq, Apple, etc.)
 
 ## GPU Backend Notes
+
+**Pure GPU Architecture:** Metal and CUDA backends are fully GPU-resident. All factor and solve operations (including Cholesky and LU) execute entirely on GPU with no CPU BLAS fallbacks. The only CPU round-trip is the final result readback. This enables fusion with upstream GPU pipelines (e.g., IREE custom-calls).
 
 ### Metal Backend (Apple Silicon)
 
