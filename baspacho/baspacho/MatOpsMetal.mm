@@ -2223,29 +2223,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (numColItems <= 0) return;
 
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead for small ops)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        int64_t startRow =
-            (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
-        const int64_t* rowsTillEnd = sym.devChainRowsTillEnd.ptr() + chainColPtr;
-        const int64_t* toSpan = sym.devChainRowSpan.ptr() + chainColPtr;
-        for (int64_t tid = 0; tid < numColItems; tid++) {
-          int64_t rowsBefore = (tid > 0) ? (rowsTillEnd[tid - 1] - startRow) : 0;
-          int64_t rowsAfter = rowsTillEnd[tid] - startRow;
-          int64_t blockRows = rowsAfter - rowsBefore;
-          int64_t span = toSpan[tid];
-          int64_t spanStart = sym.devSpanStart.ptr()[span];
-          const float* srcPtr = tempVecBuffer.ptr() + rowsBefore * nRHS;
-          float* dstPtr = C + spanStart;
-          for (int rhs = 0; rhs < nRHS; rhs++) {
-            for (int64_t i = 0; i < blockRows; i++) {
-              dstPtr[i + rhs * ldc] += srcPtr[i * nRHS + rhs];
-            }
-          }
-        }
-        return;
-      }
-
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
       if (!cBufferInfo.first) {
         throw std::runtime_error("MetalSolveCtx<float>::assembleVec: buffer not found");
@@ -2330,29 +2307,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (numColItems <= 0) return;
 
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead for small ops)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        int64_t startRow =
-            (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
-        const int64_t* rowsTillEnd = sym.devChainRowsTillEnd.ptr() + chainColPtr;
-        const int64_t* toSpan = sym.devChainRowSpan.ptr() + chainColPtr;
-        for (int64_t tid = 0; tid < numColItems; tid++) {
-          int64_t rowsBefore = (tid > 0) ? (rowsTillEnd[tid - 1] - startRow) : 0;
-          int64_t rowsAfter = rowsTillEnd[tid] - startRow;
-          int64_t blockRows = rowsAfter - rowsBefore;
-          int64_t span = toSpan[tid];
-          int64_t spanStart = sym.devSpanStart.ptr()[span];
-          float* dstPtr = tempVecBuffer.ptr() + rowsBefore * nRHS;
-          const float* srcPtr = C + spanStart;
-          for (int rhs = 0; rhs < nRHS; rhs++) {
-            for (int64_t i = 0; i < blockRows; i++) {
-              dstPtr[i * nRHS + rhs] = srcPtr[i + rhs * ldc];
-            }
-          }
-        }
-        return;
-      }
-
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
       if (!cBufferInfo.first) {
         throw std::runtime_error("MetalSolveCtx<float>::assembleVecT: buffer not found");
@@ -2397,19 +2351,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
 
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead for small ops)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-        using OuterStridedCMajMatM =
-            Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                       OuterStride>;
-        Eigen::Map<const MatRMaj> matA(data + offM, n, n);
-        OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-        matA.template triangularView<Eigen::UnitLower>().solveInPlace(matC);
-        return;
-      }
-
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
       if (!dataBufferInfo.first || !cBufferInfo.first) {
@@ -2444,19 +2385,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                       int64_t ldc) override {
     @autoreleasepool {
       if (n <= 0 || nRHS <= 0) return;
-
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead for small ops)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-        using OuterStridedCMajMatM =
-            Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                       OuterStride>;
-        Eigen::Map<const MatRMaj> matA(data + offM, n, n);
-        OuterStridedCMajMatM matC(C + offC, n, nRHS, OuterStride(ldc));
-        matA.template triangularView<Eigen::Upper>().solveInPlace(matC);
-        return;
-      }
 
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
@@ -2507,19 +2435,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // CPU fallback when no pending GPU work
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        for (int64_t i = 0; i < n; i++) {
-          int64_t swapRow = pivots[i];
-          if (swapRow != i) {
-            for (int rhs = 0; rhs < nRHS; rhs++) {
-              std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
-            }
-          }
-        }
-        return;
-      }
-
       // Compute offset into pre-uploaded pivot buffer, or upload on-demand
       size_t pivotByteOffset = 0;
       if (pivotsBase_ && pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
@@ -2562,19 +2477,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                    int64_t ldVec) override {
     @autoreleasepool {
       if (n <= 0) return;
-
-      // CPU fallback when no pending GPU work
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        for (int64_t i = n - 1; i >= 0; i--) {
-          int64_t swapRow = pivots[i];
-          if (swapRow != i) {
-            for (int rhs = 0; rhs < nRHS; rhs++) {
-              std::swap(vec[i + rhs * ldVec], vec[swapRow + rhs * ldVec]);
-            }
-          }
-        }
-        return;
-      }
 
       // Compute offset into pre-uploaded pivot buffer, or upload on-demand
       size_t pivotByteOffset = 0;
@@ -2619,23 +2521,6 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                            float alpha) override {
     @autoreleasepool {
       if (nRows <= 0 || nCols <= 0 || nRHS <= 0) return;
-
-      // CPU fallback when no pending GPU work (avoids GPU dispatch overhead for small ops)
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        using MatRMaj = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-        using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-        using OuterStridedCMajMatK =
-            Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
-                       0, OuterStride>;
-        using OuterStridedCMajMatM =
-            Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>, 0,
-                       OuterStride>;
-        Eigen::Map<const MatRMaj> matM(data + offset, nRows, nCols);
-        OuterStridedCMajMatK matSrc(vec + srcOff, nCols, nRHS, OuterStride(ldVec));
-        OuterStridedCMajMatM matDst(vec + dstOff, nRows, nRHS, OuterStride(ldVec));
-        matDst.noalias() += alpha * (matM * matSrc);
-        return;
-      }
 
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
