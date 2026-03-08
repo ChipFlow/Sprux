@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include <cmath>
 #include <cxxabi.h>
 #include <memory>
+#include <type_traits>
 #include <typeindex>
 #include <vector>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
@@ -184,6 +186,29 @@ struct NumericCtx : NumericCtxBase {
   // Read a single value from data buffer. Default: direct CPU read.
   // GPU backends override to copy from device memory.
   virtual T readValue(const T* data, int64_t offset) { return data[offset]; }
+
+  // Compute max|diag| across all lumps in [startLump, upToLump).
+  // Default: uses readValue loop (works for CPU and GPU with lazy cache).
+  // GPU backends can override with reduction kernel for pure-GPU operation.
+  virtual double maxAbsDiag(const T* data, const int64_t* lumpStart, const int64_t* chainColPtr,
+                            const int64_t* chainData, int64_t startLump, int64_t upToLump) {
+    if constexpr (std::is_arithmetic_v<T>) {
+      double maxVal = 0;
+      for (int64_t l = startLump; l < upToLump; l++) {
+        int64_t lumpSize = lumpStart[l + 1] - lumpStart[l];
+        int64_t diagOff = chainData[chainColPtr[l]];
+        for (int64_t i = 0; i < lumpSize; i++) {
+          double absVal = std::abs(static_cast<double>(readValue(data, diagOff + i * lumpSize + i)));
+          if (absVal > maxVal) maxVal = absVal;
+        }
+      }
+      return maxVal;
+    } else {
+      (void)data; (void)lumpStart; (void)chainColPtr; (void)chainData;
+      (void)startLump; (void)upToLump;
+      throw std::runtime_error("maxAbsDiag: not supported for batched types");
+    }
+  }
 
   // dense Cholesky on dense row-major matrix A (in place)
   virtual void potrf(int64_t n, T* data, int64_t offA) = 0;

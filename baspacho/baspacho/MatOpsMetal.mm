@@ -1008,6 +1008,53 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
+  virtual double maxAbsDiag(const float* data, const int64_t* lumpStart, const int64_t* chainColPtr,
+                            const int64_t* chainData, int64_t startLump, int64_t upToLump) override {
+    @autoreleasepool {
+      int64_t numLumps = upToLump - startLump;
+      if (numLumps <= 0) return 0.0;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      if (!dataBufferInfo.first) {
+        throw std::runtime_error("MetalNumericCtx<float>::maxAbsDiag: data buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      size_t dataOffset = dataBufferInfo.second;
+
+      // Result buffer: single uint32 for atomic max
+      MetalMirror<uint32_t> resultBuf;
+      resultBuf.resizeToAtLeast(1);
+      resultBuf.ptr()[0] = 0;
+
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline("maxAbsDiag_kernel_float");
+
+      int wgs = 256;
+      int numGroups = (int)((numLumps + wgs - 1) / wgs);
+
+      id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+      [encoder setComputePipelineState:pipeline];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer() offset:0 atIndex:1];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
+      [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+      [encoder setBytes:&startLump length:sizeof(int64_t) atIndex:4];
+      [encoder setBytes:&numLumps length:sizeof(int64_t) atIndex:5];
+      [encoder setBuffer:(__bridge id<MTLBuffer>)resultBuf.buffer() offset:0 atIndex:6];
+      [encoder dispatchThreadgroups:MTLSizeMake(numGroups, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(wgs, 1, 1)];
+      [encoder endEncoding];
+      [cmdBuf commit];
+      [cmdBuf waitUntilCompleted];
+
+      // Convert uint bit pattern back to float
+      uint32_t resultBits = resultBuf.ptr()[0];
+      float result;
+      memcpy(&result, &resultBits, sizeof(float));
+      return result;
+    }
+  }
+
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
     @autoreleasepool {
       if (n <= 0) return;

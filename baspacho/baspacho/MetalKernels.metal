@@ -1464,6 +1464,58 @@ kernel void cholesky_symm_kernel_float(
 }
 
 // ============================================================================
+// maxAbsDiag GPU reduction kernel
+// ============================================================================
+
+// Compute max|diag| across all lumps. One thread per lump, each thread finds its
+// local max. Threadgroup reduction finds group max. Atomic max across groups.
+// Result: single float in output[0].
+kernel void maxAbsDiag_kernel_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    constant float* data [[buffer(3)]],
+    constant int64_t& startLump [[buffer(4)]],
+    constant int64_t& numLumps [[buffer(5)]],
+    device atomic_uint* result [[buffer(6)]],
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]])
+{
+    float localMax = 0.0f;
+
+    int64_t lump = startLump + tid;
+    if (int64_t(tid) < numLumps) {
+        int64_t lumpSize = lumpStarts[lump + 1] - lumpStarts[lump];
+        int64_t diagOff = chainData[chainColPtr[lump]];
+        for (int64_t i = 0; i < lumpSize; i++) {
+            float absVal = abs(data[diagOff + i * lumpSize + i]);
+            localMax = max(localMax, absVal);
+        }
+    }
+
+    // Threadgroup reduction using shared memory
+    threadgroup float shared[256];
+    shared[lid] = localMax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tgSize / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            shared[lid] = max(shared[lid], shared[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Atomically update global maximum (using uint bit representation for float max)
+    if (lid == 0) {
+        uint val = as_type<uint>(shared[0]);
+        // Atomic max for positive floats: IEEE 754 bit pattern preserves ordering
+        // for non-negative floats, so atomic_max on uint gives correct float max.
+        atomic_fetch_max_explicit(result, val, memory_order_relaxed);
+    }
+}
+
+// ============================================================================
 // Sparse elimination solve kernels: below-diagonal block multiply
 // ============================================================================
 

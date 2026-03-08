@@ -743,17 +743,10 @@ void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startS
     using ValT = typename std::remove_pointer<decltype(data)>::type;
     ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
     if (staticPivotThreshold_ == 0) {
-      ValT maxDiag = 0;
-      for (int64_t l = startLump; l < upToLump; l++) {
-        int64_t lumpSize = factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l];
-        int64_t chainColBegin = factorSkel.chainColPtr[l];
-        int64_t diagOff = factorSkel.chainData[chainColBegin];
-        for (int64_t i = 0; i < lumpSize; i++) {
-          ValT absVal = std::abs(numCtx->readValue(data, diagOff + i * lumpSize + i));
-          if (absVal > maxDiag) maxDiag = absVal;
-        }
-      }
-      effectiveStaticPivotThreshold_ = static_cast<double>(epsScale * std::max(maxDiag, epsScale));
+      double maxDiag = numCtx->maxAbsDiag(data, factorSkel.lumpStart.data(),
+                                          factorSkel.chainColPtr.data(),
+                                          factorSkel.chainData.data(), startLump, upToLump);
+      effectiveStaticPivotThreshold_ = static_cast<double>(epsScale) * std::max(maxDiag, static_cast<double>(epsScale));
     } else {
       effectiveStaticPivotThreshold_ = staticPivotThreshold_;
     }
