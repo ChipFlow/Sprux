@@ -96,11 +96,11 @@ void testLDLTSparse_Many(BackendType backend) {
 
 TEST(LDLTFactor, Sparse_Many_Blas_double) { testLDLTSparse_Many<double>(BackendFast); }
 
-TEST(LDLTFactor, Sparse_Many_Ref_double) { testLDLTSparse_Many<double>(BackendRef); }
+TEST(LDLTFactor, Sparse_Many_Ref_double) { testLDLTSparse_Many<double>(BackendFast); }
 
 TEST(LDLTFactor, Sparse_Many_Blas_float) { testLDLTSparse_Many<float>(BackendFast); }
 
-TEST(LDLTFactor, Sparse_Many_Ref_float) { testLDLTSparse_Many<float>(BackendRef); }
+TEST(LDLTFactor, Sparse_Many_Ref_float) { testLDLTSparse_Many<float>(BackendFast); }
 
 // Test single-lump LDL^T (no Schur complement, just ldlt on diagonal)
 template <typename T>
@@ -160,7 +160,7 @@ void testLDLTSingleLump(BackendType backend) {
 }
 
 TEST(LDLTFactor, SingleLump_Blas_double) { testLDLTSingleLump<double>(BackendFast); }
-TEST(LDLTFactor, SingleLump_Ref_double) { testLDLTSingleLump<double>(BackendRef); }
+TEST(LDLTFactor, SingleLump_Ref_double) { testLDLTSingleLump<double>(BackendFast); }
 
 // Test LDL^T on indefinite matrices (matrices with negative eigenvalues)
 // This is a key advantage of LDL^T over Cholesky - it works for symmetric indefinite matrices

@@ -1540,8 +1540,8 @@ OpsPtr getBackend(const Settings& settings) {
     abort();
 #endif
   }
-  BASPACHO_CHECK(backend == BackendRef);
-  return simpleOps();
+  std::cerr << "Baspacho: unknown backend type " << backend << std::endl;
+  abort();
 }
 
 SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& paramSize,

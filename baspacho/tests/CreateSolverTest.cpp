@@ -101,7 +101,7 @@ void testCreateSolver_Many(bool elimSet, bool lastIds) {
     vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 2, 3, 47);
 
     {
-      auto solver = createSolver({.backend = BackendRef, .addFillPolicy = AddFillComplete},
+      auto solver = createSolver({.backend = BackendFast, .addFillPolicy = AddFillComplete},
                                  paramSize, ss, sparseElimRanges, elimLastIds);
       ASSERT_EQ(solver->canFactorUpToSpan(), numParams);
       check<T>(*solver, 4 * i + 0, elimLastIds);
@@ -109,7 +109,7 @@ void testCreateSolver_Many(bool elimSet, bool lastIds) {
 
     if (!lastIds) {
       {
-        auto solver = createSolver({.backend = BackendRef, .addFillPolicy = AddFillForAutoElims},
+        auto solver = createSolver({.backend = BackendFast, .addFillPolicy = AddFillForAutoElims},
                                    paramSize, ss, sparseElimRanges);
         std::cout << "Selims: " << printVec(solver->sparseEliminationRanges()) << std::endl;
         if (elimSet) {  // test auto-discovering of elim sets
@@ -121,7 +121,7 @@ void testCreateSolver_Many(bool elimSet, bool lastIds) {
       }
 
       {
-        auto solver = createSolver({.backend = BackendRef, .addFillPolicy = AddFillForGivenElims},
+        auto solver = createSolver({.backend = BackendFast, .addFillPolicy = AddFillForGivenElims},
                                    paramSize, ss, sparseElimRanges);
         if (elimSet) {
           ASSERT_EQ(solver->canFactorUpToSpan(), 90);
@@ -130,7 +130,7 @@ void testCreateSolver_Many(bool elimSet, bool lastIds) {
       }
 
       {
-        auto solver = createSolver({.backend = BackendRef, .addFillPolicy = AddFillNone}, paramSize,
+        auto solver = createSolver({.backend = BackendFast, .addFillPolicy = AddFillNone}, paramSize,
                                    ss, sparseElimRanges);
         ASSERT_EQ(solver->canFactorUpToSpan(), 0);
         check<T>(*solver, 4 * i + 3, {});

@@ -37,7 +37,7 @@ void runTest(const std::string& precondArg, int seed) {
   vector<int64_t> paramSize = randomVec(ss.ptrs.size() - 1, 2, 3, 47);
 
   cout << "creating solver..." << endl;
-  auto solver = createSolver({.backend = BackendRef, .addFillPolicy = AddFillForAutoElims},
+  auto solver = createSolver({.backend = BackendFast, .addFillPolicy = AddFillForAutoElims},
                              paramSize, ss, {0, 100});
 
   int64_t nocross = solver->canFactorUpToSpan();
