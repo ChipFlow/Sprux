@@ -17,25 +17,11 @@
 #include "baspacho/baspacho/MathUtils.h"
 #include "baspacho/baspacho/Utils.h"
 
-#ifdef BASPACHO_USE_BLAS
-#include "baspacho/baspacho/BlasDefs.h"
-#endif
-
 namespace BaSpaCho {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;
-
-// CPU transpose for BLAS fallback (row-major ↔ col-major conversion)
-template <typename T>
-static void transposeSquareInPlace(T* data, int64_t n) {
-  for (int64_t i = 0; i < n; i++) {
-    for (int64_t j = i + 1; j < n; j++) {
-      std::swap(data[i * n + j], data[j * n + i]);
-    }
-  }
-}
 
 using OuterStride = Eigen::OuterStride<>;
 template <typename T>
@@ -852,7 +838,6 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   virtual T readValue(const T* data, int64_t offset) override {
-    if (cpuBlasMode_) return hostData_[offset];
     // Lazy cache: on first readValue, bulk-copy device data to host
     // to avoid per-element cudaMemcpy overhead (~10μs × N = 250ms for 25K lumps).
     // Cache is invalidated by beginDenseOps (which re-copies post-sparse-elim data).
@@ -891,15 +876,6 @@ struct CudaNumericCtx : NumericCtx<T> {
                              int64_t numCols) override;
 
   virtual void flush() override {
-    if (cpuBlasMode_) {
-      // Copy modified host data back to device
-      cuCHECK(cudaMemcpy(devDataPtr_, hostData_.data(), totalDataSize_ * sizeof(T),
-                          cudaMemcpyHostToDevice));
-      cpuBlasMode_ = false;
-      devDataPtr_ = nullptr;
-      // Don't clear hostData_ (keep allocation for next factorization)
-      return;
-    }
     flushGemmBatch();
     // Flush deferred pivot copies: one bulk sync + sequential copies
     if (!deferredPivotCopies_.empty()) {
@@ -914,11 +890,6 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   int64_t deferredPerturbCount() override {
-    if (cpuPerturbCount_ > 0) {
-      int64_t count = cpuPerturbCount_;
-      cpuPerturbCount_ = 0;
-      return count;
-    }
     if (!perturbCountPending_) return 0;
     int64_t count = 0;
     cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -929,20 +900,6 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
                                         T threshold) override {
     if (n <= 0) return 0;
-
-    if (cpuBlasMode_) {
-      int64_t count = 0;
-      T* h = hostData_.data();
-      for (int64_t i = 0; i < n; i++) {
-        T& diag = h[offset + i * stride + i];
-        if (!std::isfinite(diag) || std::abs(diag) < threshold) {
-          diag = (diag >= T(0)) ? threshold : -threshold;
-          count++;
-        }
-      }
-      cpuPerturbCount_ += count;
-      return 0;  // Actual count returned via deferredPerturbCount()
-    }
 
     // Initialize persistent counter on first call (once per factorization)
     if (!perturbCountPending_) {
@@ -1009,9 +966,6 @@ struct CudaNumericCtx : NumericCtx<T> {
          i < iEnd; i++) {
       spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
     }
-
-    // In CPU BLAS mode, skip GPU upload (no GPU operations in dense loop)
-    if (cpuBlasMode_) return;
 
     // Upload to GPU using pinned memory for async H→D copy
     size_t bytes = spanToChainOffset.size() * sizeof(int64_t);
@@ -1113,38 +1067,18 @@ struct CudaNumericCtx : NumericCtx<T> {
   DevMirror<T> devGemmWork_;  // GPU storage for GemmWorkItem array (reinterpret_cast)
   T* gemmDataPtr_ = nullptr;  // data pointer for current batch (for validation)
 
-  // CPU BLAS mode: after sparse elimination completes on GPU, copy entire data buffer
-  // to host and run all dense LU operations (boards + factor) on CPU using BLAS.
-  // This avoids cuSolver/cuBLAS dispatch overhead and the expensive CPU iteration
-  // in eliminateBoardLU with GPU-side GEMMs. Modeled after Metal's CPU BLAS fallback
-  // (which uses unified memory; CUDA needs explicit D→H + H→D copies).
-  bool cpuBlasMode_ = false;
   bool readCacheValid_ = false;   // Lazy read cache for readValue (avoids per-element cudaMemcpy)
-  T* devDataPtr_ = nullptr;       // Device data pointer (for H→D copy back in flush)
-  int64_t totalDataSize_ = 0;     // Total data buffer size in elements
-  std::vector<T> hostData_;       // Host copy of data buffer (shared by readCache + cpuBlasMode)
-  int64_t cpuPerturbCount_ = 0;   // Accumulated perturb count during CPU mode
+  std::vector<T> hostData_;       // Host copy of data buffer (for readValue lazy cache)
 
   virtual void beginDenseOps(T* data, int64_t totalDataSize) override {
-#ifdef BASPACHO_USE_BLAS
     // Sync GPU to ensure all prior work (sparse elimination) is complete
     cuCHECK(cudaDeviceSynchronize());
 
     // Invalidate lazy read cache (data changed by GPU sparse elimination)
     readCacheValid_ = false;
 
-    // Copy entire data buffer from device to host
-    devDataPtr_ = data;
-    totalDataSize_ = totalDataSize;
-    hostData_.resize(totalDataSize);
-    cuCHECK(cudaMemcpy(hostData_.data(), data, totalDataSize * sizeof(T),
-                        cudaMemcpyDeviceToHost));
-    cpuBlasMode_ = true;
-    cpuPerturbCount_ = 0;
-#else
     (void)data;
     (void)totalDataSize;
-#endif
   }
 
   const CudaSymbolicCtx& sym;
@@ -1245,19 +1179,6 @@ int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t of
                                    int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
 
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    int64_t minMN = std::min(m, n);
-    double* h = hostData_.data();
-    if (m == n) transposeSquareInPlace(h + offA, n);
-    std::vector<BLAS_INT> ipiv(minMN);
-    int info = LAPACKE_dgetrf(LAPACK_COL_MAJOR, m, n, h + offA, m, ipiv.data());
-    if (m == n) transposeSquareInPlace(h + offA, n);
-    for (int64_t i = 0; i < minMN; i++) pivots[i] = ipiv[i] - 1;
-    return info;
-  }
-#endif
-
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
 
@@ -1315,19 +1236,6 @@ template <>
 int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
                                   int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
-
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    int64_t minMN = std::min(m, n);
-    float* h = hostData_.data();
-    if (m == n) transposeSquareInPlace(h + offA, n);
-    std::vector<BLAS_INT> ipiv(minMN);
-    int info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, m, n, h + offA, m, ipiv.data());
-    if (m == n) transposeSquareInPlace(h + offA, n);
-    for (int64_t i = 0; i < minMN; i++) pivots[i] = ipiv[i] - 1;
-    return info;
-  }
-#endif
 
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
@@ -1387,14 +1295,6 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
 template <>
 void CudaNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L, int64_t offL,
                                             double* B, int64_t offB, int64_t ldb) {
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    double* h = hostData_.data();
-    cblas_dtrsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit,
-                n, m, 1.0, h + offL, m, h + offB, ldb);
-    return;
-  }
-#endif
   double alpha(1.0);
   cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
                            CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
@@ -1403,14 +1303,6 @@ void CudaNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L
 template <>
 void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL,
                                            float* B, int64_t offB, int64_t ldb) {
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    float* h = hostData_.data();
-    cblas_strsm(CblasColMajor, CblasRight, CblasUpper, CblasNoTrans, CblasUnit,
-                n, m, 1.0f, h + offL, m, h + offB, ldb);
-    return;
-  }
-#endif
   float alpha(1.0);
   cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
                            CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
@@ -1421,14 +1313,6 @@ void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, 
 template <>
 void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
                                              double* B, int64_t offB, int64_t /*ldb*/) {
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    double* h = hostData_.data();
-    cblas_dtrsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
-                n, m, 1.0, h + offU, n, h + offB, n);
-    return;
-  }
-#endif
   double alpha(1.0);
   cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
@@ -1437,14 +1321,6 @@ void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* 
 template <>
 void CudaNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
                                             float* B, int64_t offB, int64_t /*ldb*/) {
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    float* h = hostData_.data();
-    cblas_strsm(CblasColMajor, CblasLeft, CblasLower, CblasNoTrans, CblasNonUnit,
-                n, m, 1.0f, h + offU, n, h + offB, n);
-    return;
-  }
-#endif
   float alpha(1.0);
   cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
@@ -1457,15 +1333,6 @@ void CudaNumericCtx<double>::saveGemm(int64_t m, int64_t n, int64_t k, const dou
                                        int64_t offL, int64_t ldL, const double* U, int64_t offU,
                                        int64_t ldU, double* C, int64_t offC, int64_t ldC) {
   sym.gemmCalls++;
-
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    double* h = hostData_.data();
-    cblas_dgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, n, m, k, -1.0,
-                h + offU, ldU, h + offL, ldL, 1.0, h + offC, ldC);
-    return;
-  }
-#endif
 
   // Batch small GEMMs into a single kernel dispatch
   if (m * n <= kBatchGemmMaxMN) {
@@ -1488,15 +1355,6 @@ void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
                                       int64_t offL, int64_t ldL, const float* U, int64_t offU,
                                       int64_t ldU, float* C, int64_t offC, int64_t ldC) {
   sym.gemmCalls++;
-
-#ifdef BASPACHO_USE_BLAS
-  if (cpuBlasMode_) {
-    float* h = hostData_.data();
-    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans, n, m, k, -1.0f,
-                h + offU, ldU, h + offL, ldL, 1.0f, h + offC, ldC);
-    return;
-  }
-#endif
 
   // Batch small GEMMs into a single kernel dispatch to avoid cuBLAS overhead
   if (m * n <= kBatchGemmMaxMN) {
@@ -1523,19 +1381,6 @@ void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* da
                                            int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
 
-  if (cpuBlasMode_) {
-    double* h = hostData_.data();
-    for (int64_t i = 0; i < n; i++) {
-      int64_t swapRow = pivots[i];
-      if (swapRow != i) {
-        for (int64_t c = 0; c < numCols; c++) {
-          std::swap(h[offData + i + c * ld], h[offData + swapRow + c * ld]);
-        }
-      }
-    }
-    return;
-  }
-
   int64_t* devPivPtr;
   if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
     // Use GPU-resident pivots from deferred getrf (no sync needed)
@@ -1556,19 +1401,6 @@ template <>
 void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData,
                                           int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
-
-  if (cpuBlasMode_) {
-    float* h = hostData_.data();
-    for (int64_t i = 0; i < n; i++) {
-      int64_t swapRow = pivots[i];
-      if (swapRow != i) {
-        for (int64_t c = 0; c < numCols; c++) {
-          std::swap(h[offData + i + c * ld], h[offData + swapRow + c * ld]);
-        }
-      }
-    }
-    return;
-  }
 
   int64_t* devPivPtr;
   if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
