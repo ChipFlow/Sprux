@@ -50,6 +50,11 @@ class Solver {
   // return an accessor to be used by an on-device kernel (if supported by backend)
   PermutedCoalescedAccessor deviceAccessor() const { return symCtx->deviceAccessor(); }
 
+  // Set the CUDA stream for all GPU operations (cuBLAS, cuSOLVER, kernels).
+  // Must be called before factorLU/solveLU when using a non-default stream
+  // (e.g., JAX's XLA stream from the FFI plugin). No-op for CPU backends.
+  void setStream(void* stream) { symCtx->setStream(stream); }
+
   // enable stat collection (default: disabled)
   void enableStats(bool enabled = true);
 

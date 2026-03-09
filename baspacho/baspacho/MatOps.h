@@ -63,6 +63,13 @@ struct NumericCtxBase {
   // Get count of deferred perturbSmallDiagonals perturbations (GPU backends
   // defer the count to avoid per-lump CPU sync). Returns 0 for CPU backends.
   virtual int64_t deferredPerturbCount() { return 0; }
+  // Pre-allocate all GPU buffers to max needed sizes so no cudaMalloc occurs
+  // during the hot factorization path. Required for CUDA graph capture.
+  // No-op for CPU backends.
+  virtual void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) {
+    (void)maxDenseBlockSize;
+    (void)totalDensePivots;
+  }
 };
 
 struct SolveCtxBase {
@@ -74,6 +81,11 @@ struct SolveCtxBase {
 // (symbolic) context for factorization, constant indices (and GPU copies)
 struct SymbolicCtx {
   virtual ~SymbolicCtx() {}
+
+  // Set the stream for all GPU operations (cuBLAS, cuSOLVER, kernel launches).
+  // Must be called before factorLU/solveLU when using a non-default stream.
+  // No-op for CPU backends.
+  virtual void setStream(void* stream) { (void)stream; }
 
   // prepares data for a parallel elimination op (Cholesky)
   virtual SymElimCtxPtr prepareElimination(int64_t lumpsBegin, int64_t lumpsEnd) = 0;

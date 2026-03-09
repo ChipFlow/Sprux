@@ -91,6 +91,15 @@ struct CudaSymbolicCtx : SymbolicCtx {
     }
   }
 
+  // Set the CUDA stream for all cuBLAS and cuSOLVER operations.
+  // Must be called before factorLU/solveLU when using a non-default stream
+  // (e.g., JAX's XLA stream). This is required for CUDA graph capture.
+  virtual void setStream(void* stream) override {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    cublasCHECK(cublasSetStream(cublasH, s));
+    cusolverCHECK(cusolverDnSetStream(cusolverDnH, s));
+  }
+
   virtual PermutedCoalescedAccessor deviceAccessor() override {
     PermutedCoalescedAccessor retv;
     retv.init(devSpanStart.ptr, devSpanToLump.ptr, devLumpStart.ptr, devSpanOffsetInLump.ptr,
@@ -787,8 +796,48 @@ struct CudaNumericCtx : NumericCtx<T> {
     devSpanToChainOffset.resizeToAtLeast(spanToChainOffset.size());
   }
 
+  // Pre-allocate all GPU buffers to their maximum needed sizes so that no
+  // cudaMalloc calls occur during the hot factorization path. This is required
+  // for CUDA graph capture compatibility.
+  //
+  // maxDenseBlockSize: largest dense block dimension that getrf will see
+  // totalDensePivots: total pivot storage needed across all dense lumps
+  void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) {
+    if (maxDenseBlockSize <= 0) return;
+
+    // Pre-allocate getrf workspace by querying cuSOLVER for the max size.
+    // This avoids the dynamic resizeToAtLeast during factorization.
+    int workspaceSize = 0;
+    if constexpr (std::is_same_v<T, double>) {
+      cusolverDnDgetrf_bufferSize(sym.cusolverDnH, maxDenseBlockSize,
+                                   maxDenseBlockSize, nullptr,
+                                   maxDenseBlockSize, &workspaceSize);
+    } else if constexpr (std::is_same_v<T, float>) {
+      cusolverDnSgetrf_bufferSize(sym.cusolverDnH, maxDenseBlockSize,
+                                   maxDenseBlockSize, nullptr,
+                                   maxDenseBlockSize, &workspaceSize);
+    }
+    devTempBuffer.resizeToAtLeast(workspaceSize);
+
+    // Pre-allocate cuSolver pivot buffer and singularity index
+    devGetrfPivots.resizeToAtLeast(maxDenseBlockSize);
+    devPotrfSingIndex.resizeToAtLeast(1);
+
+    // Pre-allocate converted pivot storage (for deferred D→H copies)
+    if (totalDensePivots > 0) {
+      ensureDensePivotCapacity(totalDensePivots);
+    }
+
+    // Pre-allocate perturb count
+    devPerturbCount.resizeToAtLeast(1);
+
+    // Pre-allocate pivot buffer for applyRowPerm
+    devPivotBuf.resizeToAtLeast(maxDenseBlockSize);
+  }
+
   virtual ~CudaNumericCtx() override {
     if (pinnedBuf_) cudaFreeHost(pinnedBuf_);
+    if (sparseCompleteEvent_) cudaEventDestroy(sparseCompleteEvent_);
   }
 
   virtual void pseudoFactorSpans(T* data, int64_t spanBegin, int64_t spanEnd) override {
@@ -1071,8 +1120,19 @@ struct CudaNumericCtx : NumericCtx<T> {
   std::vector<T> hostData_;       // Host copy of data buffer (for readValue lazy cache)
 
   virtual void beginDenseOps(T* data, int64_t totalDataSize) override {
-    // Sync GPU to ensure all prior work (sparse elimination) is complete
-    cuCHECK(cudaDeviceSynchronize());
+    // Ensure all prior GPU work (sparse elimination kernels) on the default
+    // stream is complete before the dense loop begins issuing new work.
+    //
+    // Previously used cudaDeviceSynchronize() which blocks ALL streams and
+    // prevents CUDA graph capture. Instead, we record an event on the current
+    // stream and wait on it — this provides the same ordering guarantee but
+    // is graph-capture compatible (cudaEventRecord and cudaStreamWaitEvent are
+    // both allowed inside graph capture).
+    if (!sparseCompleteEvent_) {
+      cuCHECK(cudaEventCreateWithFlags(&sparseCompleteEvent_, cudaEventDisableTiming));
+    }
+    cuCHECK(cudaEventRecord(sparseCompleteEvent_, 0));  // record on default stream
+    cuCHECK(cudaStreamWaitEvent(0, sparseCompleteEvent_, 0));  // wait on default stream
 
     // Invalidate lazy read cache (data changed by GPU sparse elimination)
     readCacheValid_ = false;
@@ -1080,6 +1140,9 @@ struct CudaNumericCtx : NumericCtx<T> {
     (void)data;
     (void)totalDataSize;
   }
+
+  // Event for synchronizing sparse elimination completion (graph-capture safe)
+  cudaEvent_t sparseCompleteEvent_ = nullptr;
 
   const CudaSymbolicCtx& sym;
 };
