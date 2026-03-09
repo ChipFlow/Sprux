@@ -910,7 +910,7 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   BASPACHO_SIGNPOST_BEGIN("solveSetup");
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
-  // With transpose workaround in getrf, we have P * A = L * U (standard form).
+  // After getrf, we have P * A = L * U (standard form).
   // The solve for A*x = b is:
   //   1. Apply P: y = P * b
   //   2. Solve L * z = y (forward substitution)

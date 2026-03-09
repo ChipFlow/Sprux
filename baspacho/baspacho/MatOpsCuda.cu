@@ -464,6 +464,95 @@ __global__ void convertPivotsKernel(const int* src, int64_t* dst, int64_t count)
   }
 }
 
+// Row-major LU factorization with partial pivoting (graph-capture compatible).
+// Replaces cuSOLVER getrf which uses cudaMalloc and breaks CUDA graph capture.
+// Single block: all threads cooperate on pivot search, row swap, column scale,
+// and trailing matrix update. Outputs 0-based int64_t pivots directly.
+//
+// A: pointer to m×n submatrix in global memory (row-major, stride = ld)
+// pivots: output array of min(m,n) pivot indices (0-based row swap targets)
+template <typename T>
+__global__ void luFactorRowMajorKernel(
+    T* __restrict__ A,
+    int64_t m,
+    int64_t n,
+    int64_t ld,
+    int64_t* __restrict__ pivots
+) {
+  int tid = threadIdx.x;
+  int nt = blockDim.x;
+  int64_t minMN = (m < n) ? m : n;
+
+  // Shared memory for parallel max-abs reduction
+  extern __shared__ char shmem[];
+  T* svals = reinterpret_cast<T*>(shmem);
+  int64_t* sidx = reinterpret_cast<int64_t*>(svals + nt);
+
+  for (int64_t k = 0; k < minMN; k++) {
+    // Step 1: Find pivot row — max |A[i, k]| for i in [k, m)
+    T myMaxAbs = T(0);
+    int64_t myBestRow = k;
+    for (int64_t i = k + tid; i < m; i += nt) {
+      T val = A[i * ld + k];
+      T absVal = (val >= T(0)) ? val : -val;
+      if (absVal > myMaxAbs) {
+        myMaxAbs = absVal;
+        myBestRow = i;
+      }
+    }
+    svals[tid] = myMaxAbs;
+    sidx[tid] = myBestRow;
+    __syncthreads();
+
+    // Parallel reduction (requires power-of-2 block size)
+    for (int s = nt / 2; s > 0; s >>= 1) {
+      if (tid < s && tid + s < nt) {
+        if (svals[tid + s] > svals[tid]) {
+          svals[tid] = svals[tid + s];
+          sidx[tid] = sidx[tid + s];
+        }
+      }
+      __syncthreads();
+    }
+
+    int64_t pivotRow = sidx[0];
+    if (tid == 0) {
+      pivots[k] = pivotRow;
+    }
+    __syncthreads();
+
+    // Step 2: Swap rows k and pivotRow (all columns)
+    if (pivotRow != k) {
+      for (int64_t j = tid; j < n; j += nt) {
+        T tmp = A[k * ld + j];
+        A[k * ld + j] = A[pivotRow * ld + j];
+        A[pivotRow * ld + j] = tmp;
+      }
+      __syncthreads();
+    }
+
+    // Step 3: Scale column k below diagonal
+    T diag = A[k * ld + k];
+    if (diag != T(0)) {
+      T invDiag = T(1) / diag;
+      for (int64_t i = k + 1 + tid; i < m; i += nt) {
+        A[i * ld + k] *= invDiag;
+      }
+    }
+    __syncthreads();
+
+    // Step 4: Rank-1 update of trailing matrix
+    // A[i,j] -= A[i,k] * A[k,j] for i in [k+1,m), j in [k+1,n)
+    for (int64_t i = k + 1 + tid; i < m; i += nt) {
+      T lik = A[i * ld + k];
+      for (int64_t j = k + 1; j < n; j++) {
+        A[i * ld + j] -= lik * A[k * ld + j];
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // Batched small GEMM: C -= L * U (row-major) for many small matrix multiplies.
 // Each block handles one work item. Threads within a block parallelize over output elements.
 // This avoids the ~10μs cuBLAS dispatch overhead per GEMM for thousands of tiny operations.
@@ -805,22 +894,11 @@ struct CudaNumericCtx : NumericCtx<T> {
   void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) {
     if (maxDenseBlockSize <= 0) return;
 
-    // Pre-allocate getrf workspace by querying cuSOLVER for the max size.
-    // This avoids the dynamic resizeToAtLeast during factorization.
-    int workspaceSize = 0;
-    if constexpr (std::is_same_v<T, double>) {
-      cusolverDnDgetrf_bufferSize(sym.cusolverDnH, maxDenseBlockSize,
-                                   maxDenseBlockSize, nullptr,
-                                   maxDenseBlockSize, &workspaceSize);
-    } else if constexpr (std::is_same_v<T, float>) {
-      cusolverDnSgetrf_bufferSize(sym.cusolverDnH, maxDenseBlockSize,
-                                   maxDenseBlockSize, nullptr,
-                                   maxDenseBlockSize, &workspaceSize);
-    }
-    devTempBuffer.resizeToAtLeast(workspaceSize);
-
-    // Pre-allocate cuSolver pivot buffer and singularity index
-    devGetrfPivots.resizeToAtLeast(maxDenseBlockSize);
+    // Custom LU kernel uses no workspace buffer (operates in-place).
+    // devTempBuffer may still be needed by other operations (potrf, trsm).
+    // devGetrfPivots and devPotrfSingIndex are no longer used by getrf
+    // (custom kernel writes 0-based int64_t pivots directly to devDensePivots)
+    // but kept for Cholesky (potrf) path.
     devPotrfSingIndex.resizeToAtLeast(1);
 
     // Pre-allocate converted pivot storage (for deferred D→H copies)
@@ -1233,9 +1311,10 @@ void CudaNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const 
 
 // ============ LU NumericCtx implementations ============
 
-// getrf: GPU implementation using cuSolver + transpose kernel
-// Deferred pivot readback: pivots are converted on GPU and stored in devDensePivots
-// at per-lump offsets. D→H copy is deferred to flush() to eliminate per-lump sync.
+// getrf: GPU implementation using custom row-major LU kernel (graph-capture compatible).
+// Replaces cuSOLVER getrf to eliminate cudaMalloc and enable CUDA graph capture.
+// Pivots are written as 0-based int64_t directly to devDensePivots (no format conversion).
+// D→H copy is deferred to flush() to eliminate per-lump sync.
 // applyRowPerm reads directly from devDensePivots via lastGetrfPivotOff_.
 template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
@@ -1245,51 +1324,28 @@ int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t of
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
 
-  // Step 1: Transpose row-major → col-major on GPU (in-place for square)
-  if (m == n) {
-    int64_t numPairs = n * (n - 1) / 2;
-    if (numPairs > 0) {
-      int wgs = 256;
-      int numGroups = (numPairs + wgs - 1) / wgs;
-      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
-    }
-  }
-
-  // Step 2: cuSolver getrf (col-major LU with partial pivoting)
-  int workspaceSize;
-  cusolverCHECK(cusolverDnDgetrf_bufferSize(sym.cusolverDnH, m, n, data + offA, m, &workspaceSize));
-
-  devTempBuffer.resizeToAtLeast(workspaceSize);
-  devGetrfPivots.resizeToAtLeast(minMN);
-  devPotrfSingIndex.resizeToAtLeast(1);
-
-  cusolverCHECK(cusolverDnDgetrf(sym.cusolverDnH, m, n, data + offA, m,
-                                  devTempBuffer.ptr, devGetrfPivots.ptr, devPotrfSingIndex.ptr));
-
-  // Step 3: Transpose col-major → row-major on GPU
-  if (m == n) {
-    int64_t numPairs = n * (n - 1) / 2;
-    if (numPairs > 0) {
-      int wgs = 256;
-      int numGroups = (numPairs + wgs - 1) / wgs;
-      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
-    }
-  }
-
-  // Step 4: Convert pivots on GPU into devDensePivots at current offset
+  // Pivot storage: write directly to devDensePivots (0-based int64_t)
   int64_t pivotOff = densePivotWriteOffset_;
   ensureDensePivotCapacity(pivotOff + minMN);
-  {
-    int wgs = 256;
-    int numGroups = (minMN + wgs - 1) / wgs;
-    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr,
-                                             devDensePivots.ptr + pivotOff, minMN);
-  }
+
+  // Custom row-major LU kernel — graph-capture compatible.
+  // Works directly on row-major data (no transpose), outputs 0-based int64_t
+  // pivots (no format conversion), and uses no cuSOLVER (no cudaMalloc).
+  int threads = std::min((int)std::max(m, n), 256);
+  // Round up to next power of 2 for efficient parallel reduction
+  int t = 1;
+  while (t < threads) t <<= 1;
+  threads = t;
+  size_t shmemBytes = threads * (sizeof(double) + sizeof(int64_t));
+
+  luFactorRowMajorKernel<double><<<1, threads, shmemBytes>>>(
+      data + offA, m, n, n, devDensePivots.ptr + pivotOff);
+
   lastGetrfPivotOff_ = pivotOff;
   lastGetrfPivotN_ = minMN;
   densePivotWriteOffset_ = pivotOff + minMN;
 
-  // Step 5: Defer D→H pivot copy to flush() — no sync barrier here
+  // Defer D→H pivot copy to flush() — no sync barrier here
   deferredPivotCopies_.push_back({pivots, pivotOff, minMN});
 
   return 0;
@@ -1303,51 +1359,25 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
 
-  // Step 1: Transpose row-major → col-major on GPU (in-place for square)
-  if (m == n) {
-    int64_t numPairs = n * (n - 1) / 2;
-    if (numPairs > 0) {
-      int wgs = 256;
-      int numGroups = (numPairs + wgs - 1) / wgs;
-      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
-    }
-  }
-
-  // Step 2: cuSolver getrf (col-major LU with partial pivoting)
-  int workspaceSize;
-  cusolverCHECK(cusolverDnSgetrf_bufferSize(sym.cusolverDnH, m, n, data + offA, m, &workspaceSize));
-
-  devTempBuffer.resizeToAtLeast(workspaceSize);
-  devGetrfPivots.resizeToAtLeast(minMN);
-  devPotrfSingIndex.resizeToAtLeast(1);
-
-  cusolverCHECK(cusolverDnSgetrf(sym.cusolverDnH, m, n, data + offA, m,
-                                  devTempBuffer.ptr, devGetrfPivots.ptr, devPotrfSingIndex.ptr));
-
-  // Step 3: Transpose col-major → row-major on GPU
-  if (m == n) {
-    int64_t numPairs = n * (n - 1) / 2;
-    if (numPairs > 0) {
-      int wgs = 256;
-      int numGroups = (numPairs + wgs - 1) / wgs;
-      transposeSquareInPlaceKernel<<<numGroups, wgs>>>(data + offA, n);
-    }
-  }
-
-  // Step 4: Convert pivots on GPU into devDensePivots at current offset
+  // Pivot storage: write directly to devDensePivots (0-based int64_t)
   int64_t pivotOff = densePivotWriteOffset_;
   ensureDensePivotCapacity(pivotOff + minMN);
-  {
-    int wgs = 256;
-    int numGroups = (minMN + wgs - 1) / wgs;
-    convertPivotsKernel<<<numGroups, wgs>>>(devGetrfPivots.ptr,
-                                             devDensePivots.ptr + pivotOff, minMN);
-  }
+
+  // Custom row-major LU kernel — graph-capture compatible.
+  int threads = std::min((int)std::max(m, n), 256);
+  int t = 1;
+  while (t < threads) t <<= 1;
+  threads = t;
+  size_t shmemBytes = threads * (sizeof(float) + sizeof(int64_t));
+
+  luFactorRowMajorKernel<float><<<1, threads, shmemBytes>>>(
+      data + offA, m, n, n, devDensePivots.ptr + pivotOff);
+
   lastGetrfPivotOff_ = pivotOff;
   lastGetrfPivotN_ = minMN;
   densePivotWriteOffset_ = pivotOff + minMN;
 
-  // Step 5: Defer D→H pivot copy to flush() — no sync barrier here
+  // Defer D→H pivot copy to flush() — no sync barrier here
   deferredPivotCopies_.push_back({pivots, pivotOff, minMN});
 
   return 0;
@@ -2032,10 +2062,26 @@ struct CudaSolveCtx : SolveCtx<T> {
   virtual void gemvDirect(const T* data, int64_t offset, int64_t nRows, int64_t nCols, T* vec,
                            int64_t srcOff, int64_t dstOff, int64_t ldVec, T alpha) override;
 
+  // Bulk upload all pivots to GPU at once (called from solveLU setup).
+  // Eliminates per-lump H→D copies in applyRowPermVec/applyRowPermVecInv.
+  virtual void uploadPivots(const int64_t* pivots, int64_t totalSize) override {
+    devPivotBuf.resizeToAtLeast(totalSize);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, totalSize * sizeof(int64_t),
+                         cudaMemcpyHostToDevice));
+    pivotsBase_ = pivots;
+    pivotsUploaded_ = true;
+  }
+
   const CudaSymbolicCtx& sym;
   int64_t nRHS;
   DevMirror<T> devSolveBuf;
   DevMirror<int64_t> devPivotBuf;  // GPU buffer for LU pivots
+
+  // Bulk pivot upload state: when pivots are pre-uploaded via uploadPivots,
+  // applyRowPermVec uses pointer arithmetic to find the right offset in
+  // devPivotBuf instead of doing a per-lump H→D copy.
+  const int64_t* pivotsBase_ = nullptr;
+  bool pivotsUploaded_ = false;
 };
 
 template <>
@@ -2166,55 +2212,72 @@ void CudaSolveCtx<float>::solveU(const float* data, int64_t offM, int64_t n, flo
                            CUBLAS_DIAG_NON_UNIT, n, nRHS, &alpha, data + offM, n, C + offC, ldc));
 }
 
-// applyRowPermVec: GPU kernel - copy small pivots H→D, run kernel on device
+// applyRowPermVec: use pre-uploaded device pivots if available, else H→D per lump
 template <>
 void CudaSolveCtx<double>::applyRowPermVec(const int64_t* pivots, int64_t n, double* vec,
                                             int64_t ldVec) {
   if (n <= 0) return;
-
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-
-  // Single block (sequential pivot dependency)
   int wgs = std::min((int64_t)256, nRHS);
-  applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+
+  if (pivotsUploaded_ && pivotsBase_) {
+    // Use pre-uploaded device buffer with computed offset (no per-lump H→D)
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+  } else {
+    // Fallback: per-lump H→D copy
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+  }
 }
 
 template <>
 void CudaSolveCtx<float>::applyRowPermVec(const int64_t* pivots, int64_t n, float* vec,
                                            int64_t ldVec) {
   if (n <= 0) return;
-
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-
   int wgs = std::min((int64_t)256, nRHS);
-  applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+
+  if (pivotsUploaded_ && pivotsBase_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+  } else {
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+  }
 }
 
-// applyRowPermVecInv: GPU kernel - copy small pivots H→D, run kernel on device (reverse)
+// applyRowPermVecInv: use pre-uploaded device pivots if available (reverse direction)
 template <>
 void CudaSolveCtx<double>::applyRowPermVecInv(const int64_t* pivots, int64_t n, double* vec,
                                                int64_t ldVec) {
   if (n <= 0) return;
-
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-
   int wgs = std::min((int64_t)256, nRHS);
-  applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+
+  if (pivotsUploaded_ && pivotsBase_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+  } else {
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+  }
 }
 
 template <>
 void CudaSolveCtx<float>::applyRowPermVecInv(const int64_t* pivots, int64_t n, float* vec,
                                               int64_t ldVec) {
   if (n <= 0) return;
-
-  devPivotBuf.resizeToAtLeast(n);
-  cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-
   int wgs = std::min((int64_t)256, nRHS);
-  applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+
+  if (pivotsUploaded_ && pivotsBase_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+  } else {
+    devPivotBuf.resizeToAtLeast(n);
+    cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
+    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+  }
 }
 
 // gemvDirect: result += alpha * M * x, M is row-major (nRows × nCols)
