@@ -70,12 +70,29 @@ struct NumericCtxBase {
     (void)maxDenseBlockSize;
     (void)totalDensePivots;
   }
+  // Reset per-factorization mutable state without deallocating any buffers.
+  // Used by persistent-context overloads to reuse the context across calls.
+  virtual void reset() {}
+
+  // Flush deferred pivot copies as device-to-device (keeps pivots on GPU).
+  // devDstPivots must be a device-allocated buffer with enough space.
+  // Default: no-op (CPU backends don't have deferred pivot copies).
+  virtual void flushDevicePivots(int64_t* devDstPivots) { (void)devDstPivots; }
 };
 
 struct SolveCtxBase {
   virtual ~SolveCtxBase() {}
   // Flush pending GPU operations (no-op for CPU backends)
   virtual void flush() {}
+  // Reset per-solve mutable state without deallocating any buffers.
+  // Used by persistent-context overloads to reuse the context across calls.
+  virtual void reset() {}
+  // Point solve context at device-resident pivots (no H2D upload needed).
+  // Default: no-op (CPU backends don't need this).
+  virtual void useDevicePivots(const int64_t* devPivots, int64_t totalSize) {
+    (void)devPivots;
+    (void)totalSize;
+  }
 };
 
 // (symbolic) context for factorization, constant indices (and GPU copies)

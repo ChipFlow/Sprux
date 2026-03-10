@@ -893,6 +893,178 @@ void Solver::factorLU(T* data, int64_t* pivots, bool verbose) const {
   finishInternalFactorRangeLU(data, pivots, 0, factorSkel.numSpans(), verbose);
 }
 
+// Persistent-context overload: reuses caller-provided NumericCtx across calls.
+// Same logic as beginInternalFactorRangeLU + finishInternalFactorRangeLU,
+// but the context is reset() instead of created/destroyed.
+template <typename T>
+void Solver::factorLU(T* data, int64_t* pivots, NumericCtx<T>& numCtx, bool verbose) const {
+  staticPivotPerturbCount_ = 0;
+
+  int64_t startSpanIndex = 0;
+  int64_t endSpanIndex = factorSkel.numSpans();
+  BASPACHO_CHECK_GE(startSpanIndex, 0);
+  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
+  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  // Reset mutable state, reuse allocated buffers
+  numCtx.reset();
+
+  using ValT = typename std::remove_pointer<decltype(data)>::type;
+
+  // Compute effective static pivot threshold scaled by matrix diagonal magnitude.
+  if (staticPivotThreshold_ >= 0) {
+    ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
+    if (staticPivotThreshold_ == 0) {
+      double maxDiag = numCtx.maxAbsDiag(data, factorSkel.lumpStart.data(),
+                                         factorSkel.chainColPtr.data(),
+                                         factorSkel.chainData.data(), startLump, upToLump);
+      effectiveStaticPivotThreshold_ = static_cast<double>(epsScale) * std::max(maxDiag, static_cast<double>(epsScale));
+    } else {
+      effectiveStaticPivotThreshold_ = staticPivotThreshold_;
+    }
+  }
+
+  // LU sparse elimination
+  ValT effectiveThreshold =
+      (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
+
+  if (!luElimCtxs.empty()) {
+    if (startLump == 0 && upToLump >= sparseElimRanges.back()) {
+      numCtx.doAllEliminationsLU(luElimCtxs, sparseElimRanges, data, effectiveThreshold,
+                                 staticPivotPerturbCount_);
+    } else {
+      for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+        if (sparseElimRanges[l + 1] > upToLump) break;
+        else if (startLump > sparseElimRanges[l]) continue;
+        if (luElimCtxs[l]) {
+          int64_t perturbCount = 0;
+          numCtx.doEliminationLU(*luElimCtxs[l], data, sparseElimRanges[l],
+                                 sparseElimRanges[l + 1], effectiveThreshold, perturbCount);
+          staticPivotPerturbCount_ += perturbCount;
+        }
+      }
+    }
+  }
+
+  // Dense factorization loop
+  int64_t denseOpsFromLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
+
+  numCtx.beginDenseOps(data, factorSkel.totalDataSize());
+
+  for (int64_t l = std::max(startLump, denseOpsFromLump);
+       l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
+    numCtx.prepareAssemble(l);
+
+    int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
+                                                : factorSkel.boardRowPtr[l];
+    for (int64_t rPtr = rPtrStart,
+                 rEnd = factorSkel.boardRowPtr[l + 1] - 1;
+         rPtr < rEnd; rPtr++) {
+      int64_t origLump = factorSkel.boardColLump[rPtr];
+      if (origLump >= upToLump) break;
+      else if (origLump < startLump) continue;
+      eliminateBoardLU(numCtx, data, rPtr);
+    }
+
+    if (l < upToLump) {
+      factorLumpLU(numCtx, data, pivots, l);
+    }
+  }
+
+  numCtx.flush();
+  staticPivotPerturbCount_ += numCtx.deferredPerturbCount();
+  // Context is NOT destroyed — caller owns it.
+}
+
+// Device-pivot overload: when pivLoc == Device, pivots stay on device.
+// flush() is replaced by flushDevicePivots() which does D→D instead of D→H.
+template <typename T>
+void Solver::factorLU(T* data, int64_t* devPivots, NumericCtx<T>& numCtx, PivotLocation pivLoc,
+                      bool verbose) const {
+  if (pivLoc == PivotLocation::Host) {
+    // Delegate to host-pivot version
+    factorLU(data, devPivots, numCtx, verbose);
+    return;
+  }
+
+  staticPivotPerturbCount_ = 0;
+
+  int64_t startSpanIndex = 0;
+  int64_t endSpanIndex = factorSkel.numSpans();
+  int64_t startLump = factorSkel.spanToLump[startSpanIndex];
+  int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
+
+  numCtx.reset();
+
+  using ValT = typename std::remove_pointer<decltype(data)>::type;
+
+  // Compute effective static pivot threshold
+  if (staticPivotThreshold_ >= 0) {
+    ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
+    if (staticPivotThreshold_ == 0) {
+      double maxDiag = numCtx.maxAbsDiag(data, factorSkel.lumpStart.data(),
+                                         factorSkel.chainColPtr.data(),
+                                         factorSkel.chainData.data(), startLump, upToLump);
+      effectiveStaticPivotThreshold_ = static_cast<double>(epsScale) * std::max(maxDiag, static_cast<double>(epsScale));
+    } else {
+      effectiveStaticPivotThreshold_ = staticPivotThreshold_;
+    }
+  }
+
+  // LU sparse elimination
+  ValT effectiveThreshold =
+      (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
+
+  if (!luElimCtxs.empty()) {
+    // This overload always factorizes the full range (startLump==0, upToLump==numLumps).
+    BASPACHO_CHECK(startLump == 0);
+    BASPACHO_CHECK(upToLump >= sparseElimRanges.back());
+    numCtx.doAllEliminationsLU(luElimCtxs, sparseElimRanges, data, effectiveThreshold,
+                               staticPivotPerturbCount_);
+  }
+
+  // Dense factorization loop — pivots pointer is passed through to getrf,
+  // which stores them in devDensePivots. flushDevicePivots() copies D→D.
+  int64_t denseOpsFromLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
+
+  numCtx.beginDenseOps(data, factorSkel.totalDataSize());
+
+  for (int64_t l = std::max(startLump, denseOpsFromLump);
+       l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
+    numCtx.prepareAssemble(l);
+
+    int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
+                                                : factorSkel.boardRowPtr[l];
+    for (int64_t rPtr = rPtrStart,
+                 rEnd = factorSkel.boardRowPtr[l + 1] - 1;
+         rPtr < rEnd; rPtr++) {
+      int64_t origLump = factorSkel.boardColLump[rPtr];
+      if (origLump >= upToLump) break;
+      else if (origLump < startLump) continue;
+      eliminateBoardLU(numCtx, data, rPtr);
+    }
+
+    if (l < upToLump) {
+      // Pass devPivots (device pointer) — getrf defers pivot writes to devDensePivots.
+      // The cpuDst in DeferredPivotCopy will hold (devPivots + lumpStart[l]),
+      // but it's never dereferenced on host — only used for offset computation
+      // in flushDevicePivots.
+      factorLumpLU(numCtx, data, devPivots, l);
+    }
+  }
+
+  // Flush pivot copies as D→D instead of D→H
+  numCtx.flushDevicePivots(devPivots);
+  staticPivotPerturbCount_ += numCtx.deferredPerturbCount();
+}
+
 template <typename T>
 void Solver::beginFactorLU(T* data, int64_t* pivots, bool verbose) const {
   staticPivotPerturbCount_ = 0;
@@ -944,6 +1116,67 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   internalSolveURange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   slvCtx->flush();  // Final flush: ensure all GPU solve work is complete
   BASPACHO_SIGNPOST_END("solveU");
+}
+
+// Persistent-context overload: reuses caller-provided SolveCtx across calls.
+template <typename T>
+void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride,
+                     int nRHS, SolveCtx<T>& slvCtx) const {
+  slvCtx.reset();
+
+  slvCtx.uploadPivots(pivots, factorSkel.lumpStart[factorSkel.numLumps()]);
+
+  // Step 1: Apply row permutation P
+  int64_t pivotStartLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
+  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    int64_t pivotOffset = factorSkel.lumpStart[l];
+    slvCtx.applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+  }
+
+  // Step 2: Solve L * z = y (forward substitution)
+  internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+
+  // Step 3: Solve U * x = z (backward substitution)
+  internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx.flush();
+  // Context is NOT destroyed — caller owns it.
+}
+
+// Device-pivot overload: pivots already on device (no H2D upload).
+template <typename T>
+void Solver::solveLU(const T* matData, const int64_t* devPivots, T* vecData, int64_t stride,
+                     int nRHS, SolveCtx<T>& slvCtx, PivotLocation pivLoc) const {
+  if (pivLoc == PivotLocation::Host) {
+    solveLU(matData, devPivots, vecData, stride, nRHS, slvCtx);
+    return;
+  }
+
+  slvCtx.reset();
+
+  // Point solve context at device-resident pivots (no memcpy!)
+  slvCtx.useDevicePivots(devPivots, factorSkel.lumpStart[factorSkel.numLumps()]);
+
+  // Step 1: Apply row permutation P
+  int64_t pivotStartLump =
+      (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
+  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+    int64_t lumpStart = factorSkel.lumpStart[l];
+    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+    int64_t pivotOffset = factorSkel.lumpStart[l];
+    // devPivots + pivotOffset: device pointer, never dereferenced on host.
+    // Used by CudaSolveCtx::applyRowPermVec for offset computation only.
+    slvCtx.applyRowPermVec(devPivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+  }
+
+  // Step 2: Solve L * z = y (forward substitution)
+  internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+
+  // Step 3: Solve U * x = z (backward substitution)
+  internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  slvCtx.flush();
 }
 
 // Forward substitution for LU with unit lower triangular L
@@ -1079,6 +1312,10 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
 
 template void Solver::factorLU<double>(double* data, int64_t* pivots, bool verbose) const;
 template void Solver::factorLU<float>(float* data, int64_t* pivots, bool verbose) const;
+template void Solver::factorLU<double>(double* data, int64_t* pivots, NumericCtx<double>& ctx,
+                                       bool verbose) const;
+template void Solver::factorLU<float>(float* data, int64_t* pivots, NumericCtx<float>& ctx,
+                                      bool verbose) const;
 template void Solver::beginFactorLU<double>(double* data, int64_t* pivots, bool verbose) const;
 template void Solver::beginFactorLU<float>(float* data, int64_t* pivots, bool verbose) const;
 template void Solver::finishFactorLU<double>(double* data, int64_t* pivots, bool verbose) const;
@@ -1087,6 +1324,20 @@ template void Solver::solveLU<double>(const double* matData, const int64_t* pivo
                                       int64_t stride, int nRHS) const;
 template void Solver::solveLU<float>(const float* matData, const int64_t* pivots, float* vecData,
                                      int64_t stride, int nRHS) const;
+template void Solver::solveLU<double>(const double* matData, const int64_t* pivots, double* vecData,
+                                      int64_t stride, int nRHS, SolveCtx<double>& ctx) const;
+template void Solver::solveLU<float>(const float* matData, const int64_t* pivots, float* vecData,
+                                     int64_t stride, int nRHS, SolveCtx<float>& ctx) const;
+template void Solver::factorLU<double>(double* data, int64_t* devPivots, NumericCtx<double>& ctx,
+                                       PivotLocation pivLoc, bool verbose) const;
+template void Solver::factorLU<float>(float* data, int64_t* devPivots, NumericCtx<float>& ctx,
+                                      PivotLocation pivLoc, bool verbose) const;
+template void Solver::solveLU<double>(const double* matData, const int64_t* devPivots,
+                                      double* vecData, int64_t stride, int nRHS,
+                                      SolveCtx<double>& ctx, PivotLocation pivLoc) const;
+template void Solver::solveLU<float>(const float* matData, const int64_t* devPivots,
+                                     float* vecData, int64_t stride, int nRHS,
+                                     SolveCtx<float>& ctx, PivotLocation pivLoc) const;
 
 // ============ LDL^T Factorization Implementation ============
 // For symmetric indefinite matrices: A = L * D * L^T

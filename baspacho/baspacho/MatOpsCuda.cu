@@ -461,6 +461,60 @@ __global__ void perturbSmallDiagonalsKernel(int64_t n, T* data, int64_t offset, 
   }
 }
 
+// maxAbsDiag GPU reduction kernel: find max|diag| across lumps [startLump, startLump + numLumps).
+// Each thread handles one lump, iterates over its diagonal elements.
+// Uses shared memory reduction within the block, then atomicMax across blocks.
+// devResult must be pre-initialized to 0.0 by the caller.
+template <typename T>
+__global__ void maxAbsDiagKernel(const T* data, const int64_t* lumpStart,
+                                 const int64_t* chainColPtr, const int64_t* chainData,
+                                 int64_t startLump, int64_t numLumps, double* devResult) {
+  extern __shared__ double sdata[];
+  int tid = threadIdx.x;
+  int64_t lumpIdx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  double localMax = 0.0;
+  if (lumpIdx < numLumps) {
+    int64_t l = startLump + lumpIdx;
+    int64_t lSize = lumpStart[l + 1] - lumpStart[l];
+    int64_t diagOff = chainData[chainColPtr[l]];
+    for (int64_t i = 0; i < lSize; i++) {
+      double val = static_cast<double>(data[diagOff + i * lSize + i]);
+      double absVal = (val >= 0.0) ? val : -val;
+      if (absVal > localMax) localMax = absVal;
+    }
+  }
+
+  sdata[tid] = localMax;
+  __syncthreads();
+
+  // Block reduction
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (sdata[tid + s] > sdata[tid]) sdata[tid] = sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  // Atomic max across blocks (using unsigned long long reinterpretation for doubles)
+  if (tid == 0 && sdata[0] > 0.0) {
+    // Double atomicMax via atomicCAS (standard pattern)
+    unsigned long long* addr = reinterpret_cast<unsigned long long*>(devResult);
+    unsigned long long old_val = *addr;
+    unsigned long long assumed;
+    double newVal = sdata[0];
+    do {
+      assumed = old_val;
+      double oldDouble;
+      memcpy(&oldDouble, &assumed, sizeof(double));
+      if (oldDouble >= newVal) break;
+      unsigned long long newBits;
+      memcpy(&newBits, &newVal, sizeof(unsigned long long));
+      old_val = atomicCAS(addr, assumed, newBits);
+    } while (assumed != old_val);
+  }
+}
+
 // Convert cuSolver pivots (int, 1-based) to BaSpaCho format (int64_t, 0-based) on GPU
 __global__ void convertPivotsKernel(const int* src, int64_t* dst, int64_t count) {
   int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -896,7 +950,14 @@ struct CudaNumericCtx : NumericCtx<T> {
   //
   // maxDenseBlockSize: largest dense block dimension that getrf will see
   // totalDensePivots: total pivot storage needed across all dense lumps
-  void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) {
+  void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) override {
+    preAllocateForLU(maxDenseBlockSize, totalDensePivots, 0);
+  }
+
+  // Extended version with maxGemmBatchItems for full pre-allocation.
+  // maxGemmBatchItems: max number of GemmWorkItems per lump (0 = estimate from spanToChainOffset)
+  void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots,
+                        int64_t maxGemmBatchItems) {
     if (maxDenseBlockSize <= 0) return;
 
     // Custom LU kernel uses no workspace buffer (operates in-place).
@@ -916,11 +977,42 @@ struct CudaNumericCtx : NumericCtx<T> {
 
     // Pre-allocate pivot buffer for applyRowPerm
     devPivotBuf.resizeToAtLeast(maxDenseBlockSize);
+
+    // Pre-allocate maxAbsDiag result buffer
+    devMaxAbsDiagResult_.resizeToAtLeast(1);
+
+    // Pre-allocate pinned staging buffer to max of prepareAssemble and flushGemmBatch needs.
+    // This prevents ensurePinnedBuf from triggering cudaFreeHost/cudaHostAlloc during the hot path.
+    size_t spanBytes = spanToChainOffset.size() * sizeof(int64_t);
+    size_t gemmBytes = maxGemmBatchItems > 0
+        ? (size_t)maxGemmBatchItems * sizeof(GemmWorkItem)
+        : spanBytes;  // conservative fallback
+    ensurePinnedBuf(std::max(spanBytes, gemmBytes));
+
+    // Pre-allocate devGemmWork_ to match max batch size
+    if (maxGemmBatchItems > 0) {
+      size_t devGemmElements = (maxGemmBatchItems * sizeof(GemmWorkItem)) / sizeof(T) + 1;
+      devGemmWork_.resizeToAtLeast(devGemmElements);
+    }
   }
 
   virtual ~CudaNumericCtx() override {
     if (pinnedBuf_) cudaFreeHost(pinnedBuf_);
     if (sparseCompleteEvent_) cudaEventDestroy(sparseCompleteEvent_);
+  }
+
+  // Reset per-factorization mutable state without deallocating any buffers.
+  // Allows reusing this context across multiple factorLU calls.
+  void reset() override {
+    gemmBatch_.clear();
+    gemmDataPtr_ = nullptr;
+    deferredPivotCopies_.clear();
+    densePivotWriteOffset_ = 0;
+    lastGetrfPivotOff_ = -1;
+    perturbCountPending_ = false;
+    readCacheValid_ = false;
+    // Buffers (pinnedBuf_, devGemmWork_, devDensePivots, devTempBuffer, etc.)
+    // are NOT freed — they are reused across calls.
   }
 
   virtual void pseudoFactorSpans(T* data, int64_t spanBegin, int64_t spanEnd) override {
@@ -984,6 +1076,31 @@ struct CudaNumericCtx : NumericCtx<T> {
     return hostData_[offset];
   }
 
+  // GPU reduction kernel for maxAbsDiag — avoids bulk D→H copy from readValue loop.
+  // Only copies 8 bytes (the result) D→H.
+  double maxAbsDiag(const T* data, const int64_t* /*lumpStart*/,
+                    const int64_t* /*chainColPtr*/, const int64_t* /*chainData*/,
+                    int64_t startLump, int64_t upToLump) override {
+    int64_t numLumps = upToLump - startLump;
+    if (numLumps <= 0) return 0.0;
+
+    devMaxAbsDiagResult_.resizeToAtLeast(1);
+    cuCHECK(cudaMemsetAsync(devMaxAbsDiagResult_.ptr, 0, sizeof(double), 0));
+
+    int wgs = 256;
+    int numBlocks = (numLumps + wgs - 1) / wgs;
+    size_t shmem = wgs * sizeof(double);
+    maxAbsDiagKernel<T><<<numBlocks, wgs, shmem>>>(
+        data, sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
+        sym.devChainData.ptr, startLump, numLumps, devMaxAbsDiagResult_.ptr);
+
+    double result = 0.0;
+    cuCHECK(cudaMemcpy(&result, devMaxAbsDiagResult_.ptr, sizeof(double), cudaMemcpyDeviceToHost));
+    return result;
+  }
+
+  DevMirror<double> devMaxAbsDiagResult_;
+
   virtual void potrf(int64_t n, T* data, int64_t offA) override;
 
   virtual void trsm(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override;
@@ -1009,11 +1126,32 @@ struct CudaNumericCtx : NumericCtx<T> {
 
   virtual void flush() override {
     flushGemmBatch();
-    // Flush deferred pivot copies: one bulk sync + sequential copies
+    // Flush deferred pivot copies: D→H (host destination)
     if (!deferredPivotCopies_.empty()) {
       for (auto& dc : deferredPivotCopies_) {
         cuCHECK(cudaMemcpy(dc.cpuDst, devDensePivots.ptr + dc.gpuSrcOffset,
                             dc.count * sizeof(int64_t), cudaMemcpyDeviceToHost));
+      }
+      deferredPivotCopies_.clear();
+      densePivotWriteOffset_ = 0;
+      lastGetrfPivotOff_ = -1;
+    }
+  }
+
+  // Flush deferred pivot copies as device-to-device (keeps pivots on GPU).
+  // The destination offsets are computed relative to the first deferred copy's
+  // host pointer (which corresponds to offset 0 in the consolidated array).
+  void flushDevicePivots(int64_t* devDstPivots) override {
+    flushGemmBatch();
+    if (!deferredPivotCopies_.empty()) {
+      // Compute destination offsets relative to the first copy's host pointer
+      int64_t* basePtr = deferredPivotCopies_[0].cpuDst;
+      for (auto& dc : deferredPivotCopies_) {
+        int64_t dstOff = dc.cpuDst - basePtr;
+        cuCHECK(cudaMemcpyAsync(devDstPivots + dstOff,
+                                 devDensePivots.ptr + dc.gpuSrcOffset,
+                                 dc.count * sizeof(int64_t),
+                                 cudaMemcpyDeviceToDevice, 0));
       }
       deferredPivotCopies_.clear();
       densePivotWriteOffset_ = 0;
@@ -1184,9 +1322,9 @@ struct CudaNumericCtx : NumericCtx<T> {
   int64_t densePivotWriteOffset_ = 0;  // Current write offset in devDensePivots
   int64_t lastGetrfPivotOff_ = -1;     // Offset of last getrf pivots in devDensePivots
   struct DeferredPivotCopy {
-    int64_t* cpuDst;
-    int64_t gpuSrcOffset;
-    int64_t count;
+    int64_t* cpuDst;       // Host or device destination pointer (for offset computation)
+    int64_t gpuSrcOffset;  // Offset in devDensePivots
+    int64_t count;         // Number of pivot elements
   };
   std::vector<DeferredPivotCopy> deferredPivotCopies_;
 
@@ -1944,6 +2082,15 @@ struct CudaSolveCtx : SolveCtx<T> {
   }
   virtual ~CudaSolveCtx() override {}
 
+  // Reset per-solve mutable state without deallocating any buffers.
+  // Allows reusing this context across multiple solveLU calls.
+  void reset() override {
+    pivotsBase_ = nullptr;
+    pivotsUploaded_ = false;
+    externalDevPivots_ = nullptr;
+    // devSolveBuf, devPivotBuf are NOT freed — reused across calls.
+  }
+
   virtual void sparseElimSolveL(const SymElimCtx& /*elimData*/, const T* data, int64_t lumpsBegin,
                                 int64_t lumpsEnd, T* C, int64_t ldc) override {
     auto timer = sym.solveSparseLStat.instance<CudaSyncOps>();
@@ -2075,6 +2222,19 @@ struct CudaSolveCtx : SolveCtx<T> {
                          cudaMemcpyHostToDevice));
     pivotsBase_ = pivots;
     pivotsUploaded_ = true;
+    externalDevPivots_ = nullptr;
+  }
+
+  // Point solve context at device-resident pivots (no H2D upload needed).
+  // Used when factorLU wrote pivots directly to device via flushDevicePivots.
+  // pivotsBase_ is set to devPivots so that offset computation works:
+  //   solveLU passes (devPivots + lumpStart[l]) to applyRowPermVec,
+  //   which computes offset = (devPivots + lumpStart[l]) - pivotsBase_ = lumpStart[l].
+  void useDevicePivots(const int64_t* devPivots, int64_t totalSize) override {
+    (void)totalSize;
+    externalDevPivots_ = devPivots;
+    pivotsBase_ = devPivots;  // used for offset computation only, never dereferenced
+    pivotsUploaded_ = true;
   }
 
   const CudaSymbolicCtx& sym;
@@ -2087,6 +2247,10 @@ struct CudaSolveCtx : SolveCtx<T> {
   // devPivotBuf instead of doing a per-lump H→D copy.
   const int64_t* pivotsBase_ = nullptr;
   bool pivotsUploaded_ = false;
+
+  // External device pivots: when set via useDevicePivots(), applyRowPermVec
+  // reads from this pointer instead of devPivotBuf. Avoids aliasing devPivotBuf.ptr.
+  const int64_t* externalDevPivots_ = nullptr;
 };
 
 template <>
@@ -2224,7 +2388,11 @@ void CudaSolveCtx<double>::applyRowPermVec(const int64_t* pivots, int64_t n, dou
   if (n <= 0) return;
   int wgs = std::min((int64_t)256, nRHS);
 
-  if (pivotsUploaded_ && pivotsBase_) {
+  if (externalDevPivots_ && pivotsUploaded_) {
+    // Use external device-resident pivots (no copy at all)
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+  } else if (pivotsUploaded_ && pivotsBase_) {
     // Use pre-uploaded device buffer with computed offset (no per-lump H→D)
     int64_t offset = pivots - pivotsBase_;
     applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
@@ -2242,7 +2410,10 @@ void CudaSolveCtx<float>::applyRowPermVec(const int64_t* pivots, int64_t n, floa
   if (n <= 0) return;
   int wgs = std::min((int64_t)256, nRHS);
 
-  if (pivotsUploaded_ && pivotsBase_) {
+  if (externalDevPivots_ && pivotsUploaded_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+  } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
     applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
@@ -2259,7 +2430,10 @@ void CudaSolveCtx<double>::applyRowPermVecInv(const int64_t* pivots, int64_t n, 
   if (n <= 0) return;
   int wgs = std::min((int64_t)256, nRHS);
 
-  if (pivotsUploaded_ && pivotsBase_) {
+  if (externalDevPivots_ && pivotsUploaded_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecInvKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+  } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
     applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
@@ -2275,7 +2449,10 @@ void CudaSolveCtx<float>::applyRowPermVecInv(const int64_t* pivots, int64_t n, f
   if (n <= 0) return;
   int wgs = std::min((int64_t)256, nRHS);
 
-  if (pivotsUploaded_ && pivotsBase_) {
+  if (externalDevPivots_ && pivotsUploaded_) {
+    int64_t offset = pivots - pivotsBase_;
+    applyRowPermVecInvKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+  } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
     applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {

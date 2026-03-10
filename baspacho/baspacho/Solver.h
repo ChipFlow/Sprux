@@ -17,6 +17,10 @@
 
 namespace BaSpaCho {
 
+// Where pivot data resides (host or device memory).
+// Used by persistent-context factorLU/solveLU overloads to avoid D2H→H2D roundtrips.
+enum class PivotLocation { Host, Device };
+
 /**
  * @brief Class solver represents a symbolic decomposition with the operations required to
  * operate on (externally allocated) numeric matrix/vector data.
@@ -73,6 +77,18 @@ class Solver {
   template <typename T>
   void factorLU(T* data, int64_t* pivots, bool verbose = false) const;
 
+  // Persistent-context overload: caller provides a pre-existing NumericCtx
+  // that is reset() and reused across calls (NOT created/destroyed each time).
+  // This eliminates per-call cudaMalloc/cudaFreeHost overhead on GPU backends.
+  template <typename T>
+  void factorLU(T* data, int64_t* pivots, NumericCtx<T>& ctx, bool verbose = false) const;
+
+  // Device-pivot overload: pivots stay on device (no D2H copy in flush).
+  // devPivots must be device-allocated with at least numSpans() int64_t elements.
+  template <typename T>
+  void factorLU(T* data, int64_t* devPivots, NumericCtx<T>& ctx, PivotLocation pivLoc,
+                bool verbose = false) const;
+
   /**
    * @brief Begin LU factorization (phase 1): submit sparse elimination to GPU.
    *
@@ -121,6 +137,17 @@ class Solver {
   // pivots array must match the one used in factorLU
   template <typename T>
   void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS) const;
+
+  // Persistent-context overload: caller provides a pre-existing SolveCtx
+  // that is reset() and reused across calls (NOT created/destroyed each time).
+  template <typename T>
+  void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS,
+               SolveCtx<T>& ctx) const;
+
+  // Device-pivot overload: pivots are already on device (no H2D upload needed).
+  template <typename T>
+  void solveLU(const T* matData, const int64_t* devPivots, T* vecData, int64_t stride, int nRHS,
+               SolveCtx<T>& ctx, PivotLocation pivLoc) const;
 
   /**
    * @brief Factor using LDL^T decomposition for symmetric indefinite matrices.
