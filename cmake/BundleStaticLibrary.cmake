@@ -107,7 +107,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
   add_custom_target(bundling_target ALL DEPENDS ${bundled_tgt_full_name})
   add_dependencies(bundling_target ${tgt_name})
 
-  add_library(${bundled_tgt_name} STATIC IMPORTED)
+  add_library(${bundled_tgt_name} STATIC IMPORTED GLOBAL)
   set_target_properties(${bundled_tgt_name} 
     PROPERTIES 
       IMPORTED_LOCATION ${bundled_tgt_full_name}
