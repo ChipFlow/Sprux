@@ -104,6 +104,11 @@ struct CudaSymbolicCtx : SymbolicCtx {
     PermutedCoalescedAccessor retv;
     retv.init(devSpanStart.ptr, devSpanToLump.ptr, devLumpStart.ptr, devSpanOffsetInLump.ptr,
               devChainColPtr.ptr, devChainRowSpan.ptr, devChainData.ptr, devPermutation.ptr);
+    // Initialize upper triangle device pointers for LU factorization (MTYPE_GENERAL)
+    if (skel.isGeneral()) {
+      retv.plainAcc.initUpper(devUpperChainRowPtr.ptr, devUpperChainColSpan.ptr,
+                              devUpperChainData.ptr);
+    }
     return retv;
   }
 
