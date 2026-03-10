@@ -673,31 +673,55 @@ void Solver::eliminateBoardLU(NumericCtx<T>& numCtx, T* data, int64_t ptr) const
           }
         } else {
           // Target is in upper triangle at (lRowSpan row, uColSpan col)
-          // lRowSpan < uColSpan, so we need to find this block in the upper triangle
-          // of the lump containing lRowSpan
+          // lRowSpan < uColSpan
           int64_t targetRowLump = factorSkel.spanToLump[lRowSpan];
-          int64_t targetUpperRowStart = factorSkel.upperChainRowPtr[targetRowLump];
-          int64_t targetUpperRowEnd = factorSkel.upperChainRowPtr[targetRowLump + 1];
+          int64_t targetColLump2 = factorSkel.spanToLump[uColSpan];
 
-          // Find the upper triangle entry pointing to uColSpan
-          int64_t targetDataOffset = -1;
-          for (int64_t tu = targetUpperRowStart; tu < targetUpperRowEnd; tu++) {
-            if (factorSkel.upperChainColSpan[tu] == uColSpan) {
-              targetDataOffset = upperDataBase + factorSkel.upperChainData[tu];
-              // Add row offset within the lump
-              int64_t rowOffsetInLump = factorSkel.spanOffsetInLump[lRowSpan];
-              targetDataOffset += rowOffsetInLump * uColSize;
-              break;
-            }
-          }
+          if (targetRowLump == targetColLump2) {
+            // INTRA-LUMP upper: target is in the diagonal block of this lump.
+            // upperChainData only stores INTER-lump entries, so we must address
+            // the diagonal block directly.
+            int64_t tgtLumpSize =
+                factorSkel.lumpStart[targetRowLump + 1] - factorSkel.lumpStart[targetRowLump];
+            int64_t tgtChainColBegin = factorSkel.chainColPtr[targetRowLump];
+            int64_t diagDataStart = factorSkel.chainData[tgtChainColBegin];
+            int64_t rowOff = factorSkel.spanOffsetInLump[lRowSpan];
+            int64_t colOff = factorSkel.spanOffsetInLump[uColSpan];
+            int64_t targetDataOffset = diagDataStart + rowOff * tgtLumpSize + colOff;
 
-          if (targetDataOffset >= 0) {
             // C -= L * U
             // L is lRowSize x origLumpSize at lDataOffset (row-major, ld=origLumpSize)
             // U is origLumpSize x uColSize at uDataOffset (row-major, ld=uColSize)
-            // C is lRowSize x uColSize at targetDataOffset (row-major, ld=uColSize)
+            // C is lRowSize x uColSize at targetDataOffset (row-major, ld=tgtLumpSize)
             numCtx.saveGemm(lRowSize, uColSize, origLumpSize, data, lDataOffset, origLumpSize, data,
-                            uDataOffset, uColSize, data, targetDataOffset, uColSize);
+                            uDataOffset, uColSize, data, targetDataOffset, tgtLumpSize);
+          } else {
+            // INTER-LUMP upper: find in the upper triangle chain data
+            int64_t targetUpperRowStart = factorSkel.upperChainRowPtr[targetRowLump];
+            int64_t targetUpperRowEnd = factorSkel.upperChainRowPtr[targetRowLump + 1];
+
+            // Find the upper triangle entry pointing to uColSpan
+            int64_t targetDataOffset = -1;
+            int64_t tgtLumpSize =
+                factorSkel.lumpStart[targetRowLump + 1] - factorSkel.lumpStart[targetRowLump];
+            for (int64_t tu = targetUpperRowStart; tu < targetUpperRowEnd; tu++) {
+              if (factorSkel.upperChainColSpan[tu] == uColSpan) {
+                targetDataOffset = upperDataBase + factorSkel.upperChainData[tu];
+                // Add row offset within the lump (stride = uColSize for inter-lump upper data)
+                int64_t rowOffsetInLump = factorSkel.spanOffsetInLump[lRowSpan];
+                targetDataOffset += rowOffsetInLump * uColSize;
+                break;
+              }
+            }
+
+            if (targetDataOffset >= 0) {
+              // C -= L * U
+              // L is lRowSize x origLumpSize at lDataOffset (row-major, ld=origLumpSize)
+              // U is origLumpSize x uColSize at uDataOffset (row-major, ld=uColSize)
+              // C is lRowSize x uColSize at targetDataOffset (row-major, ld=uColSize)
+              numCtx.saveGemm(lRowSize, uColSize, origLumpSize, data, lDataOffset, origLumpSize,
+                              data, uDataOffset, uColSize, data, targetDataOffset, uColSize);
+            }
           }
         }
       }
