@@ -43,6 +43,42 @@ struct CudaSyncOps {
   }
 };
 
+// CPU-side binary search (mirrors GPU bisect)
+static int64_t cpuBisect(const int64_t* array, int64_t size, int64_t needle) {
+  int64_t a = 0, b = size;
+  while (b - a > 1) {
+    int64_t mid = (a + b) / 2;
+    if (needle >= array[mid])
+      a = mid;
+    else
+      b = mid;
+  }
+  return a;
+}
+
+// LU work item for two-phase deterministic elimination
+struct CudaLUWorkItem {
+  int32_t L_offset;
+  int32_t U_offset;
+  int32_t target_offset;
+};
+
+// Cholesky element-level work item for two-phase elimination
+struct CudaCholWorkItem {
+  int32_t srcRow_offset;
+  int32_t srcCol_offset;
+  int16_t numK;
+  int16_t padding;
+  int32_t target_offset;
+};
+
+// Segment descriptor for two-phase accumulation
+struct CudaSegmentInfo {
+  int32_t target_offset;
+  int32_t scratch_start;
+  int32_t count;
+};
+
 struct CudaSymElimCtx : SymElimCtx {
   CudaSymElimCtx() {}
   virtual ~CudaSymElimCtx() override {}
@@ -50,6 +86,18 @@ struct CudaSymElimCtx : SymElimCtx {
   int64_t numColumns;
   int64_t numBlockPairs;
   DevMirror<int64_t> makeBlockPairEnumStraight;
+
+  // Two-phase LU elimination
+  int64_t numLUWorkItems = 0;
+  DevMirror<int32_t> devLUWorkItems;  // packed: 3 int32 per CudaLUWorkItem
+  int64_t numLUSegments = 0;
+  DevMirror<int32_t> devLUSegments;   // packed: 3 int32 per CudaSegmentInfo
+
+  // Two-phase Cholesky elimination
+  int64_t numCholWorkItems = 0;
+  DevMirror<int32_t> devCholWorkItems;  // packed: 4 int32 per CudaCholWorkItem
+  int64_t numCholSegments = 0;
+  DevMirror<int32_t> devCholSegments;   // packed: 3 int32 per CudaSegmentInfo
 };
 
 struct CudaSymbolicCtx : SymbolicCtx {
@@ -134,6 +182,110 @@ struct CudaSymbolicCtx : SymbolicCtx {
     elim->numBlockPairs = makeStraight[makeStraight.size() - 1];
     elim->makeBlockPairEnumStraight.load(makeStraight);
 
+    // Build element-level work items for two-phase deterministic elimination.
+    // Expand each block pair into individual element dot products.
+    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+
+    vector<CudaCholWorkItem> cholItems;
+    cholItems.reserve(elim->numBlockPairs * 4);  // heuristic: ~4 elements per block pair
+
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t colStart = skel.chainColPtr[l] + 1;  // skip diagonal
+      int64_t colEnd = skel.chainColPtr[l + 1];
+      int64_t n = colEnd - colStart;
+      int64_t lumpSize = skel.lumpStart[l + 1] - skel.lumpStart[l];
+
+      for (int64_t p = 0; p < n * (n + 1) / 2; p++) {
+        // Convert linear index to ordered pair (di, dj) where di <= dj
+        int64_t odd = n & 1;
+        int64_t m = n + 1 - odd;
+        int64_t di = p % m;
+        int64_t dj = n - 1 - (p / m);
+        if (di > dj) {
+          di = di - dj - 1;
+          dj = n - 1 - odd - dj;
+        }
+
+        // Block info (mirrors GPU kernel logic)
+        int64_t iSpan = skel.chainRowSpan[colStart + di];
+        int64_t jSpan = skel.chainRowSpan[colStart + dj];
+        int64_t iSize = skel.spanStart[iSpan + 1] - skel.spanStart[iSpan];
+        int64_t jSize = skel.spanStart[jSpan + 1] - skel.spanStart[jSpan];
+        int64_t iDataPtr = skel.chainData[colStart + di];
+        int64_t jDataPtr = skel.chainData[colStart + dj];
+
+        // Find target block via bisect
+        int64_t iLump = skel.spanToLump[iSpan];
+        int64_t iSpanOff = skel.spanOffsetInLump[iSpan];
+        int64_t targetLumpSize = skel.lumpStart[iLump + 1] - skel.lumpStart[iLump];
+        int64_t targetStartPtr = skel.chainColPtr[iLump];
+        int64_t targetEndPtr = skel.chainColPtr[iLump + 1];
+        int64_t targetPos = cpuBisect(skel.chainRowSpan.data() + targetStartPtr,
+                                      targetEndPtr - targetStartPtr, jSpan);
+        int64_t jiDataPtr = skel.chainData[targetStartPtr + targetPos];
+
+        // Expand to element-level: each (i,j) gets one dot product
+        for (int64_t i = 0; i < jSize; i++) {
+          for (int64_t j = 0; j < iSize; j++) {
+            CudaCholWorkItem item;
+            item.srcRow_offset = (int32_t)(jDataPtr + i * lumpSize);
+            item.srcCol_offset = (int32_t)(iDataPtr + j * lumpSize);
+            item.numK = (int16_t)lumpSize;
+            item.padding = 0;
+            item.target_offset = (int32_t)(jiDataPtr + iSpanOff + i * targetLumpSize + j);
+            cholItems.push_back(item);
+          }
+        }
+      }
+    }
+
+    // Sort by target_offset for deterministic accumulation
+    stable_sort(cholItems.begin(), cholItems.end(),
+                [](const CudaCholWorkItem& a, const CudaCholWorkItem& b) {
+                  return a.target_offset < b.target_offset;
+                });
+
+    elim->numCholWorkItems = (int64_t)cholItems.size();
+    if (elim->numCholWorkItems > 0) {
+      // Upload as packed int32 array (4 int32 per CudaCholWorkItem = 16 bytes)
+      vector<int32_t> packed(4 * elim->numCholWorkItems);
+      for (int64_t i = 0; i < elim->numCholWorkItems; i++) {
+        packed[4 * i + 0] = cholItems[i].srcRow_offset;
+        packed[4 * i + 1] = cholItems[i].srcCol_offset;
+        // Pack numK and padding into one int32
+        int32_t numK_packed;
+        memcpy(&numK_packed, &cholItems[i].numK, sizeof(int32_t));
+        packed[4 * i + 2] = numK_packed;
+        packed[4 * i + 3] = cholItems[i].target_offset;
+      }
+      elim->devCholWorkItems.load(packed);
+
+      // Build segment table
+      vector<CudaSegmentInfo> segments;
+      segments.reserve(elim->numCholWorkItems);
+      int32_t segStart = 0;
+      for (int64_t i = 1; i <= elim->numCholWorkItems; i++) {
+        if (i == elim->numCholWorkItems ||
+            cholItems[i].target_offset != cholItems[segStart].target_offset) {
+          CudaSegmentInfo seg;
+          seg.target_offset = cholItems[segStart].target_offset;
+          seg.scratch_start = segStart;
+          seg.count = (int32_t)(i - segStart);
+          segments.push_back(seg);
+          segStart = (int32_t)i;
+        }
+      }
+
+      elim->numCholSegments = (int64_t)segments.size();
+      vector<int32_t> segPacked(3 * elim->numCholSegments);
+      for (int64_t i = 0; i < elim->numCholSegments; i++) {
+        segPacked[3 * i + 0] = segments[i].target_offset;
+        segPacked[3 * i + 1] = segments[i].scratch_start;
+        segPacked[3 * i + 2] = segments[i].count;
+      }
+      elim->devCholSegments.load(segPacked);
+    }
+
     return SymElimCtxPtr(elim);
   }
 
@@ -156,6 +308,89 @@ struct CudaSymbolicCtx : SymbolicCtx {
     elim->numColumns = lumpsEnd - lumpsBegin;
     elim->numBlockPairs = pairEnum[pairEnum.size() - 1];
     elim->makeBlockPairEnumStraight.load(pairEnum);
+
+    // Pre-compute LU work items for two-phase elimination
+    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+    int64_t upperDataBase = skel.dataSize();
+
+    vector<CudaLUWorkItem> workItems;
+    workItems.reserve(elim->numBlockPairs);
+
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t colStart = skel.chainColPtr[l] + 1;
+      int64_t n = skel.chainColPtr[l + 1] - colStart;
+      int64_t uRowStart = skel.upperChainRowPtr[l];
+
+      for (int64_t row_idx = 0; row_idx < n; row_idx++) {
+        for (int64_t col_idx = 0; col_idx < n; col_idx++) {
+          CudaLUWorkItem item;
+          item.L_offset = (int32_t)skel.chainData[colStart + row_idx];
+          item.U_offset = (int32_t)(upperDataBase + skel.upperChainData[uRowStart + col_idx]);
+
+          int64_t aSpan = skel.chainRowSpan[colStart + row_idx];
+          int64_t bSpan = skel.chainRowSpan[colStart + col_idx];
+
+          if (aSpan >= bSpan) {
+            int64_t bLump = skel.spanToLump[bSpan];
+            int64_t bSpanOff = skel.spanOffsetInLump[bSpan];
+            int64_t tStart = skel.chainColPtr[bLump];
+            int64_t tEnd = skel.chainColPtr[bLump + 1];
+            int64_t tPos = cpuBisect(skel.chainRowSpan.data() + tStart, tEnd - tStart, aSpan);
+            item.target_offset = (int32_t)(skel.chainData[tStart + tPos] + bSpanOff);
+          } else {
+            int64_t aLump = skel.spanToLump[aSpan];
+            int64_t uStart = skel.upperChainRowPtr[aLump];
+            int64_t uEnd = skel.upperChainRowPtr[aLump + 1];
+            int64_t tPos =
+                cpuBisect(skel.upperChainColSpan.data() + uStart, uEnd - uStart, bSpan);
+            item.target_offset = (int32_t)(upperDataBase + skel.upperChainData[uStart + tPos]);
+          }
+          workItems.push_back(item);
+        }
+      }
+    }
+
+    // Sort by target for deterministic accumulation
+    stable_sort(workItems.begin(), workItems.end(),
+                [](const CudaLUWorkItem& a, const CudaLUWorkItem& b) {
+                  return a.target_offset < b.target_offset;
+                });
+
+    elim->numLUWorkItems = (int64_t)workItems.size();
+    if (elim->numLUWorkItems > 0) {
+      vector<int32_t> packed(3 * elim->numLUWorkItems);
+      for (int64_t i = 0; i < elim->numLUWorkItems; i++) {
+        packed[3 * i + 0] = workItems[i].L_offset;
+        packed[3 * i + 1] = workItems[i].U_offset;
+        packed[3 * i + 2] = workItems[i].target_offset;
+      }
+      elim->devLUWorkItems.load(packed);
+
+      // Build segment table
+      vector<CudaSegmentInfo> segments;
+      segments.reserve(elim->numLUWorkItems);
+      int32_t segStart = 0;
+      for (int64_t i = 1; i <= elim->numLUWorkItems; i++) {
+        if (i == elim->numLUWorkItems ||
+            workItems[i].target_offset != workItems[segStart].target_offset) {
+          CudaSegmentInfo seg;
+          seg.target_offset = workItems[segStart].target_offset;
+          seg.scratch_start = segStart;
+          seg.count = (int32_t)(i - segStart);
+          segments.push_back(seg);
+          segStart = (int32_t)i;
+        }
+      }
+
+      elim->numLUSegments = (int64_t)segments.size();
+      vector<int32_t> segPacked(3 * elim->numLUSegments);
+      for (int64_t i = 0; i < elim->numLUSegments; i++) {
+        segPacked[3 * i + 0] = segments[i].target_offset;
+        segPacked[3 * i + 1] = segments[i].scratch_start;
+        segPacked[3 * i + 2] = segments[i].count;
+      }
+      elim->devLUSegments.load(segPacked);
+    }
 
     return SymElimCtxPtr(elim);
   }
@@ -827,6 +1062,60 @@ __global__ void lu_sparse_elim_kernel(
 }
 
 // ============================================================================
+// Two-phase deterministic sparse elimination kernels
+// ============================================================================
+
+// Phase 1 (LU): compute L*U products into scratch buffer (no atomics)
+template <typename T>
+__global__ void lu_sparse_elim_phase1_kernel(T* data, const int32_t* items,
+                                              T* scratch, int64_t numItems) {
+  int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= numItems) return;
+  // items: packed as 3 int32 per work item (L_offset, U_offset, target_offset)
+  int32_t L_offset = items[3 * tid + 0];
+  int32_t U_offset = items[3 * tid + 1];
+  scratch[tid] = data[L_offset] * data[U_offset];
+}
+
+// Phase 1 (Cholesky): compute dot products into scratch buffer (no atomics)
+template <typename T>
+__global__ void chol_sparse_elim_phase1_kernel(T* data, const int32_t* items,
+                                                T* scratch, int64_t numItems) {
+  int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= numItems) return;
+  // items: packed as 4 int32 per work item (srcRow_offset, srcCol_offset, numK|padding, target_offset)
+  int32_t srcRow_offset = items[4 * tid + 0];
+  int32_t srcCol_offset = items[4 * tid + 1];
+  int32_t numK_packed = items[4 * tid + 2];
+  int16_t numK;
+  memcpy(&numK, &numK_packed, sizeof(int16_t));
+
+  T val = T(0);
+  for (int16_t k = 0; k < numK; k++) {
+    val += data[srcRow_offset + k] * data[srcCol_offset + k];
+  }
+  scratch[tid] = val;
+}
+
+// Phase 2: deterministic segmented sum (shared by LU and Cholesky)
+template <typename T>
+__global__ void sparse_elim_phase2_kernel(T* data, T* scratch, const int32_t* segments,
+                                           int64_t numSegments) {
+  int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= numSegments) return;
+  // segments: packed as 3 int32 per segment (target_offset, scratch_start, count)
+  int32_t target_offset = segments[3 * tid + 0];
+  int32_t scratch_start = segments[3 * tid + 1];
+  int32_t count = segments[3 * tid + 2];
+
+  T sum = T(0);
+  for (int32_t i = 0; i < count; i++) {
+    sum += scratch[scratch_start + i];
+  }
+  data[target_offset] -= sum;
+}
+
+// ============================================================================
 // LU sparse elimination solve kernels
 // ============================================================================
 
@@ -1048,21 +1337,22 @@ struct CudaNumericCtx : NumericCtx<T> {
                              sym.devBoardColPtr.ptr, sym.devBoardChainColOrd.ptr,
                              sym.devChainRowsTillEnd.ptr, data, lumpsBegin, lumpsEnd, Plain{});
 
-#if 0
-    // double inner loop
-    sparse_elim_2loops_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr,
-        sym.devChainRowSpan.ptr, sym.devSpanStart.ptr, sym.devChainData.ptr,
-        sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, data,
-        lumpsBegin, lumpsEnd, Plain{});
-#else
-    int wgs2 = 32;
-    int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
-    sparse_elim_straight_kernel<T><<<numGroups2, wgs2, 0, sym.stream_>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
-        sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, data, lumpsBegin,
-        lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, Plain{});
-#endif
+    // Two-phase deterministic Cholesky sparse elimination
+    if (elim.numCholWorkItems > 0 && elim.numCholSegments > 0) {
+      elimScratchBuffer_.resizeToAtLeast(elim.numCholWorkItems);
+
+      // Phase 1: compute dot products into scratch (no atomics)
+      int wgs1 = 256;
+      int numGroups1 = (elim.numCholWorkItems + wgs1 - 1) / wgs1;
+      chol_sparse_elim_phase1_kernel<T><<<numGroups1, wgs1, 0, sym.stream_>>>(
+          data, elim.devCholWorkItems.ptr, elimScratchBuffer_.ptr, elim.numCholWorkItems);
+
+      // Phase 2: deterministic segmented sum
+      int wgs2 = 256;
+      int numGroups2 = (elim.numCholSegments + wgs2 - 1) / wgs2;
+      sparse_elim_phase2_kernel<T><<<numGroups2, wgs2, 0, sym.stream_>>>(
+          data, elimScratchBuffer_.ptr, elim.devCholSegments.ptr, elim.numCholSegments);
+    }
   }
 
   virtual T readValue(const T* data, int64_t offset) override {
@@ -1212,17 +1502,21 @@ struct CudaNumericCtx : NumericCtx<T> {
           staticPivotThreshold, devPerturbCount.ptr);
     }
 
-    // Step 2: LU Schur complement (L*U updates to both triangles)
-    if (elim.numBlockPairs > 0) {
-      int64_t upperDataBase = sym.skel.dataSize();
-      int wgs = 32;
-      int numGroups = (elim.numBlockPairs + wgs - 1) / wgs;
-      lu_sparse_elim_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
-          sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr,
-          sym.devSpanStart.ptr, sym.devChainData.ptr, sym.devSpanToLump.ptr,
-          sym.devSpanOffsetInLump.ptr, data, lumpsBegin, lumpsEnd,
-          elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, sym.devUpperChainRowPtr.ptr,
-          sym.devUpperChainColSpan.ptr, sym.devUpperChainData.ptr, upperDataBase);
+    // Step 2: Two-phase LU Schur complement (deterministic accumulation)
+    if (elim.numLUWorkItems > 0 && elim.numLUSegments > 0) {
+      elimScratchBuffer_.resizeToAtLeast(elim.numLUWorkItems);
+
+      // Phase 1: compute L*U products into scratch (no atomics)
+      int wgs1 = 256;
+      int numGroups1 = (elim.numLUWorkItems + wgs1 - 1) / wgs1;
+      lu_sparse_elim_phase1_kernel<T><<<numGroups1, wgs1, 0, sym.stream_>>>(
+          data, elim.devLUWorkItems.ptr, elimScratchBuffer_.ptr, elim.numLUWorkItems);
+
+      // Phase 2: deterministic segmented sum
+      int wgs2 = 256;
+      int numGroups2 = (elim.numLUSegments + wgs2 - 1) / wgs2;
+      sparse_elim_phase2_kernel<T><<<numGroups2, wgs2, 0, sym.stream_>>>(
+          data, elimScratchBuffer_.ptr, elim.devLUSegments.ptr, elim.numLUSegments);
     }
 
     // Read back perturb count
@@ -1311,6 +1605,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   DevMirror<T> devTempBuffer;
+  DevMirror<T> elimScratchBuffer_;  // Scratch for two-phase deterministic sparse elimination
   DevMirror<int> devPotrfSingIndex;
   DevMirror<int64_t> devSpanToChainOffset;
   vector<int64_t> spanToChainOffset;
@@ -1713,25 +2008,26 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
         sym.devBoardChainColOrd.ptr, sym.devChainRowsTillEnd.ptr, devPtrsA.ptr, lumpsBegin,
         lumpsEnd, Batched{.batchSize = (int)data->size(), .batchIndex = 0});
 
-#if 0
-    // double inner loop
-    sparse_elim_2loops_kernel<T*><<<numGroups, wgs, 0, sym.stream_>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr,
-        sym.devChainRowSpan.ptr, sym.devSpanStart.ptr, sym.devChainData.ptr,
-        sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, devPtrsA.ptr,
-        lumpsBegin, lumpsEnd,
-        Batched{.batchSize = (int)data->size(), .batchIndex = 0});
-#else
-    int wgs2 = 32 / batchWgs;
-    int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
-    dim3 gridDim2(numGroups2, batchGroups);
-    dim3 blockDim2(wgs2, batchWgs);
-    sparse_elim_straight_kernel<T*><<<gridDim2, blockDim2, 0, sym.stream_>>>(
-        sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
-        sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, devPtrsA.ptr,
-        lumpsBegin, lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs,
-        Batched{.batchSize = (int)data->size(), .batchIndex = 0});
-#endif
+    // Two-phase deterministic Cholesky sparse elimination (per batch item)
+    if (elim.numCholWorkItems > 0 && elim.numCholSegments > 0) {
+      elimScratchBuffer_.resizeToAtLeast(elim.numCholWorkItems);
+
+      for (size_t b = 0; b < data->size(); b++) {
+        T* batchData = (*data)[b];
+
+        // Phase 1: compute dot products into scratch (no atomics)
+        int wgs1 = 256;
+        int numGroups1 = (elim.numCholWorkItems + wgs1 - 1) / wgs1;
+        chol_sparse_elim_phase1_kernel<T><<<numGroups1, wgs1, 0, sym.stream_>>>(
+            batchData, elim.devCholWorkItems.ptr, elimScratchBuffer_.ptr, elim.numCholWorkItems);
+
+        // Phase 2: deterministic segmented sum
+        int wgs2 = 256;
+        int numGroups2 = (elim.numCholSegments + wgs2 - 1) / wgs2;
+        sparse_elim_phase2_kernel<T><<<numGroups2, wgs2, 0, sym.stream_>>>(
+            batchData, elimScratchBuffer_.ptr, elim.devCholSegments.ptr, elim.numCholSegments);
+      }
+    }
   }
 
   virtual void potrf(int64_t n, vector<T*>* data, int64_t offA) override;
@@ -1788,6 +2084,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
   DevPtrMirror<T> devPtrsA, devPtrsB;
   DevMirror<int64_t> devSpanToChainOffset;
   vector<int64_t> spanToChainOffset;
+  DevMirror<T> elimScratchBuffer_;  // Scratch for two-phase deterministic sparse elimination
 
   const CudaSymbolicCtx& sym;
 };
