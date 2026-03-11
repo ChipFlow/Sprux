@@ -1711,24 +1711,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Ensure devPivots is large enough for this lump's pivots
       devPivots.resizeToAtLeast(minMN);
 
-      // Profiling fallback: use sync dispatch for per-kernel GPU timestamps
-      if (metalProfilingEnabled()) {
-        id<MTLComputePipelineState> pipeline = getProfiledPipeline(
-                "lu_getrf_kernel_float");
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-              [encoder setBytes:&offA length:sizeof(int64_t) atIndex:1];
-              [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
-              [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer() offset:0 atIndex:4];
-            },
-            1);
-        memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
-        return 0;
-      }
-
       // MPS LU factorization on GPU for all sizes.
       // Flush pending saveGemm work items first — ensures all Schur
       // complement updates are dispatched before factorization of this lump.
@@ -1769,6 +1751,16 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       [mpsLU encodeToCommandBuffer:pendingCmdBuf_
           sourceMatrix:mpsA resultMatrix:mpsA
           pivotIndices:mpsPiv status:nil];
+
+      // When profiling, commit and wait to get per-getrf GPU timestamps
+      if (metalProfilingEnabled()) {
+        [pendingCmdBuf_ commit];
+        [pendingCmdBuf_ waitUntilCompleted];
+        double gpuTimeMs = ([pendingCmdBuf_ GPUEndTime] - [pendingCmdBuf_ GPUStartTime]) * 1000.0;
+        NSLog(@"[GPU] %-45s  size=%lldx%lld  gpu=%.3fms",
+              "MPS_LU_getrf", m, n, gpuTimeMs);
+        pendingCmdBuf_ = nil;
+      }
 
       // GPU-resident pivot path: for general (LU) matrices with pre-allocated
       // devAllPivots, encode a GPU-side uint32→int64 conversion kernel and
