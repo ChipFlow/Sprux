@@ -48,8 +48,9 @@ jobs:
 
     - name: Scipy cross-validation (CPU)
       run: |
-        pip install --quiet scipy numpy
-        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
 
   # Linux with OpenCL (CPU backend via pocl)
   linux-opencl:
@@ -135,9 +136,10 @@ jobs:
 
     - name: Scipy cross-validation (CPU + Metal)
       run: |
-        pip3 install --quiet scipy numpy
-        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
-        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary MetalSequenceSolveTest
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary MetalSequenceSolveTest
 
   # CUDA GPU tests on self-hosted NVIDIA runner
   cuda-gpu:
@@ -189,6 +191,8 @@ jobs:
 
     - name: Scipy cross-validation (CPU + CUDA)
       run: |
-        pip install --quiet scipy numpy
-        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
-        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary CudaSequenceSolveTest
+        apt-get install -y -qq python3-venv
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary CudaSequenceSolveTest

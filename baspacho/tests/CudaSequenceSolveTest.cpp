@@ -75,17 +75,6 @@ static SparseStructure csrToSparseStructure(const CsrMatrix& A) {
   return columnsToCscStruct(colBlocks).transpose();
 }
 
-static double computeResidual(const CsrMatrix& A, const Eigen::VectorXd& x,
-                              const Eigen::VectorXd& b) {
-  Eigen::VectorXd Ax = Eigen::VectorXd::Zero(A.nRows);
-  for (int64_t i = 0; i < A.nRows; i++) {
-    for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
-      Ax(i) += A.values[k] * x(A.colInd[k]);
-    }
-  }
-  return (Ax - b).norm() / b.norm();
-}
-
 // ============================================================================
 // Ring oscillator on CUDA (double precision, tiny matrices — GPU smoke test)
 // ============================================================================
