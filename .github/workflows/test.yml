@@ -46,6 +46,11 @@ jobs:
     - name: Run Tests
       run: ctest --test-dir build --output-on-failure -j"$(nproc)"
 
+    - name: Scipy cross-validation (CPU)
+      run: |
+        pip install --quiet scipy numpy
+        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+
   # Linux with OpenCL (CPU backend via pocl)
   linux-opencl:
     runs-on: ubuntu-latest
@@ -128,6 +133,12 @@ jobs:
     - name: Run all tests (CPU + Metal GPU)
       run: ctest --test-dir build --output-on-failure -j"$(sysctl -n hw.ncpu)"
 
+    - name: Scipy cross-validation (CPU + Metal)
+      run: |
+        pip3 install --quiet scipy numpy
+        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary MetalSequenceSolveTest
+
   # CUDA GPU tests on self-hosted NVIDIA runner
   cuda-gpu:
     runs-on: [nvidia-runner-1]
@@ -149,7 +160,7 @@ jobs:
     - name: Install dependencies
       run: |
         apt-get update
-        apt-get install -y cmake build-essential libopenblas-dev
+        apt-get install -y cmake build-essential libopenblas-dev python3-pip
 
     - name: System info
       run: |
@@ -175,3 +186,9 @@ jobs:
 
     - name: Run all tests
       run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+    - name: Scipy cross-validation (CPU + CUDA)
+      run: |
+        pip install --quiet scipy numpy
+        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        python3 tests/scipy_ring_comparison.py --build-dir build --test-binary CudaSequenceSolveTest
