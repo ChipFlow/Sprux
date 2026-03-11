@@ -77,6 +77,22 @@ struct LUWorkItem {
   int32_t target_offset;  // data offset for target
 };
 
+// Segment descriptor for two-phase deterministic sparse elimination
+struct SegmentInfo {
+  int32_t target_offset;  // data offset for target element
+  int32_t scratch_start;  // start index in scratch buffer
+  int32_t count;          // number of products to sum
+};
+
+// Cholesky element-level work item for two-phase elimination
+struct CholWorkItem {
+  int32_t srcRow_offset;   // start offset of row in source B matrix (in data[])
+  int32_t srcCol_offset;   // start offset of row in source C matrix (in data[])
+  int16_t numK;            // dot product length (= lumpSize)
+  int16_t padding;
+  int32_t target_offset;   // target element in data[]
+};
+
 // Symbolic elimination context for Metal
 struct MetalSymElimCtx : SymElimCtx {
   MetalSymElimCtx() {}
@@ -86,9 +102,19 @@ struct MetalSymElimCtx : SymElimCtx {
   int64_t numBlockPairs;
   MetalMirror<int64_t> makeBlockPairEnumStraight;
 
-  // Pre-computed work list for LU sparse elimination (Phase 1)
+  // Pre-computed work list for LU sparse elimination
   int64_t numWorkItems = 0;
   MetalMirror<int32_t> devWorkItems;  // packed: 3 int32 per LUWorkItem
+
+  // Two-phase deterministic elimination: segments (sorted by target)
+  int64_t numSegments = 0;
+  MetalMirror<int32_t> devSegments;  // packed: 3 int32 per SegmentInfo
+
+  // Two-phase Cholesky element-level work items
+  int64_t numCholWorkItems = 0;
+  MetalMirror<int32_t> devCholWorkItems;  // packed: 4 int32 per CholWorkItem (16 bytes)
+  int64_t numCholSegments = 0;
+  MetalMirror<int32_t> devCholSegments;  // packed: 3 int32 per SegmentInfo
 };
 
 // Forward declarations
@@ -232,13 +258,18 @@ struct MetalSymbolicCtx : SymbolicCtx {
       }
     }
 
-    // Note: sorting by target_offset was benchmarked but hurts performance
-    // by disrupting L/U read locality (consecutive threads from the same
-    // lump share L/U cache lines in natural order).
+    // Sort work items by target_offset for deterministic accumulation.
+    // Phase 1 reads L/U values (indexed by work item order) — sorting by
+    // target disrupts L/U locality but Phase 1 is embarrassingly parallel.
+    // Phase 2 does the accumulation in fixed order per target.
+    std::stable_sort(workItems.begin(), workItems.end(),
+                     [](const LUWorkItem& a, const LUWorkItem& b) {
+                       return a.target_offset < b.target_offset;
+                     });
 
-    // Upload as packed int32 array (3 int32 per work item)
     elim->numWorkItems = (int64_t)workItems.size();
     if (elim->numWorkItems > 0) {
+      // Upload sorted work items as packed int32 array (3 int32 per item)
       vector<int32_t> packed(3 * elim->numWorkItems);
       for (int64_t i = 0; i < elim->numWorkItems; i++) {
         packed[3 * i + 0] = workItems[i].L_offset;
@@ -246,6 +277,31 @@ struct MetalSymbolicCtx : SymbolicCtx {
         packed[3 * i + 2] = workItems[i].target_offset;
       }
       elim->devWorkItems.load(packed);
+
+      // Build segment table: group consecutive items with same target
+      vector<SegmentInfo> segments;
+      segments.reserve(elim->numWorkItems);  // upper bound
+      int32_t segStart = 0;
+      for (int64_t i = 1; i <= elim->numWorkItems; i++) {
+        if (i == elim->numWorkItems ||
+            workItems[i].target_offset != workItems[segStart].target_offset) {
+          SegmentInfo seg;
+          seg.target_offset = workItems[segStart].target_offset;
+          seg.scratch_start = segStart;
+          seg.count = (int32_t)(i - segStart);
+          segments.push_back(seg);
+          segStart = (int32_t)i;
+        }
+      }
+
+      elim->numSegments = (int64_t)segments.size();
+      vector<int32_t> segPacked(3 * elim->numSegments);
+      for (int64_t i = 0; i < elim->numSegments; i++) {
+        segPacked[3 * i + 0] = segments[i].target_offset;
+        segPacked[3 * i + 1] = segments[i].scratch_start;
+        segPacked[3 * i + 2] = segments[i].count;
+      }
+      elim->devSegments.load(segPacked);
     }
 
     return SymElimCtxPtr(elim);
@@ -761,23 +817,47 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             (NSUInteger)numLumps);
       }
 
-      // Step 2: LU Schur complement (L*U updates to both triangles)
-      if (elim.numWorkItems > 0) {
-        // Pre-computed work list path: no binary searches, 3 buffer bindings
-        id<MTLComputePipelineState> pipeline =
+      // Step 2: LU Schur complement — two-phase deterministic elimination
+      if (elim.numWorkItems > 0 && elim.numSegments > 0) {
+        elimScratchBuffer.resizeToAtLeast(elim.numWorkItems);
+
+        // Phase 1: compute products into scratch
+        id<MTLComputePipelineState> p1Pipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-                "lu_sparse_elim_precomputed_float");
+                "lu_sparse_elim_phase1_float");
 
         dispatchKernel(
-            sym.commandQueue, pipeline,
+            sym.commandQueue, p1Pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
               [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
                           offset:0
                          atIndex:1];
-              [encoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:3];
             },
             (NSUInteger)elim.numWorkItems);
+
+        // Phase 2: deterministic segmented sum
+        id<MTLComputePipelineState> p2Pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparse_elim_phase2_float");
+
+        dispatchKernel(
+            sym.commandQueue, p2Pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devSegments.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBytes:&elim.numSegments length:sizeof(int64_t) atIndex:3];
+            },
+            (NSUInteger)elim.numSegments);
       }
 
       // Read back perturb count
@@ -786,8 +866,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Batch all LU sparse elimination levels into a single command buffer
-  // on the ASYNC queue. This allows sparse elim to run concurrently with
-  // solve operations on the primary queue when pipelining across matrices.
+  // on the ASYNC queue. Uses two-phase deterministic accumulation:
+  //   Phase 1: compute L*U products into scratch buffer (no atomics)
+  //   Phase 2: segmented sum per target in fixed order (deterministic)
   // Signals the shared event so beginDenseOps/waitForGpu can synchronize.
   void doAllEliminationsLU(const std::vector<SymElimCtxPtr>& elimCtxs,
                            const std::vector<int64_t>& ranges, float* data,
@@ -809,12 +890,24 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       id<MTLComputePipelineState> factorPipeline =
           getProfiledPipeline("lu_factor_lumps_kernel_float");
-      id<MTLComputePipelineState> elimPipeline =
-          getProfiledPipeline("lu_sparse_elim_precomputed_float");
+      id<MTLComputePipelineState> phase1Pipeline =
+          getProfiledPipeline("lu_sparse_elim_phase1_float");
+      id<MTLComputePipelineState> phase2Pipeline =
+          getProfiledPipeline("sparse_elim_phase2_float");
+
+      // Compute max scratch buffer size across all levels
+      int64_t maxScratchSize = 0;
+      for (size_t l = 0; l + 1 < ranges.size(); l++) {
+        if (!elimCtxs[l]) continue;
+        const MetalSymElimCtx& elim =
+            *dynamic_cast<const MetalSymElimCtx*>(elimCtxs[l].get());
+        maxScratchSize = std::max(maxScratchSize, elim.numWorkItems);
+      }
+      if (maxScratchSize > 0) {
+        elimScratchBuffer.resizeToAtLeast(maxScratchSize);
+      }
 
       // Create a dedicated command buffer on the ASYNC queue.
-      // This is separate from pendingCmdBuf_ (primary queue) so that
-      // sparse elim can run concurrently with solve on the primary queue.
       id<MTLCommandBuffer> asyncCmdBuf = [sym.asyncCommandQueue commandBuffer];
       id<MTLComputeCommandEncoder> asyncEncoder = [asyncCmdBuf computeCommandEncoder];
       int dispatchCount = 0;
@@ -862,20 +955,40 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                      threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
         dispatchCount++;
 
-        // LU Schur complement
-        if (elim.numWorkItems > 0) {
+        // LU Schur complement: two-phase deterministic elimination
+        if (elim.numWorkItems > 0 && elim.numSegments > 0) {
+          // Phase 1: compute products into scratch buffer
           [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-          [asyncEncoder setComputePipelineState:elimPipeline];
+          [asyncEncoder setComputePipelineState:phase1Pipeline];
           [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
           [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
                            offset:0 atIndex:1];
-          [asyncEncoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                           offset:0 atIndex:2];
+          [asyncEncoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:3];
 
-          NSUInteger etgs = MIN(elimPipeline.maxTotalThreadsPerThreadgroup, 256);
+          NSUInteger etgs = MIN(phase1Pipeline.maxTotalThreadsPerThreadgroup, 256);
           etgs = MIN(etgs, (NSUInteger)elim.numWorkItems);
           [asyncEncoder dispatchThreadgroups:
               MTLSizeMake(((NSUInteger)elim.numWorkItems + etgs - 1) / etgs, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(etgs, 1, 1)];
+          dispatchCount++;
+
+          // Phase 2: deterministic segmented sum
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+          [asyncEncoder setComputePipelineState:phase2Pipeline];
+          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                           offset:0 atIndex:1];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devSegments.buffer()
+                           offset:0 atIndex:2];
+          [asyncEncoder setBytes:&elim.numSegments length:sizeof(int64_t) atIndex:3];
+
+          NSUInteger stgs = MIN(phase2Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          stgs = MIN(stgs, (NSUInteger)elim.numSegments);
+          [asyncEncoder dispatchThreadgroups:
+              MTLSizeMake(((NSUInteger)elim.numSegments + stgs - 1) / stgs, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(stgs, 1, 1)];
           dispatchCount++;
         }
       }
@@ -883,7 +996,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       [asyncEncoder endEncoding];
 
       // Signal shared event on the async queue so waitForGpu() can detect completion.
-      // This works across queues — MTLSharedEvent is device-wide, not queue-specific.
       if (dispatchCount > 0) {
         if (!sharedEvent_) {
           sharedEvent_ = [sym.device newSharedEvent];
@@ -1853,6 +1965,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // Deferred sparse elimination perturb count (read after GPU completion)
   id<MTLBuffer> deferredElimPerturbBuf_ = nil;
   int64_t deferredElimPerturbCount_ = 0;
+
+  // Scratch buffer for two-phase deterministic sparse elimination
+  MetalMirror<float> elimScratchBuffer;
 
 };
 

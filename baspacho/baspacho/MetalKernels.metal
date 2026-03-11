@@ -529,6 +529,75 @@ kernel void lu_sparse_elim_precomputed_float(
 }
 
 // ============================================================================
+// Two-phase deterministic sparse elimination
+// Phase 1: compute products into scratch buffer (no atomics)
+// Phase 2: accumulate per-target in fixed order (deterministic)
+// ============================================================================
+
+// Segment descriptor: groups work items that write to the same target
+struct SegmentInfo {
+  int32_t target_offset;  // data offset for target element
+  int32_t scratch_start;  // start index in scratch buffer
+  int32_t count;          // number of products to sum
+};
+
+// Phase 1 (LU): compute L*U products into scratch (no atomics, fully parallel)
+kernel void lu_sparse_elim_phase1_float(
+    device float* data [[buffer(0)]],
+    constant LUSparseWorkItem* items [[buffer(1)]],
+    device float* scratch [[buffer(2)]],
+    constant int64_t& numItems [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= numItems) return;
+    LUSparseWorkItem w = items[tid];
+    scratch[tid] = data[w.L_offset] * data[w.U_offset];
+}
+
+// Phase 2: deterministic segmented sum — one thread per target element
+kernel void sparse_elim_phase2_float(
+    device float* data [[buffer(0)]],
+    device float* scratch [[buffer(1)]],
+    constant SegmentInfo* segments [[buffer(2)]],
+    constant int64_t& numSegments [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= numSegments) return;
+    SegmentInfo seg = segments[tid];
+    float sum = 0.0f;
+    for (int32_t i = 0; i < seg.count; i++) {
+        sum += scratch[seg.scratch_start + i];
+    }
+    data[seg.target_offset] -= sum;
+}
+
+// Phase 1 (Cholesky): compute dot products into scratch (no atomics)
+// Each work item computes a dot product between two source rows
+struct CholSparseWorkItem {
+  int32_t srcRow_offset;   // start offset of row in source B matrix (in data[])
+  int32_t srcCol_offset;   // start offset of row in source C matrix (in data[])
+  int16_t numK;            // dot product length (= lumpSize)
+  int16_t padding;
+  int32_t target_offset;   // target element in data[]
+};  // 16 bytes per item
+
+kernel void chol_sparse_elim_phase1_float(
+    device float* data [[buffer(0)]],
+    constant CholSparseWorkItem* items [[buffer(1)]],
+    device float* scratch [[buffer(2)]],
+    constant int64_t& numItems [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int64_t(tid) >= numItems) return;
+    CholSparseWorkItem w = items[tid];
+    float val = 0.0f;
+    for (int16_t k = 0; k < w.numK; k++) {
+        val += data[w.srcRow_offset + k] * data[w.srcCol_offset + k];
+    }
+    scratch[tid] = val;
+}
+
+// ============================================================================
 // Kernel 4: assemble_kernel (Assemble rectangular sections)
 // ============================================================================
 kernel void assemble_kernel_float(
