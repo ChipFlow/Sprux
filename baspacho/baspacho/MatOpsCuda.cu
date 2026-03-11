@@ -91,14 +91,18 @@ struct CudaSymbolicCtx : SymbolicCtx {
     }
   }
 
-  // Set the CUDA stream for all cuBLAS and cuSOLVER operations.
-  // Must be called before factorLU/solveLU when using a non-default stream
-  // (e.g., JAX's XLA stream). This is required for CUDA graph capture.
+  // Set the CUDA stream for ALL CUDA operations (kernel launches, memory copies,
+  // cuBLAS, cuSOLVER). Must be called before factorLU/solveLU when using a
+  // non-default stream (e.g., JAX's XLA stream). Required for CUDA graph capture:
+  // the legacy stream (stream 0) is INVALID during graph capture.
   virtual void setStream(void* stream) override {
     cudaStream_t s = static_cast<cudaStream_t>(stream);
+    stream_ = s;
     cublasCHECK(cublasSetStream(cublasH, s));
     cusolverCHECK(cusolverDnSetStream(cusolverDnH, s));
   }
+
+  cudaStream_t stream_ = 0;  // Current CUDA stream (0 = default/legacy)
 
   virtual PermutedCoalescedAccessor deviceAccessor() override {
     PermutedCoalescedAccessor retv;
@@ -1021,7 +1025,7 @@ struct CudaNumericCtx : NumericCtx<T> {
     int wgs = 32;
     int numGroups = (spanEnd - spanBegin + wgs - 1) / wgs;
     factor_spans_kernel<T>
-        <<<numGroups, wgs>>>(sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr,
+        <<<numGroups, wgs, 0, sym.stream_>>>(sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr,
                              sym.devLumpToSpan.ptr, sym.devSpanStart.ptr,
 
                              sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
@@ -1040,13 +1044,13 @@ struct CudaNumericCtx : NumericCtx<T> {
     int wgs = 32;
     int numGroups = (lumpsEnd - lumpsBegin + wgs - 1) / wgs;
     factor_lumps_kernel<T>
-        <<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
+        <<<numGroups, wgs, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
                              sym.devBoardColPtr.ptr, sym.devBoardChainColOrd.ptr,
                              sym.devChainRowsTillEnd.ptr, data, lumpsBegin, lumpsEnd, Plain{});
 
 #if 0
     // double inner loop
-    sparse_elim_2loops_kernel<T><<<numGroups, wgs>>>(
+    sparse_elim_2loops_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devChainColPtr.ptr, sym.devLumpStart.ptr,
         sym.devChainRowSpan.ptr, sym.devSpanStart.ptr, sym.devChainData.ptr,
         sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, data,
@@ -1054,7 +1058,7 @@ struct CudaNumericCtx : NumericCtx<T> {
 #else
     int wgs2 = 32;
     int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
-    sparse_elim_straight_kernel<T><<<numGroups2, wgs2>>>(
+    sparse_elim_straight_kernel<T><<<numGroups2, wgs2, 0, sym.stream_>>>(
         sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
         sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, data, lumpsBegin,
         lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs, Plain{});
@@ -1085,12 +1089,12 @@ struct CudaNumericCtx : NumericCtx<T> {
     if (numLumps <= 0) return 0.0;
 
     devMaxAbsDiagResult_.resizeToAtLeast(1);
-    cuCHECK(cudaMemsetAsync(devMaxAbsDiagResult_.ptr, 0, sizeof(double), 0));
+    cuCHECK(cudaMemsetAsync(devMaxAbsDiagResult_.ptr, 0, sizeof(double), sym.stream_));
 
     int wgs = 256;
     int numBlocks = (numLumps + wgs - 1) / wgs;
     size_t shmem = wgs * sizeof(double);
-    maxAbsDiagKernel<T><<<numBlocks, wgs, shmem>>>(
+    maxAbsDiagKernel<T><<<numBlocks, wgs, shmem, sym.stream_>>>(
         data, sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
         sym.devChainData.ptr, startLump, numLumps, devMaxAbsDiagResult_.ptr);
 
@@ -1151,7 +1155,7 @@ struct CudaNumericCtx : NumericCtx<T> {
         cuCHECK(cudaMemcpyAsync(devDstPivots + dstOff,
                                  devDensePivots.ptr + dc.gpuSrcOffset,
                                  dc.count * sizeof(int64_t),
-                                 cudaMemcpyDeviceToDevice, 0));
+                                 cudaMemcpyDeviceToDevice, sym.stream_));
       }
       deferredPivotCopies_.clear();
       densePivotWriteOffset_ = 0;
@@ -1174,12 +1178,12 @@ struct CudaNumericCtx : NumericCtx<T> {
     // Initialize persistent counter on first call (once per factorization)
     if (!perturbCountPending_) {
       devPerturbCount.resizeToAtLeast(1);
-      cuCHECK(cudaMemsetAsync(devPerturbCount.ptr, 0, sizeof(int64_t), 0));
+      cuCHECK(cudaMemsetAsync(devPerturbCount.ptr, 0, sizeof(int64_t), sym.stream_));
       perturbCountPending_ = true;
     }
     int wgs = 256;
     int numGroups = (n + wgs - 1) / wgs;
-    perturbSmallDiagonalsKernel<<<numGroups, wgs>>>(n, data, offset, stride, threshold,
+    perturbSmallDiagonalsKernel<<<numGroups, wgs, 0, sym.stream_>>>(n, data, offset, stride, threshold,
                                                     devPerturbCount.ptr);
     return 0;  // Actual count read in deferredPerturbCount() after flush
   }
@@ -1202,7 +1206,7 @@ struct CudaNumericCtx : NumericCtx<T> {
     {
       int wgs = 32;
       int numGroups = (numLumps + wgs - 1) / wgs;
-      lu_factor_lumps_kernel<T><<<numGroups, wgs>>>(
+      lu_factor_lumps_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
           sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr, sym.devBoardColPtr.ptr,
           sym.devBoardChainColOrd.ptr, sym.devChainRowsTillEnd.ptr, data, lumpsBegin, lumpsEnd,
           staticPivotThreshold, devPerturbCount.ptr);
@@ -1213,7 +1217,7 @@ struct CudaNumericCtx : NumericCtx<T> {
       int64_t upperDataBase = sym.skel.dataSize();
       int wgs = 32;
       int numGroups = (elim.numBlockPairs + wgs - 1) / wgs;
-      lu_sparse_elim_kernel<T><<<numGroups, wgs>>>(
+      lu_sparse_elim_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
           sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr,
           sym.devSpanStart.ptr, sym.devChainData.ptr, sym.devSpanToLump.ptr,
           sym.devSpanOffsetInLump.ptr, data, lumpsBegin, lumpsEnd,
@@ -1242,7 +1246,7 @@ struct CudaNumericCtx : NumericCtx<T> {
     ensurePinnedBuf(bytes);
     memcpy(pinnedBuf_, spanToChainOffset.data(), bytes);
     cuCHECK(cudaMemcpyAsync(devSpanToChainOffset.ptr, pinnedBuf_, bytes,
-                             cudaMemcpyHostToDevice, 0));
+                             cudaMemcpyHostToDevice, sym.stream_));
   }
 
   virtual void assemble(T* data, int64_t rectRowBegin,
@@ -1257,7 +1261,7 @@ struct CudaNumericCtx : NumericCtx<T> {
 
     int wgs = 32;
     int numGroups = (numBlockRows * numBlockCols + wgs - 1) / wgs;
-    assemble_kernel<T><<<numGroups, wgs>>>(
+    assemble_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
         numBlockRows, numBlockCols, rectRowBegin, srcRectWidth, dstStride, pChainRowsTillEnd,
         pToSpan, pSpanToChainOffset, pSpanOffsetInLump, devTempBuffer.ptr, data, Plain{});
   }
@@ -1270,11 +1274,11 @@ struct CudaNumericCtx : NumericCtx<T> {
     ensurePinnedBuf(bytes);
     memcpy(pinnedBuf_, gemmBatch_.data(), bytes);
     cuCHECK(cudaMemcpyAsync(devGemmWork_.ptr, pinnedBuf_, bytes,
-                             cudaMemcpyHostToDevice, 0));
+                             cudaMemcpyHostToDevice, sym.stream_));
     int wgs = 256;  // threads per block — one thread per work item
     int numBlocks = ((int)gemmBatch_.size() + wgs - 1) / wgs;
     batchedSmallGemmKernel<T>
-        <<<numBlocks, wgs>>>(gemmDataPtr_, (GemmWorkItem*)devGemmWork_.ptr,
+        <<<numBlocks, wgs, 0, sym.stream_>>>(gemmDataPtr_, (GemmWorkItem*)devGemmWork_.ptr,
                              (int64_t)gemmBatch_.size());
     gemmBatch_.clear();
     gemmDataPtr_ = nullptr;
@@ -1299,7 +1303,7 @@ struct CudaNumericCtx : NumericCtx<T> {
     if (devDensePivots.ptr && densePivotWriteOffset_ > 0) {
       cuCHECK(cudaMemcpyAsync(newPtr, devDensePivots.ptr,
                                 densePivotWriteOffset_ * sizeof(int64_t),
-                                cudaMemcpyDeviceToDevice, 0));
+                                cudaMemcpyDeviceToDevice, sym.stream_));
     }
     devDensePivots.clear();
     devDensePivots.ptr = newPtr;
@@ -1481,7 +1485,7 @@ int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t of
   threads = t;
   size_t shmemBytes = threads * (sizeof(double) + sizeof(int64_t));
 
-  luFactorRowMajorKernel<double><<<1, threads, shmemBytes>>>(
+  luFactorRowMajorKernel<double><<<1, threads, shmemBytes, sym.stream_>>>(
       data + offA, m, n, n, devDensePivots.ptr + pivotOff);
 
   lastGetrfPivotOff_ = pivotOff;
@@ -1513,7 +1517,7 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
   threads = t;
   size_t shmemBytes = threads * (sizeof(float) + sizeof(int64_t));
 
-  luFactorRowMajorKernel<float><<<1, threads, shmemBytes>>>(
+  luFactorRowMajorKernel<float><<<1, threads, shmemBytes, sym.stream_>>>(
       data + offA, m, n, n, devDensePivots.ptr + pivotOff);
 
   lastGetrfPivotOff_ = pivotOff;
@@ -1630,7 +1634,7 @@ void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* da
 
   // Single block launch (sequential pivot dependency requires __syncthreads)
   int wgs = std::min((int64_t)256, numCols);
-  applyRowPermKernel<<<1, wgs>>>(devPivPtr, n, data, offData, ld, numCols);
+  applyRowPermKernel<<<1, wgs, 0, sym.stream_>>>(devPivPtr, n, data, offData, ld, numCols);
 }
 
 template <>
@@ -1650,7 +1654,7 @@ void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data
   }
 
   int wgs = std::min((int64_t)256, numCols);
-  applyRowPermKernel<<<1, wgs>>>(devPivPtr, n, data, offData, ld, numCols);
+  applyRowPermKernel<<<1, wgs, 0, sym.stream_>>>(devPivPtr, n, data, offData, ld, numCols);
 }
 
 template <typename T>
@@ -1704,14 +1708,14 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     dim3 gridDim(numGroups, batchGroups);
     dim3 blockDim(wgs, batchWgs);
 
-    factor_lumps_kernel<T*><<<gridDim, blockDim>>>(
+    factor_lumps_kernel<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr, sym.devBoardColPtr.ptr,
         sym.devBoardChainColOrd.ptr, sym.devChainRowsTillEnd.ptr, devPtrsA.ptr, lumpsBegin,
         lumpsEnd, Batched{.batchSize = (int)data->size(), .batchIndex = 0});
 
 #if 0
     // double inner loop
-    sparse_elim_2loops_kernel<T*><<<numGroups, wgs>>>(
+    sparse_elim_2loops_kernel<T*><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devChainColPtr.ptr, sym.devLumpStart.ptr,
         sym.devChainRowSpan.ptr, sym.devSpanStart.ptr, sym.devChainData.ptr,
         sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, devPtrsA.ptr,
@@ -1722,7 +1726,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     int numGroups2 = (elim.numBlockPairs + wgs2 - 1) / wgs2;
     dim3 gridDim2(numGroups2, batchGroups);
     dim3 blockDim2(wgs2, batchWgs);
-    sparse_elim_straight_kernel<T*><<<gridDim2, blockDim2>>>(
+    sparse_elim_straight_kernel<T*><<<gridDim2, blockDim2, 0, sym.stream_>>>(
         sym.devChainColPtr.ptr, sym.devLumpStart.ptr, sym.devChainRowSpan.ptr, sym.devSpanStart.ptr,
         sym.devChainData.ptr, sym.devSpanToLump.ptr, sym.devSpanOffsetInLump.ptr, devPtrsA.ptr,
         lumpsBegin, lumpsEnd, elim.makeBlockPairEnumStraight.ptr, elim.numBlockPairs,
@@ -1771,7 +1775,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
     int numGroups = (numBlockRows * numBlockCols + wgs - 1) / wgs;
     dim3 gridDim(numGroups, batchGroups);
     dim3 blockDim(wgs, batchWgs);
-    assemble_kernel<T*><<<gridDim, blockDim>>>(
+    assemble_kernel<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         numBlockRows, numBlockCols, rectRowBegin, srcRectWidth, dstStride, pChainRowsTillEnd,
         pToSpan, pSpanToChainOffset, pSpanOffsetInLump, devTempBufsDev.ptr, devPtrsA.ptr,
         Batched{.batchSize = (int)data->size(), .batchIndex = 0});
@@ -2097,12 +2101,12 @@ struct CudaSolveCtx : SolveCtx<T> {
 
     int wgs = 32;
     int numGroups = (lumpsEnd - lumpsBegin + wgs - 1) / wgs;
-    sparseElim_diagSolveL<T><<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
+    sparseElim_diagSolveL<T><<<numGroups, wgs, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
                                                  sym.devChainData.ptr, data, C, ldc, nRHS,
                                                  lumpsBegin, lumpsEnd, Plain{});
 
     // TODO: consider "straightening" inner loop
-    sparseElim_subDiagMult<T><<<numGroups, wgs>>>(
+    sparseElim_subDiagMult<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
         sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin, lumpsEnd, Plain{});
   }
@@ -2115,11 +2119,11 @@ struct CudaSolveCtx : SolveCtx<T> {
     int numGroups = (lumpsEnd - lumpsBegin + wgs - 1) / wgs;
 
     // TODO: consider "straightening" inner loop
-    sparseElim_subDiagMultT<T><<<numGroups, wgs>>>(
+    sparseElim_subDiagMultT<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
         sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin, lumpsEnd, Plain{});
 
-    sparseElim_diagSolveLt<T><<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
+    sparseElim_diagSolveLt<T><<<numGroups, wgs, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
                                                   sym.devChainData.ptr, data, C, ldc, nRHS,
                                                   lumpsBegin, lumpsEnd, Plain{});
   }
@@ -2136,7 +2140,7 @@ struct CudaSolveCtx : SolveCtx<T> {
 
     // No diagonal solve for unit L (diagonal is implicitly 1)
     // Only dispatch below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
-    sparseElim_subDiagMult<T><<<numGroups, wgs>>>(
+    sparseElim_subDiagMult<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
         sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin, lumpsEnd, Plain{});
   }
@@ -2153,13 +2157,13 @@ struct CudaSolveCtx : SolveCtx<T> {
     int64_t upperDataBase = sym.skel.dataSize();
 
     // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
-    sparseElim_upperGather<T><<<numGroups, wgs>>>(
+    sparseElim_upperGather<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devUpperChainRowPtr.ptr,
         sym.devUpperChainColSpan.ptr, sym.devUpperChainData.ptr, data, C, ldc, nRHS, lumpsBegin,
         lumpsEnd, upperDataBase, Plain{});
 
     // Then: diagonal U solve: v[lump] /= U_diagonal (row-major)
-    sparseElim_diagDivU<T><<<numGroups, wgs>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
+    sparseElim_diagDivU<T><<<numGroups, wgs, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr,
                                                sym.devChainData.ptr, data, C, ldc, nRHS, lumpsBegin,
                                                lumpsEnd, Plain{});
   }
@@ -2177,7 +2181,7 @@ struct CudaSolveCtx : SolveCtx<T> {
     auto timer = sym.solveAssVStat.instance<CudaSyncOps>();
     int wgs = 32;
     int numGroups = (numColItems + wgs - 1) / wgs;
-    assembleVec_kernel<T><<<numGroups, wgs>>>(
+    assembleVec_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devChainRowsTillEnd.ptr + chainColPtr, sym.devChainRowSpan.ptr + chainColPtr,
         sym.devSpanStart.ptr, devSolveBuf.ptr, numColItems, C, ldc, nRHS, Plain{});
   }
@@ -2193,7 +2197,7 @@ struct CudaSolveCtx : SolveCtx<T> {
     auto timer = sym.solveAssVTStat.instance<CudaSyncOps>();
     int wgs = 32;
     int numGroups = (numColItems + wgs - 1) / wgs;
-    assembleVecT_kernel<T><<<numGroups, wgs>>>(
+    assembleVecT_kernel<T><<<numGroups, wgs, 0, sym.stream_>>>(
         sym.devChainRowsTillEnd.ptr + chainColPtr, sym.devChainRowSpan.ptr + chainColPtr,
         sym.devSpanStart.ptr, C, ldc, nRHS, devSolveBuf.ptr, numColItems, Plain{});
   }
@@ -2391,16 +2395,16 @@ void CudaSolveCtx<double>::applyRowPermVec(const int64_t* pivots, int64_t n, dou
   if (externalDevPivots_ && pivotsUploaded_) {
     // Use external device-resident pivots (no copy at all)
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
   } else if (pivotsUploaded_ && pivotsBase_) {
     // Use pre-uploaded device buffer with computed offset (no per-lump H→D)
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
     // Fallback: per-lump H→D copy
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
   }
 }
 
@@ -2412,14 +2416,14 @@ void CudaSolveCtx<float>::applyRowPermVec(const int64_t* pivots, int64_t n, floa
 
   if (externalDevPivots_ && pivotsUploaded_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
   } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-    applyRowPermVecKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+    applyRowPermVecKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
   }
 }
 
@@ -2432,14 +2436,14 @@ void CudaSolveCtx<double>::applyRowPermVecInv(const int64_t* pivots, int64_t n, 
 
   if (externalDevPivots_ && pivotsUploaded_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecInvKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
   } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
   }
 }
 
@@ -2451,14 +2455,14 @@ void CudaSolveCtx<float>::applyRowPermVecInv(const int64_t* pivots, int64_t n, f
 
   if (externalDevPivots_ && pivotsUploaded_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecInvKernel<<<1, wgs>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(externalDevPivots_ + offset, n, vec, ldVec, nRHS);
   } else if (pivotsUploaded_ && pivotsBase_) {
     int64_t offset = pivots - pivotsBase_;
-    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr + offset, n, vec, ldVec, nRHS);
   } else {
     devPivotBuf.resizeToAtLeast(n);
     cuCHECK(cudaMemcpy(devPivotBuf.ptr, pivots, n * sizeof(int64_t), cudaMemcpyHostToDevice));
-    applyRowPermVecInvKernel<<<1, wgs>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
+    applyRowPermVecInvKernel<<<1, wgs, 0, sym.stream_>>>(devPivotBuf.ptr, n, vec, ldVec, nRHS);
   }
 }
 
@@ -2517,12 +2521,12 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     dim3 blockDim(wgs, batchWgs);
 
     sparseElim_diagSolveL<T*>
-        <<<gridDim, blockDim>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
+        <<<gridDim, blockDim, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
                                 devPtrsX.ptr, devPtrsY.ptr, ldc, nRHS, lumpsBegin, lumpsEnd,
                                 Batched{.batchSize = (int)C->size(), .batchIndex = 0});
 
     // TODO: consider "straightening" inner loop
-    sparseElim_subDiagMult<T*><<<gridDim, blockDim>>>(
+    sparseElim_subDiagMult<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
         sym.devChainData.ptr, devPtrsX.ptr, devPtrsY.ptr, ldc, nRHS, lumpsBegin, lumpsEnd,
         Batched{.batchSize = (int)C->size(), .batchIndex = 0});
@@ -2547,13 +2551,13 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     dim3 blockDim(wgs, batchWgs);
 
     // TODO: consider "straightening" inner loop
-    sparseElim_subDiagMultT<T*><<<gridDim, blockDim>>>(
+    sparseElim_subDiagMultT<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         sym.devLumpStart.ptr, sym.devSpanStart.ptr, sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr,
         sym.devChainData.ptr, devPtrsX.ptr, devPtrsY.ptr, ldc, nRHS, lumpsBegin, lumpsEnd,
         Batched{.batchSize = (int)C->size(), .batchIndex = 0});
 
     sparseElim_diagSolveLt<T*>
-        <<<gridDim, blockDim>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
+        <<<gridDim, blockDim, 0, sym.stream_>>>(sym.devLumpStart.ptr, sym.devChainColPtr.ptr, sym.devChainData.ptr,
                                 devPtrsX.ptr, devPtrsY.ptr, ldc, nRHS, lumpsBegin, lumpsEnd,
                                 Batched{.batchSize = (int)C->size(), .batchIndex = 0});
   }
@@ -2580,7 +2584,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     int numGroups = (numColItems + wgs - 1) / wgs;
     dim3 gridDim(numGroups, batchGroups);
     dim3 blockDim(wgs, batchWgs);
-    assembleVec_kernel<T*><<<gridDim, blockDim>>>(
+    assembleVec_kernel<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         sym.devChainRowsTillEnd.ptr + chainColPtr, sym.devChainRowSpan.ptr + chainColPtr,
         sym.devSpanStart.ptr, devSolveBufsDev.ptr, numColItems, devPtrsX.ptr, ldc, nRHS,
         Batched{.batchSize = (int)C->size(), .batchIndex = 0});
@@ -2605,7 +2609,7 @@ struct CudaSolveCtx<vector<T*>> : SolveCtx<vector<T*>> {
     int numGroups = (numColItems + wgs - 1) / wgs;
     dim3 gridDim(numGroups, batchGroups);
     dim3 blockDim(wgs, batchWgs);
-    assembleVecT_kernel<T*><<<gridDim, blockDim>>>(
+    assembleVecT_kernel<T*><<<gridDim, blockDim, 0, sym.stream_>>>(
         sym.devChainRowsTillEnd.ptr + chainColPtr, sym.devChainRowSpan.ptr + chainColPtr,
         sym.devSpanStart.ptr, devPtrsX.ptr, ldc, nRHS, devSolveBufsDev.ptr, numColItems,
         Batched{.batchSize = (int)C->size(), .batchIndex = 0});
