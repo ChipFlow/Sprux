@@ -35,8 +35,10 @@ template <>
 struct Epsilon<float> {
   static constexpr float value = 1e-5;
   // Relative tolerance for sparse elim + dense factor comparison.
-  // Real hardware (M4 Pro): ~5e-8. CI paravirtualized Metal: ~1e-5.
-  static constexpr float value2 = 1e-4;
+  // Sparse elim is now deterministic (two-phase accumulation), but MPS
+  // dense ops (potrf/trsm/GEMM) still differ on paravirtualized Metal GPU.
+  // Real hardware: ~5e-8. CI paravirtualized: ~1.7e-5.
+  static constexpr float value2 = 5e-5;
 };
 
 template <typename T>
