@@ -179,6 +179,16 @@ TEST(SequenceSolve, RingOscillator) {
     double residual = computeResidual(A, x, b);
     EXPECT_LT(residual, 1e-6) << "Matrix #" << i << " residual too large: " << residual;
 
+    // Dump solution for external comparison (e.g., scipy)
+    if (getenv("BASPACHO_DUMP_SOLUTIONS")) {
+      cout << "SOLUTION_DUMP:" << i << ":";
+      for (int64_t j = 0; j < n; j++) {
+        if (j > 0) cout << " ";
+        cout << setprecision(17) << x(j);
+      }
+      cout << endl;
+    }
+
     cout << "  Matrix #" << i << ": factor=" << fixed << setprecision(4) << factorTime
          << "s, solve=" << solveTime << "s, residual=" << scientific << setprecision(2) << residual
          << endl;
