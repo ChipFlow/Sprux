@@ -886,6 +886,25 @@ __global__ void batchedSmallGemmKernel(T* data, const GemmWorkItem* work, int64_
 // Threshold: GEMMs with m*n <= this value are batched; larger ones use cuBLAS directly
 static const int kBatchGemmMaxMN = 64;
 
+// GPU prepareAssemble: populate spanToChainOffset from device-resident skeleton arrays.
+// Replaces CPU loop + pinned H→D copy, making prepareAssemble graph-capture compatible.
+// Each thread handles one chain entry for targetLump: reads chainRowSpan[i] as the
+// destination span index and chainData[i] as the offset value.
+__global__ void prepareAssembleKernel(
+    const int64_t* __restrict__ chainColPtr,
+    const int64_t* __restrict__ chainRowSpan,
+    const int64_t* __restrict__ chainData,
+    int64_t* __restrict__ spanToChainOffset,
+    int64_t targetLump) {
+  int64_t start = chainColPtr[targetLump];
+  int64_t end = chainColPtr[targetLump + 1];
+  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < end - start) {
+    int64_t i = start + idx;
+    spanToChainOffset[chainRowSpan[i]] = chainData[i];
+  }
+}
+
 // Apply row permutation to matrix columns on GPU
 // Sequential swaps (data dependency), parallel across columns within one block.
 // IMPORTANT: Must launch with exactly 1 block since __syncthreads only syncs within a block.
@@ -1274,6 +1293,11 @@ struct CudaNumericCtx : NumericCtx<T> {
     // Pre-allocate maxAbsDiag result buffer
     devMaxAbsDiagResult_.resizeToAtLeast(1);
 
+    // Pre-create sparseCompleteEvent_ to avoid cudaEventCreate during graph capture
+    if (!sparseCompleteEvent_) {
+      cuCHECK(cudaEventCreateWithFlags(&sparseCompleteEvent_, cudaEventDisableTiming));
+    }
+
     // Pre-allocate pinned staging buffer to max of prepareAssemble and flushGemmBatch needs.
     // This prevents ensurePinnedBuf from triggering cudaFreeHost/cudaHostAlloc during the hot path.
     size_t spanBytes = spanToChainOffset.size() * sizeof(int64_t);
@@ -1304,11 +1328,17 @@ struct CudaNumericCtx : NumericCtx<T> {
     lastGetrfPivotOff_ = -1;
     perturbCountPending_ = false;
     readCacheValid_ = false;
+    // Pre-computed mode: reset flush index only (device buffers persist)
+    if (usePrecomputed_) {
+      precomputedFlushIdx_ = 0;
+      precomputedDataPtr_ = nullptr;
+    }
     // Buffers (pinnedBuf_, devGemmWork_, devDensePivots, devTempBuffer, etc.)
     // are NOT freed — they are reused across calls.
   }
 
   virtual void pseudoFactorSpans(T* data, int64_t spanBegin, int64_t spanEnd) override {
+    if (recordingMode_) return;
     auto timer = sym.pseudoFactorStat.instance<CudaSyncOps>();
 
     int wgs = 32;
@@ -1324,6 +1354,7 @@ struct CudaNumericCtx : NumericCtx<T> {
 
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
+    if (recordingMode_) return;
     const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
     BASPACHO_CHECK_NOTNULL(pElim);
     const CudaSymElimCtx& elim = *pElim;
@@ -1356,6 +1387,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   virtual T readValue(const T* data, int64_t offset) override {
+    if (recordingMode_) return T(0);
     // Lazy cache: on first readValue, bulk-copy device data to host
     // to avoid per-element cudaMemcpy overhead (~10μs × N = 250ms for 25K lumps).
     // Cache is invalidated by beginDenseOps (which re-copies post-sparse-elim data).
@@ -1375,6 +1407,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   double maxAbsDiag(const T* data, const int64_t* /*lumpStart*/,
                     const int64_t* /*chainColPtr*/, const int64_t* /*chainData*/,
                     int64_t startLump, int64_t upToLump) override {
+    if (recordingMode_) return 0.0;
     int64_t numLumps = upToLump - startLump;
     if (numLumps <= 0) return 0.0;
 
@@ -1420,6 +1453,7 @@ struct CudaNumericCtx : NumericCtx<T> {
 
   virtual void flush() override {
     flushGemmBatch();
+    if (recordingMode_) return;  // skip pivot copies during recording
     // Flush deferred pivot copies: D→H (host destination)
     if (!deferredPivotCopies_.empty()) {
       for (auto& dc : deferredPivotCopies_) {
@@ -1437,6 +1471,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   // host pointer (which corresponds to offset 0 in the consolidated array).
   void flushDevicePivots(int64_t* devDstPivots) override {
     flushGemmBatch();
+    if (recordingMode_) return;
     if (!deferredPivotCopies_.empty()) {
       // Compute destination offsets relative to the first copy's host pointer
       int64_t* basePtr = deferredPivotCopies_[0].cpuDst;
@@ -1454,6 +1489,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   int64_t deferredPerturbCount() override {
+    if (recordingMode_) return 0;
     if (!perturbCountPending_) return 0;
     int64_t count = 0;
     cuCHECK(cudaMemcpy(&count, devPerturbCount.ptr, sizeof(int64_t), cudaMemcpyDeviceToHost));
@@ -1464,6 +1500,7 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
                                         T threshold) override {
     if (n <= 0) return 0;
+    if (recordingMode_) return 0;
 
     // Initialize persistent counter on first call (once per factorization)
     if (!perturbCountPending_) {
@@ -1481,6 +1518,8 @@ struct CudaNumericCtx : NumericCtx<T> {
   virtual void doEliminationLU(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                                int64_t lumpsEnd, T staticPivotThreshold,
                                int64_t& perturbCount) override {
+    if (recordingMode_) return;
+
     const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
     BASPACHO_CHECK_NOTNULL(pElim);
     const CudaSymElimCtx& elim = *pElim;
@@ -1526,27 +1565,28 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
+    if (recordingMode_) return;  // no-op during recording
+
     const CoalescedBlockMatrixSkel& skel = sym.skel;
+    int64_t numEntries = skel.chainColPtr[targetLump + 1] - skel.chainColPtr[targetLump];
+    if (numEntries <= 0) return;
 
-    // Compute spanToChainOffset (needed for Cholesky assemble path, but also
-    // called in LU dense loop where it's not used for assemble).
-    for (int64_t i = skel.chainColPtr[targetLump], iEnd = skel.chainColPtr[targetLump + 1];
-         i < iEnd; i++) {
-      spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
-    }
-
-    // Upload to GPU using pinned memory for async H→D copy
-    size_t bytes = spanToChainOffset.size() * sizeof(int64_t);
-    ensurePinnedBuf(bytes);
-    memcpy(pinnedBuf_, spanToChainOffset.data(), bytes);
-    cuCHECK(cudaMemcpyAsync(devSpanToChainOffset.ptr, pinnedBuf_, bytes,
-                             cudaMemcpyHostToDevice, sym.stream_));
+    // GPU kernel: reads device-resident skeleton arrays, writes devSpanToChainOffset.
+    // All inputs (devChainColPtr, devChainRowSpan, devChainData) are already on device
+    // in CudaSymbolicCtx. No CPU loop, no pinned buffer, no H→D copy — fully
+    // graph-capture compatible.
+    int wgs = 64;
+    int numBlocks = (numEntries + wgs - 1) / wgs;
+    prepareAssembleKernel<<<numBlocks, wgs, 0, sym.stream_>>>(
+        sym.devChainColPtr.ptr, sym.devChainRowSpan.ptr, sym.devChainData.ptr,
+        devSpanToChainOffset.ptr, targetLump);
   }
 
   virtual void assemble(T* data, int64_t rectRowBegin,
                         int64_t dstStride,  //
                         int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
                         int64_t numBlockCols) override {
+    if (recordingMode_) return;
     auto timer = sym.asmblStat.instance<CudaSyncOps>(sizeof(T), numBlockRows, numBlockCols);
     const int64_t* pChainRowsTillEnd = sym.devChainRowsTillEnd.ptr + srcColDataOffset;
     const int64_t* pToSpan = sym.devChainRowSpan.ptr + srcColDataOffset;
@@ -1561,6 +1601,37 @@ struct CudaNumericCtx : NumericCtx<T> {
   }
 
   void flushGemmBatch() {
+    if (recordingMode_) {
+      // Recording mode: record flush point, skip GPU work
+      if (recordingBatchCount_ > 0) {
+        size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+        recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+        recordingBatchCount_ = 0;
+      }
+      gemmBatch_.clear();
+      gemmDataPtr_ = nullptr;
+      return;
+    }
+
+    if (usePrecomputed_) {
+      // Pre-computed mode: dispatch from device-resident items
+      if (precomputedFlushIdx_ >= recordedFlushPoints_.size()) return;
+      auto [startIdx, count] = recordedFlushPoints_[precomputedFlushIdx_];
+      precomputedFlushIdx_++;
+      if (count == 0) return;
+      BASPACHO_CHECK(precomputedDataPtr_ != nullptr);
+      int wgs = 256;
+      int numBlocks = ((int)count + wgs - 1) / wgs;
+      GemmWorkItem* devItems = reinterpret_cast<GemmWorkItem*>(devPrecomputedItems_.ptr) + startIdx;
+      batchedSmallGemmKernel<T>
+          <<<numBlocks, wgs, 0, sym.stream_>>>(precomputedDataPtr_, devItems, (int64_t)count);
+      // gemmBatch_ is unused in pre-computed mode but clear for safety
+      gemmBatch_.clear();
+      gemmDataPtr_ = nullptr;
+      return;
+    }
+
+    // Normal mode: upload and dispatch
     if (gemmBatch_.empty()) return;
     size_t bytes = gemmBatch_.size() * sizeof(GemmWorkItem);
     devGemmWork_.resizeToAtLeast(bytes / sizeof(T) + 1);
@@ -1636,10 +1707,62 @@ struct CudaNumericCtx : NumericCtx<T> {
   DevMirror<T> devGemmWork_;  // GPU storage for GemmWorkItem array (reinterpret_cast)
   T* gemmDataPtr_ = nullptr;  // data pointer for current batch (for validation)
 
+  // ============ Recording mode for pre-computed GemmWorkItems ============
+  // During recording: capture all GemmWorkItems and flush boundaries.
+  // After endRecording(): dispatch from pre-computed device buffers.
+  // This eliminates per-lump CPU→GPU transfers in flushGemmBatch.
+  bool recordingMode_ = false;
+  std::vector<GemmWorkItem> recordedItems_;          // all items across all flushes
+  std::vector<std::pair<size_t, size_t>> recordedFlushPoints_;  // (startIdx, count) per flush
+  size_t recordingBatchCount_ = 0;                   // items in current batch
+
+  bool usePrecomputed_ = false;
+  DevMirror<T> devPrecomputedItems_;                  // GemmWorkItems on device (as T for DevMirror)
+  size_t precomputedFlushIdx_ = 0;                    // current flush point index during dispatch
+  size_t totalPrecomputedItems_ = 0;                  // total items for bounds checking
+  T* precomputedDataPtr_ = nullptr;                   // data pointer set at first Execute
+
+  void beginRecording() override {
+    recordingMode_ = true;
+    recordedItems_.clear();
+    recordedFlushPoints_.clear();
+    recordingBatchCount_ = 0;
+  }
+
+  void endRecording() override {
+    // Flush any remaining batch
+    if (recordingBatchCount_ > 0) {
+      size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+      recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+      recordingBatchCount_ = 0;
+    }
+
+    recordingMode_ = false;
+    totalPrecomputedItems_ = recordedItems_.size();
+
+    if (totalPrecomputedItems_ > 0) {
+      // Upload all recorded items to device (single H→D copy at init time)
+      size_t bytes = totalPrecomputedItems_ * sizeof(GemmWorkItem);
+      size_t elemCount = bytes / sizeof(T) + 1;
+      devPrecomputedItems_.resizeToAtLeast(elemCount);
+      cuCHECK(cudaMemcpy(devPrecomputedItems_.ptr, recordedItems_.data(), bytes,
+                          cudaMemcpyHostToDevice));
+    }
+
+    usePrecomputed_ = true;
+    precomputedFlushIdx_ = 0;
+
+    // Free host recording buffers (data is now on device)
+    recordedItems_.clear();
+    recordedItems_.shrink_to_fit();
+  }
+
   bool readCacheValid_ = false;   // Lazy read cache for readValue (avoids per-element cudaMemcpy)
   std::vector<T> hostData_;       // Host copy of data buffer (for readValue lazy cache)
 
   virtual void beginDenseOps(T* data, int64_t totalDataSize) override {
+    if (recordingMode_) return;  // no-op during recording
+
     // Ensure all prior GPU work (sparse elimination kernels) on the default
     // stream is complete before the dense loop begins issuing new work.
     //
@@ -1648,11 +1771,14 @@ struct CudaNumericCtx : NumericCtx<T> {
     // stream and wait on it — this provides the same ordering guarantee but
     // is graph-capture compatible (cudaEventRecord and cudaStreamWaitEvent are
     // both allowed inside graph capture).
+    // sparseCompleteEvent_ is pre-created in preAllocateForLU to avoid
+    // cudaEventCreate during graph capture. Fallback creation here for
+    // code paths that skip preAllocateForLU.
     if (!sparseCompleteEvent_) {
       cuCHECK(cudaEventCreateWithFlags(&sparseCompleteEvent_, cudaEventDisableTiming));
     }
-    cuCHECK(cudaEventRecord(sparseCompleteEvent_, 0));  // record on default stream
-    cuCHECK(cudaStreamWaitEvent(0, sparseCompleteEvent_, 0));  // wait on default stream
+    cuCHECK(cudaEventRecord(sparseCompleteEvent_, sym.stream_));
+    cuCHECK(cudaStreamWaitEvent(sym.stream_, sparseCompleteEvent_, 0));
 
     // Invalidate lazy read cache (data changed by GPU sparse elimination)
     readCacheValid_ = false;
@@ -1762,6 +1888,7 @@ template <>
 int CudaNumericCtx<double>::getrf(int64_t m, int64_t n, double* data, int64_t offA,
                                    int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
+  if (recordingMode_) { flushGemmBatch(); return 0; }
 
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
@@ -1797,6 +1924,7 @@ template <>
 int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA,
                                   int64_t* pivots) {
   if (m <= 0 || n <= 0) return 0;
+  if (recordingMode_) { flushGemmBatch(); return 0; }
 
   flushGemmBatch();  // Ensure all pending GEMM updates are complete before factoring
   int64_t minMN = std::min(m, n);
@@ -1830,6 +1958,7 @@ int CudaNumericCtx<float>::getrf(int64_t m, int64_t n, float* data, int64_t offA
 template <>
 void CudaNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L, int64_t offL,
                                             double* B, int64_t offB, int64_t ldb) {
+  if (recordingMode_) return;
   double alpha(1.0);
   cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
                            CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
@@ -1838,6 +1967,7 @@ void CudaNumericCtx<double>::trsmLowerUnit(int64_t m, int64_t n, const double* L
 template <>
 void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL,
                                            float* B, int64_t offB, int64_t ldb) {
+  if (recordingMode_) return;
   float alpha(1.0);
   cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
                            CUBLAS_DIAG_UNIT, n, m, &alpha, L + offL, m, B + offB, ldb));
@@ -1848,6 +1978,7 @@ void CudaNumericCtx<float>::trsmLowerUnit(int64_t m, int64_t n, const float* L, 
 template <>
 void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* U, int64_t offU,
                                              double* B, int64_t offB, int64_t /*ldb*/) {
+  if (recordingMode_) return;
   double alpha(1.0);
   cublasCHECK(cublasDtrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
@@ -1856,6 +1987,7 @@ void CudaNumericCtx<double>::trsmUpperRight(int64_t m, int64_t n, const double* 
 template <>
 void CudaNumericCtx<float>::trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU,
                                             float* B, int64_t offB, int64_t /*ldb*/) {
+  if (recordingMode_) return;
   float alpha(1.0);
   cublasCHECK(cublasStrsm(sym.cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
                            CUBLAS_DIAG_NON_UNIT, n, m, &alpha, U + offU, n, B + offB, n));
@@ -1869,17 +2001,32 @@ void CudaNumericCtx<double>::saveGemm(int64_t m, int64_t n, int64_t k, const dou
                                        int64_t ldU, double* C, int64_t offC, int64_t ldC) {
   sym.gemmCalls++;
 
-  // Batch small GEMMs into a single kernel dispatch
+  GemmWorkItem item = {offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
+                        (int32_t)ldL, (int32_t)ldU, (int32_t)ldC};
+
   if (m * n <= kBatchGemmMaxMN) {
+    if (recordingMode_) {
+      recordedItems_.push_back(item);
+      recordingBatchCount_++;
+      return;
+    }
+    if (usePrecomputed_) {
+      // Items already on device — capture data pointer for kernel dispatch
+      if (precomputedDataPtr_ == nullptr) {
+        precomputedDataPtr_ = const_cast<double*>(L);
+      }
+      return;  // no-op: items dispatched from pre-computed buffer in flushGemmBatch
+    }
     if (gemmDataPtr_ == nullptr) {
       gemmDataPtr_ = const_cast<double*>(L);
     }
-    gemmBatch_.push_back({offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
-                          (int32_t)ldL, (int32_t)ldU, (int32_t)ldC});
+    gemmBatch_.push_back(item);
     return;
   }
 
+  // Large GEMM: flush pending batch, then cuBLAS
   flushGemmBatch();
+  if (recordingMode_) return;  // skip cuBLAS during recording
   double alpha(-1.0), beta(1.0);
   cublasCHECK(cublasDgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
                            L + offL, ldL, &beta, C + offC, ldC));
@@ -1891,19 +2038,31 @@ void CudaNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
                                       int64_t ldU, float* C, int64_t offC, int64_t ldC) {
   sym.gemmCalls++;
 
-  // Batch small GEMMs into a single kernel dispatch to avoid cuBLAS overhead
+  GemmWorkItem item = {offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
+                        (int32_t)ldL, (int32_t)ldU, (int32_t)ldC};
+
   if (m * n <= kBatchGemmMaxMN) {
-    // All pointers must refer to the same data buffer (they do in BaSpaCho)
-    if (gemmDataPtr_ == nullptr) {
-      gemmDataPtr_ = const_cast<float*>(L);  // Track the base data pointer
+    if (recordingMode_) {
+      recordedItems_.push_back(item);
+      recordingBatchCount_++;
+      return;
     }
-    gemmBatch_.push_back({offL, offU, offC, (int32_t)m, (int32_t)n, (int32_t)k,
-                          (int32_t)ldL, (int32_t)ldU, (int32_t)ldC});
+    if (usePrecomputed_) {
+      if (precomputedDataPtr_ == nullptr) {
+        precomputedDataPtr_ = const_cast<float*>(L);
+      }
+      return;
+    }
+    if (gemmDataPtr_ == nullptr) {
+      gemmDataPtr_ = const_cast<float*>(L);
+    }
+    gemmBatch_.push_back(item);
     return;
   }
 
-  // Large GEMM: flush any pending batch first, then use cuBLAS
+  // Large GEMM: flush pending batch, then cuBLAS
   flushGemmBatch();
+  if (recordingMode_) return;
   float alpha(-1.0), beta(1.0);
   cublasCHECK(cublasSgemm(sym.cublasH, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, U + offU, ldU,
                            L + offL, ldL, &beta, C + offC, ldC));
@@ -1915,6 +2074,7 @@ template <>
 void CudaNumericCtx<double>::applyRowPerm(int64_t* pivots, int64_t n, double* data, int64_t offData,
                                            int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
+  if (recordingMode_) return;
 
   int64_t* devPivPtr;
   if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
@@ -1936,6 +2096,7 @@ template <>
 void CudaNumericCtx<float>::applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData,
                                           int64_t ld, int64_t numCols) {
   if (n <= 0 || numCols <= 0) return;
+  if (recordingMode_) return;
 
   int64_t* devPivPtr;
   if (n == lastGetrfPivotN_ && lastGetrfPivotOff_ >= 0) {
