@@ -34,9 +34,9 @@ struct Epsilon;
 template <>
 struct Epsilon<float> {
   static constexpr float value = 1e-5;
-  // Metal/Apple Silicon has slightly different float precision characteristics
-  // Relaxed tolerance for complex sparse factorization (sparse elim + dense)
-  static constexpr float value2 = 3e-3;
+  // Relative tolerance for sparse elim + dense factor comparison.
+  // Real hardware (M4 Pro): ~5e-8. CI paravirtualized Metal: ~1e-5.
+  static constexpr float value2 = 1e-4;
 };
 
 template <typename T>
@@ -107,9 +107,14 @@ void testCoalescedFactor_Many(const std::function<OpsPtr()>& genOps) {
     }
 
     Matrix<T> computedMat = solver.skel().densify(data);
-
-    ASSERT_NEAR(Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>()).norm(),
-                0, Epsilon<T>::value2);
+    T absErr =
+        Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>()).norm();
+    T refNorm =
+        Matrix<T>(verifyMat.template triangularView<Eigen::Lower>()).norm();
+    T relErr = absErr / std::max(refNorm, T(1e-30));
+    ASSERT_LT(relErr, Epsilon<T>::value2)
+        << "iteration " << i << ": absErr=" << absErr << ", refNorm=" << refNorm
+        << ", relErr=" << relErr;
   }
 }
 
@@ -207,8 +212,14 @@ void testSparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps) {
     }
 
     Matrix<T> computedMat = solver.skel().densify(data);
-    ASSERT_NEAR(Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>()).norm(),
-                0, Epsilon<T>::value2);
+    T absErr =
+        Matrix<T>((verifyMat - computedMat).template triangularView<Eigen::Lower>()).norm();
+    T refNorm =
+        Matrix<T>(verifyMat.template triangularView<Eigen::Lower>()).norm();
+    T relErr = absErr / std::max(refNorm, T(1e-30));
+    ASSERT_LT(relErr, Epsilon<T>::value2)
+        << "iteration " << i << ": absErr=" << absErr << ", refNorm=" << refNorm
+        << ", relErr=" << relErr;
   }
 }
 
