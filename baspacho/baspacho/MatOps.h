@@ -128,6 +128,28 @@ struct SymbolicCtx {
   template <typename T>
   SolveCtxPtr<T> createSolveCtx(int nRHS, const T* data);
 
+  // Disable all OpStat timers. On CUDA backends, each enabled timer calls
+  // cudaStreamSynchronize(0) in its destructor for wall-clock timing.
+  // With ~45 timers × 47 lumps × 1665 factorizations = ~90K sync calls.
+  // Call this when timing stats are not needed (e.g., production FFI path).
+  void disableAllStats() {
+    potrfStat.enabled = false;
+    trsmStat.enabled = false;
+    sygeStat.enabled = false;
+    asmblStat.enabled = false;
+    getrfStat.enabled = false;
+    solveSparseLStat.enabled = false;
+    solveSparseLtStat.enabled = false;
+    pseudoFactorStat.enabled = false;
+    symmStat.enabled = false;
+    solveLStat.enabled = false;
+    solveLtStat.enabled = false;
+    solveGemvStat.enabled = false;
+    solveGemvTStat.enabled = false;
+    solveAssVStat.enabled = false;
+    solveAssVTStat.enabled = false;
+  }
+
   mutable OpStat<int, int> potrfStat;
   mutable int64_t potrfBiggestN = 0;
   mutable OpStat<int, int, int> trsmStat;
