@@ -188,6 +188,115 @@ struct MetalSymbolicCtx : SymbolicCtx {
     elim->numBlockPairs = makeStraight[makeStraight.size() - 1];
     elim->makeBlockPairEnumStraight.load(makeStraight);
 
+    // Build element-level work items for two-phase deterministic elimination.
+    // Expand each block pair into individual element dot products.
+    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+
+    vector<CholWorkItem> cholItems;
+    cholItems.reserve(elim->numBlockPairs * 4);  // heuristic: ~4 elements per block pair
+
+    for (int64_t l = lumpsBegin; l < lumpsEnd; l++) {
+      int64_t colStart = skel.chainColPtr[l] + 1;  // skip diagonal
+      int64_t colEnd = skel.chainColPtr[l + 1];
+      int64_t n = colEnd - colStart;
+      int64_t lumpSize = skel.lumpStart[l + 1] - skel.lumpStart[l];
+
+      for (int64_t p = 0; p < n * (n + 1) / 2; p++) {
+        // Convert linear index to ordered pair (di, dj) where di <= dj
+        int64_t odd = n & 1;
+        int64_t m = n + 1 - odd;
+        int64_t di = p % m;
+        int64_t dj = n - 1 - (p / m);
+        if (di > dj) {
+          di = di - dj - 1;
+          dj = n - 1 - odd - dj;
+        }
+
+        // Block info (mirrors GPU kernel logic)
+        int64_t iSpan = skel.chainRowSpan[colStart + di];
+        int64_t jSpan = skel.chainRowSpan[colStart + dj];
+        int64_t iSize = skel.spanStart[iSpan + 1] - skel.spanStart[iSpan];
+        int64_t jSize = skel.spanStart[jSpan + 1] - skel.spanStart[jSpan];
+        int64_t iDataPtr = skel.chainData[colStart + di];
+        int64_t jDataPtr = skel.chainData[colStart + dj];
+
+        // Find target block via bisect
+        int64_t iLump = skel.spanToLump[iSpan];
+        int64_t iSpanOff = skel.spanOffsetInLump[iSpan];
+        int64_t targetLumpSize = skel.lumpStart[iLump + 1] - skel.lumpStart[iLump];
+        int64_t targetStartPtr = skel.chainColPtr[iLump];
+        int64_t targetEndPtr = skel.chainColPtr[iLump + 1];
+        int64_t targetPos = cpuBisect(skel.chainRowSpan.data() + targetStartPtr,
+                                      targetEndPtr - targetStartPtr, jSpan);
+        int64_t jiDataPtr = skel.chainData[targetStartPtr + targetPos];
+
+        // target = data + jiDataPtr + iSpanOff
+        // locked_sub_product_float args: (target, targetLumpSize,
+        //   srcJ=data+jDataPtr, jSize, lumpSize, lumpSize,
+        //   srcI=data+iDataPtr, iSize, lumpSize)
+        // Element (i,j): val = dot(srcJ[i*lumpSize:], srcI[j*lumpSize:], lumpSize)
+        //   target_elem = target + i * targetLumpSize + j
+        for (int64_t i = 0; i < jSize; i++) {
+          for (int64_t j = 0; j < iSize; j++) {
+            CholWorkItem item;
+            item.srcRow_offset = (int32_t)(jDataPtr + i * lumpSize);
+            item.srcCol_offset = (int32_t)(iDataPtr + j * lumpSize);
+            item.numK = (int16_t)lumpSize;
+            item.padding = 0;
+            item.target_offset = (int32_t)(jiDataPtr + iSpanOff + i * targetLumpSize + j);
+            cholItems.push_back(item);
+          }
+        }
+      }
+    }
+
+    // Sort by target_offset for deterministic accumulation
+    stable_sort(cholItems.begin(), cholItems.end(),
+                [](const CholWorkItem& a, const CholWorkItem& b) {
+                  return a.target_offset < b.target_offset;
+                });
+
+    elim->numCholWorkItems = (int64_t)cholItems.size();
+    if (elim->numCholWorkItems > 0) {
+      // Upload as packed int32 array (4 int32 per CholWorkItem = 16 bytes)
+      vector<int32_t> packed(4 * elim->numCholWorkItems);
+      for (int64_t i = 0; i < elim->numCholWorkItems; i++) {
+        packed[4 * i + 0] = cholItems[i].srcRow_offset;
+        packed[4 * i + 1] = cholItems[i].srcCol_offset;
+        // Pack numK and padding into one int32
+        int32_t numK_packed;
+        memcpy(&numK_packed, &cholItems[i].numK, sizeof(int32_t));
+        packed[4 * i + 2] = numK_packed;
+        packed[4 * i + 3] = cholItems[i].target_offset;
+      }
+      elim->devCholWorkItems.load(packed);
+
+      // Build segment table
+      vector<SegmentInfo> segments;
+      segments.reserve(elim->numCholWorkItems);
+      int32_t segStart = 0;
+      for (int64_t i = 1; i <= elim->numCholWorkItems; i++) {
+        if (i == elim->numCholWorkItems ||
+            cholItems[i].target_offset != cholItems[segStart].target_offset) {
+          SegmentInfo seg;
+          seg.target_offset = cholItems[segStart].target_offset;
+          seg.scratch_start = segStart;
+          seg.count = (int32_t)(i - segStart);
+          segments.push_back(seg);
+          segStart = (int32_t)i;
+        }
+      }
+
+      elim->numCholSegments = (int64_t)segments.size();
+      vector<int32_t> segPacked(3 * elim->numCholSegments);
+      for (int64_t i = 0; i < elim->numCholSegments; i++) {
+        segPacked[3 * i + 0] = segments[i].target_offset;
+        segPacked[3 * i + 1] = segments[i].scratch_start;
+        segPacked[3 * i + 2] = segments[i].count;
+      }
+      elim->devCholSegments.load(segPacked);
+    }
+
     return SymElimCtxPtr(elim);
   }
 
@@ -713,45 +822,47 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             (NSUInteger)numLumps);
       }
 
-      // Step 2: Sparse elimination
-      if (elim.numBlockPairs > 0) {
-        id<MTLComputePipelineState> pipeline =
+      // Step 2: Sparse elimination — two-phase deterministic
+      if (elim.numCholWorkItems > 0 && elim.numCholSegments > 0) {
+        elimScratchBuffer.resizeToAtLeast(elim.numCholWorkItems);
+
+        // Phase 1: compute dot products into scratch
+        id<MTLComputePipelineState> cp1Pipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-                "sparse_elim_straight_kernel_float");
+                "chol_sparse_elim_phase1_float");
 
         dispatchKernel(
-            sym.commandQueue, pipeline,
+            sym.commandQueue, cp1Pipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                          offset:0
-                         atIndex:0];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholWorkItems.buffer()
                           offset:0
                          atIndex:1];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
                           offset:0
                          atIndex:2];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                          offset:0
-                         atIndex:3];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                          offset:0
-                         atIndex:4];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
-                          offset:0
-                         atIndex:5];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                          offset:0
-                         atIndex:6];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
-              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
-              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
-                          offset:0
-                         atIndex:10];
-              [encoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
+              [encoder setBytes:&elim.numCholWorkItems length:sizeof(int64_t) atIndex:3];
             },
-            (NSUInteger)elim.numBlockPairs);
+            (NSUInteger)elim.numCholWorkItems);
+
+        // Phase 2: deterministic segmented sum
+        id<MTLComputePipelineState> p2Pipeline =
+            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
+                "sparse_elim_phase2_float");
+
+        dispatchKernel(
+            sym.commandQueue, p2Pipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholSegments.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBytes:&elim.numCholSegments length:sizeof(int64_t) atIndex:3];
+            },
+            (NSUInteger)elim.numCholSegments);
       }
     }
   }
@@ -1011,7 +1122,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Batch all Cholesky sparse elimination levels into a single command buffer
-  // on the ASYNC queue. Same pattern as doAllEliminationsLU.
+  // on the ASYNC queue. Uses two-phase deterministic accumulation:
+  //   Phase 1: compute dot products into scratch buffer (no atomics)
+  //   Phase 2: segmented sum per target in fixed order (deterministic)
   void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
                          const std::vector<int64_t>& ranges, float* data) override {
     @autoreleasepool {
@@ -1025,8 +1138,22 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       id<MTLComputePipelineState> factorPipeline =
           getProfiledPipeline("factor_lumps_kernel_float");
-      id<MTLComputePipelineState> elimStraightPipeline =
-          getProfiledPipeline("sparse_elim_straight_kernel_float");
+      id<MTLComputePipelineState> cholPhase1Pipeline =
+          getProfiledPipeline("chol_sparse_elim_phase1_float");
+      id<MTLComputePipelineState> phase2Pipeline =
+          getProfiledPipeline("sparse_elim_phase2_float");
+
+      // Compute max scratch buffer size across all levels
+      int64_t maxScratchSize = 0;
+      for (size_t l = 0; l + 1 < ranges.size(); l++) {
+        if (!elimCtxs[l]) continue;
+        const MetalSymElimCtx& elim =
+            *dynamic_cast<const MetalSymElimCtx*>(elimCtxs[l].get());
+        maxScratchSize = max(maxScratchSize, elim.numCholWorkItems);
+      }
+      if (maxScratchSize > 0) {
+        elimScratchBuffer.resizeToAtLeast(maxScratchSize);
+      }
 
       // Create a dedicated command buffer on the ASYNC queue.
       id<MTLCommandBuffer> asyncCmdBuf = [sym.asyncCommandQueue commandBuffer];
@@ -1071,36 +1198,40 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                      threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
         dispatchCount++;
 
-        // Sparse elimination
-        if (elim.numBlockPairs > 0) {
+        // Sparse elimination: two-phase deterministic
+        if (elim.numCholWorkItems > 0 && elim.numCholSegments > 0) {
+          // Phase 1: compute dot products into scratch buffer
           [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-          [asyncEncoder setComputePipelineState:elimStraightPipeline];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                           offset:0 atIndex:0];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+          [asyncEncoder setComputePipelineState:cholPhase1Pipeline];
+          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholWorkItems.buffer()
                            offset:0 atIndex:1];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
                            offset:0 atIndex:2];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                           offset:0 atIndex:3];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                           offset:0 atIndex:4];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
-                           offset:0 atIndex:5];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                           offset:0 atIndex:6];
-          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:7];
-          [asyncEncoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
-          [asyncEncoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
-                           offset:0 atIndex:10];
-          [asyncEncoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
+          [asyncEncoder setBytes:&elim.numCholWorkItems length:sizeof(int64_t) atIndex:3];
 
-          NSUInteger etgs = MIN(elimStraightPipeline.maxTotalThreadsPerThreadgroup, 256);
-          etgs = MIN(etgs, (NSUInteger)elim.numBlockPairs);
+          NSUInteger etgs = MIN(cholPhase1Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          etgs = MIN(etgs, (NSUInteger)elim.numCholWorkItems);
           [asyncEncoder dispatchThreadgroups:
-              MTLSizeMake(((NSUInteger)elim.numBlockPairs + etgs - 1) / etgs, 1, 1)
+              MTLSizeMake(((NSUInteger)elim.numCholWorkItems + etgs - 1) / etgs, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(etgs, 1, 1)];
+          dispatchCount++;
+
+          // Phase 2: deterministic segmented sum
+          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+          [asyncEncoder setComputePipelineState:phase2Pipeline];
+          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
+                           offset:0 atIndex:1];
+          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholSegments.buffer()
+                           offset:0 atIndex:2];
+          [asyncEncoder setBytes:&elim.numCholSegments length:sizeof(int64_t) atIndex:3];
+
+          NSUInteger stgs = MIN(phase2Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          stgs = MIN(stgs, (NSUInteger)elim.numCholSegments);
+          [asyncEncoder dispatchThreadgroups:
+              MTLSizeMake(((NSUInteger)elim.numCholSegments + stgs - 1) / stgs, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(stgs, 1, 1)];
           dispatchCount++;
         }
       }
@@ -2893,57 +3024,68 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         [cmdBuf waitUntilCompleted];
       }
 
-      // Step 2: Sparse elimination - loop dispatch of non-batched kernel
-      if (elim.numBlockPairs > 0) {
-        id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("sparse_elim_straight_kernel_float");
+      // Step 2: Sparse elimination — two-phase deterministic
+      if (elim.numCholWorkItems > 0 && elim.numCholSegments > 0) {
+        elimScratchBuffer_.resizeToAtLeast(elim.numCholWorkItems);
+
+        id<MTLComputePipelineState> p1Pipeline =
+            getProfiledPipeline("chol_sparse_elim_phase1_float");
+        id<MTLComputePipelineState> p2Pipeline =
+            getProfiledPipeline("sparse_elim_phase2_float");
+
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-        [encoder setComputePipelineState:pipeline];
 
-        // Set structural buffers (same for all batch items)
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                    offset:0
-                   atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                    offset:0
-                   atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                    offset:0
-                   atIndex:2];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                    offset:0
-                   atIndex:3];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                    offset:0
-                   atIndex:4];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanToLump.buffer()
-                    offset:0
-                   atIndex:5];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                    offset:0
-                   atIndex:6];
-        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:8];
-        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:9];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)elim.makeBlockPairEnumStraight.buffer()
-                    offset:0
-                   atIndex:10];
-        [encoder setBytes:&elim.numBlockPairs length:sizeof(int64_t) atIndex:11];
-
-        threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
-        threadGroupSize = MIN(threadGroupSize, (NSUInteger)elim.numBlockPairs);
-        threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
-        numGroups = MTLSizeMake(
-            ((NSUInteger)elim.numBlockPairs + threadGroupSize - 1) / threadGroupSize, 1, 1);
-
-        // Dispatch once per batch item, changing only the data buffer
+        // Phase 1 + Phase 2 per batch item (scratch buffer reused between items)
         for (int b = 0; b < batchSize; b++) {
           auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
           BASPACHO_CHECK_WHAT1(bufferInfo.first,
                                "batched doElimination: data buffer not found");
+
+          if (b > 0) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+          }
+
+          // Phase 1: compute dot products into scratch
+          [encoder setComputePipelineState:p1Pipeline];
           [encoder setBuffer:(__bridge id<MTLBuffer>)bufferInfo.first
                       offset:bufferInfo.second
-                     atIndex:7];
+                     atIndex:0];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholWorkItems.buffer()
+                      offset:0
+                     atIndex:1];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer_.buffer()
+                      offset:0
+                     atIndex:2];
+          [encoder setBytes:&elim.numCholWorkItems length:sizeof(int64_t) atIndex:3];
+
+          threadGroupSize = MIN(p1Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          threadGroupSize = MIN(threadGroupSize, (NSUInteger)elim.numCholWorkItems);
+          threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+          numGroups = MTLSizeMake(
+              ((NSUInteger)elim.numCholWorkItems + threadGroupSize - 1) / threadGroupSize, 1, 1);
+          [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+
+          [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+          // Phase 2: deterministic segmented sum
+          [encoder setComputePipelineState:p2Pipeline];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)bufferInfo.first
+                      offset:bufferInfo.second
+                     atIndex:0];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer_.buffer()
+                      offset:0
+                     atIndex:1];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devCholSegments.buffer()
+                      offset:0
+                     atIndex:2];
+          [encoder setBytes:&elim.numCholSegments length:sizeof(int64_t) atIndex:3];
+
+          threadGroupSize = MIN(p2Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          threadGroupSize = MIN(threadGroupSize, (NSUInteger)elim.numCholSegments);
+          threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+          numGroups = MTLSizeMake(
+              ((NSUInteger)elim.numCholSegments + threadGroupSize - 1) / threadGroupSize, 1, 1);
           [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
         }
 
@@ -3222,6 +3364,9 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
   std::vector<int64_t> spanToChainOffset;
   bool assembleWasCalled_ = false;
   bool gpuAssemblyUsed_ = false;
+
+  // Scratch buffer for two-phase deterministic sparse elimination
+  MetalMirror<float> elimScratchBuffer_;
 };
 
 // Batched solve context for float
