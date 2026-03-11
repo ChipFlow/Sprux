@@ -122,6 +122,21 @@ struct SymbolicCtx {
 
   virtual PermutedCoalescedAccessor deviceAccessor() = 0;
 
+  // Set an external GPU command buffer and compute encoder for dispatch recording.
+  // When set, numeric/solve contexts record dispatches into the provided encoder
+  // instead of creating their own command buffers.
+  // Parameters are void* to avoid Objective-C/CUDA types in this header.
+  //   cmd_buffer: MTLCommandBuffer (Metal) or CUstream (CUDA), as void*
+  //   encoder:    MTLComputeCommandEncoder (Metal) or nullptr (CUDA), as void*
+  // Default implementation is a no-op (CPU backends don't need this).
+  virtual void setExternalEncoder(void* cmd_buffer, void* encoder) {
+    (void)cmd_buffer;
+    (void)encoder;
+  }
+
+  // Clear external encoder mode, returning to normal self-managed mode.
+  virtual void clearExternalEncoder() {}
+
   template <typename T>
   NumericCtxPtr<T> createNumericCtx(int64_t tempBufSize, const T* data);
 

@@ -421,6 +421,18 @@ struct MetalSymbolicCtx : SymbolicCtx {
 
   virtual SolveCtxBase* createSolveCtxForType(type_index tIdx, int nRHS, int batchSize) override;
 
+  void setExternalEncoder(void* cmd_buffer, void* encoder) override {
+    externalCmdBuf = (__bridge id<MTLCommandBuffer>)cmd_buffer;
+    externalEncoder = (__bridge id<MTLComputeCommandEncoder>)encoder;
+    usingExternalEncoder = true;
+  }
+
+  void clearExternalEncoder() override {
+    externalCmdBuf = nil;
+    externalEncoder = nil;
+    usingExternalEncoder = false;
+  }
+
   const CoalescedBlockMatrixSkel& skel;
 
   id<MTLDevice> device;
@@ -445,6 +457,13 @@ struct MetalSymbolicCtx : SymbolicCtx {
   MetalMirror<int64_t> devUpperChainRowPtr;
   MetalMirror<int64_t> devUpperChainColSpan;
   MetalMirror<int64_t> devUpperChainData;
+
+  // External encoder state: when set, MetalNumericCtx and MetalSolveCtx
+  // record dispatches into this encoder instead of creating their own.
+  // Set via setExternalEncoder().
+  id<MTLCommandBuffer> externalCmdBuf = nil;
+  id<MTLComputeCommandEncoder> externalEncoder = nil;
+  bool usingExternalEncoder = false;
 };
 
 // Metal operations factory
@@ -550,25 +569,35 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // pending command buffer. Uses a single encoder for all dispatches with
   // memory barriers between them to ensure correct data ordering.
   // This avoids the ~4μs overhead of creating/ending a new encoder per dispatch.
+  // In external encoder mode, dispatches are recorded into the caller-provided
+  // encoder instead of a self-managed command buffer.
   void encodeKernel(id<MTLComputePipelineState> pipeline,
                     void (^encodeBlock)(id<MTLComputeCommandEncoder>),
                     NSUInteger numThreads) {
     @autoreleasepool {
-      if (!pendingCmdBuf_) {
-        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
-      }
-      if (!pendingEncoder_) {
-        pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
-        pendingDispatchCount_ = 0;
+      id<MTLComputeCommandEncoder> encoder;
+      if (sym.usingExternalEncoder) {
+        // External encoder mode: use caller-provided encoder.
+        encoder = sym.externalEncoder;
+      } else {
+        // Normal mode: manage our own command buffer and encoder.
+        if (!pendingCmdBuf_) {
+          pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+        }
+        if (!pendingEncoder_) {
+          pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
+          pendingDispatchCount_ = 0;
+        }
+        encoder = pendingEncoder_;
       }
 
       // Insert memory barrier so previous dispatches' buffer writes are visible
       if (pendingDispatchCount_ > 0) {
-        [pendingEncoder_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
       }
 
-      [pendingEncoder_ setComputePipelineState:pipeline];
-      encodeBlock(pendingEncoder_);
+      [encoder setComputePipelineState:pipeline];
+      encodeBlock(encoder);
 
       NSUInteger threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
       threadGroupSize = MIN(threadGroupSize, numThreads);
@@ -577,7 +606,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       MTLSize numGroups =
           MTLSizeMake((numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
 
-      [pendingEncoder_ dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+      [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
       pendingDispatchCount_++;
     }
   }
@@ -587,7 +616,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // submission order, so subsequent work on the same queue will see the results.
   // Tracks the last committed buffer so waitForGpu() can wait on it later.
   // Signals the shared event for lower-overhead CPU waiting.
+  // In external encoder mode, this is a no-op — the caller manages the command buffer.
   void commitPending() {
+    if (sym.usingExternalEncoder) return;
     if (pendingCmdBuf_) {
       if (pendingEncoder_) {
         [pendingEncoder_ endEncoding];
@@ -609,7 +640,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // Wait for the most recently committed command buffer to complete.
   // Prefers MTLSharedEvent polling (lower overhead) when available,
   // falls back to waitUntilCompleted on the command buffer.
+  // In external encoder mode, this is a no-op — the caller manages synchronization.
   void waitForGpu() {
+    if (sym.usingExternalEncoder) return;
     if (sharedEvent_ && sharedEventValue_ > 0) {
       // Lower-overhead wait: polls a shared memory value instead of
       // full command buffer lifecycle tracking.
@@ -2178,25 +2211,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   // Encode a kernel dispatch onto a persistent compute encoder within the
   // pending command buffer. Uses a single encoder for all dispatches with
   // memory barriers between them to ensure correct data ordering.
+  // In external encoder mode, dispatches are recorded into the caller-provided
+  // encoder instead of a self-managed command buffer.
   void encodeKernel(id<MTLComputePipelineState> pipeline,
                     void (^encodeBlock)(id<MTLComputeCommandEncoder>),
                     NSUInteger numThreads) {
     @autoreleasepool {
-      if (!pendingCmdBuf_) {
-        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
-      }
-      if (!pendingEncoder_) {
-        pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
-        pendingDispatchCount_ = 0;
+      id<MTLComputeCommandEncoder> encoder;
+      if (sym.usingExternalEncoder) {
+        encoder = sym.externalEncoder;
+      } else {
+        if (!pendingCmdBuf_) {
+          pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+        }
+        if (!pendingEncoder_) {
+          pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
+          pendingDispatchCount_ = 0;
+        }
+        encoder = pendingEncoder_;
       }
 
       // Insert memory barrier so previous dispatches' buffer writes are visible
       if (pendingDispatchCount_ > 0) {
-        [pendingEncoder_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
       }
 
-      [pendingEncoder_ setComputePipelineState:pipeline];
-      encodeBlock(pendingEncoder_);
+      [encoder setComputePipelineState:pipeline];
+      encodeBlock(encoder);
 
       NSUInteger threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
       threadGroupSize = MIN(threadGroupSize, numThreads);
@@ -2205,13 +2246,15 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       MTLSize numGroups =
           MTLSizeMake((numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
 
-      [pendingEncoder_ dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+      [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
       pendingDispatchCount_++;
     }
   }
 
   // Commit the pending command buffer WITHOUT waiting for GPU completion.
+  // In external encoder mode, this is a no-op — the caller manages the command buffer.
   void commitPending() {
+    if (sym.usingExternalEncoder) return;
     if (pendingCmdBuf_) {
       if (pendingEncoder_) {
         [pendingEncoder_ endEncoding];
@@ -2225,7 +2268,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   }
 
   // Wait for the most recently committed command buffer to complete.
+  // In external encoder mode, this is a no-op — the caller manages synchronization.
   void waitForGpu() {
+    if (sym.usingExternalEncoder) return;
     if (lastCommittedCmdBuf_) {
       [lastCommittedCmdBuf_ waitUntilCompleted];
       lastCommittedCmdBuf_ = nil;
