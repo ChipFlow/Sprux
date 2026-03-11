@@ -228,3 +228,115 @@ void testSparseElimAndFactor_Many(const std::function<OpsPtr()>& genOps) {
 TEST(MetalFactor, SparseElimAndFactor_Many_float) {
   testSparseElimAndFactor_Many<float>([] { return metalOps(); });
 }
+
+// Diagnostic test: break down error sources between sparse elim and dense factor,
+// comparing Metal GPU vs CPU BLAS (fastOps) vs Eigen LLT.
+TEST(MetalFactor, DiagnoseErrorSources_float) {
+  using T = float;
+  T maxSparseElimErr = 0, maxDenseOnlyErr = 0, maxCombinedErr = 0;
+  T maxMetalVsBlas = 0;
+  int worstIteration = -1;
+
+  for (int i = 0; i < 20; i++) {
+    auto colBlocks = randomCols(115, 0.03, 57 + i);
+    colBlocks = makeIndependentElimSet(colBlocks, 0, 60);
+    SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
+
+    vector<int64_t> permutation = ss.fillReducingPermutation();
+    vector<int64_t> invPerm = inversePermutation(permutation);
+    SparseStructure sortedSs = ss;
+
+    vector<int64_t> paramSize = randomVec(sortedSs.ptrs.size() - 1, 2, 5, 47 + i);
+    EliminationTree et(paramSize, sortedSs);
+    et.buildTree();
+    et.processTree(/* compute sparse elim ranges = */ true);
+    et.computeAggregateStruct();
+
+    CoalescedBlockMatrixSkel factorSkel(et.computeSpanStart(), et.lumpToSpan, et.colStart,
+                                        et.rowParam);
+    int64_t order = factorSkel.order();
+    int64_t numLumps = factorSkel.lumpStart.size() - 1;
+    int64_t sparseElimEnd = et.sparseElimRanges.back();
+
+    vector<T> origData = randomData<T>(factorSkel.dataSize(), -1.0, 1.0, 9 + i);
+    factorSkel.damp(origData, T(0), T(order * 1.5));
+
+    // Eigen LLT reference
+    Matrix<T> eigenMat = factorSkel.densify(origData);
+    Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(eigenMat);
+
+    // CPU BLAS factor (same algorithm as Metal, but on CPU)
+    vector<T> cpuData = origData;
+    auto elimRanges = et.sparseElimRanges;  // copy for reuse
+    {
+      CoalescedBlockMatrixSkel cpuSkel = factorSkel;  // copy for separate solver
+      auto cpuElimRanges = elimRanges;
+      Solver cpuSolver(std::move(cpuSkel), std::move(cpuElimRanges), {}, fastOps());
+      cpuSolver.factor(cpuData.data());
+    }
+    Matrix<T> cpuMat = factorSkel.densify(cpuData);
+
+    // Metal GPU factor
+    vector<T> gpuData = origData;
+    {
+      CoalescedBlockMatrixSkel gpuSkel = factorSkel;
+      auto gpuElimRanges = elimRanges;
+      Solver gpuSolver(std::move(gpuSkel), std::move(gpuElimRanges), {}, metalOps());
+      MetalMirror<T> dataGpu(gpuData);
+      gpuSolver.factor(dataGpu.ptr());
+      dataGpu.get(gpuData);
+    }
+    Matrix<T> gpuMat = factorSkel.densify(gpuData);
+
+    T refNorm = Matrix<T>(eigenMat.template triangularView<Eigen::Lower>()).norm();
+
+    // Error: Metal GPU vs Eigen LLT
+    T gpuVsEigenErr =
+        Matrix<T>((eigenMat - gpuMat).template triangularView<Eigen::Lower>()).norm();
+    T gpuVsEigenRel = gpuVsEigenErr / std::max(refNorm, T(1e-30));
+
+    // Error: CPU BLAS vs Eigen LLT
+    T cpuVsEigenErr =
+        Matrix<T>((eigenMat - cpuMat).template triangularView<Eigen::Lower>()).norm();
+    T cpuVsEigenRel = cpuVsEigenErr / std::max(refNorm, T(1e-30));
+
+    // Error: Metal GPU vs CPU BLAS (same algorithm, different hardware)
+    T gpuVsCpuErr =
+        Matrix<T>((cpuMat - gpuMat).template triangularView<Eigen::Lower>()).norm();
+    T gpuVsCpuRel = gpuVsCpuErr / std::max(refNorm, T(1e-30));
+
+    // Find max element-wise difference between GPU and CPU BLAS
+    T maxElemDiff = 0;
+    int maxElemRow = 0, maxElemCol = 0;
+    for (int r = 0; r < order; r++) {
+      for (int c = 0; c <= r; c++) {
+        T diff = std::abs(gpuMat(r, c) - cpuMat(r, c));
+        if (diff > maxElemDiff) {
+          maxElemDiff = diff;
+          maxElemRow = r;
+          maxElemCol = c;
+        }
+      }
+    }
+
+    std::cout << "iter " << i << ": order=" << order << " lumps=" << numLumps
+              << " sparseElimEnd=" << sparseElimEnd
+              << "\n  GPU vs Eigen:  relErr=" << gpuVsEigenRel
+              << "\n  CPU vs Eigen:  relErr=" << cpuVsEigenRel
+              << "\n  GPU vs CPU:    relErr=" << gpuVsCpuRel
+              << " maxElem=" << maxElemDiff << " at (" << maxElemRow << "," << maxElemCol << ")"
+              << "\n";
+
+    if (gpuVsEigenRel > maxCombinedErr) {
+      maxCombinedErr = gpuVsEigenRel;
+      worstIteration = i;
+    }
+    maxMetalVsBlas = std::max(maxMetalVsBlas, gpuVsCpuRel);
+  }
+
+  std::cout << "\n=== SUMMARY ===\n"
+            << "Worst GPU vs Eigen relErr: " << maxCombinedErr << " (iter " << worstIteration << ")\n"
+            << "Worst GPU vs CPU relErr:   " << maxMetalVsBlas << "\n";
+
+  // Don't assert — this is purely diagnostic
+}
