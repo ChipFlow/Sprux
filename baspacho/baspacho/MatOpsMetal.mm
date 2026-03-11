@@ -2037,6 +2037,66 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     MetalContext::instance().synchronize();
   }
 
+  // Reset per-factorization mutable state without deallocating any buffers.
+  // Allows reusing this context across multiple factorLU calls.
+  void reset() override {
+    pendingGemms_.clear();
+    gemmWorkBufUsedBytes_ = 0;
+    gemmWorkBufInFlight_ = false;
+    cachedDataBuffer_ = nil;
+    cachedDataBaseOffset_ = 0;
+    allPivotsCpuBase_ = nullptr;
+    allPivotsCount_ = 0;
+    pivotsOnGpu_ = false;
+    perturbCountPending_ = false;
+    deferredElimPerturbCount_ = 0;
+    deferredElimPerturbBuf_ = nil;
+    assembleWasCalled_ = false;
+    potrfStatusPending_ = false;
+    // Buffers (tempBuffer, devSpanToChainOffset, devPivots, devAllPivots,
+    // devGemmWorkBuf_, perturbCountBuf_) are NOT freed — reused across calls.
+  }
+
+  // Pre-allocate all Metal buffers to max needed sizes so no allocation occurs
+  // during the hot factorization path. Required for streamable/external encoder mode.
+  void preAllocateForLU(int64_t maxDenseBlockSize, int64_t totalDensePivots) override {
+    if (maxDenseBlockSize <= 0) return;
+
+    // Pre-allocate pivot buffer for applyRowPerm
+    devPivots.resizeToAtLeast(maxDenseBlockSize);
+
+    // Pre-allocate the pivot output buffer (uint32_t for MPS)
+    devPivotBuf32.resizeToAtLeast(maxDenseBlockSize);
+
+    // Pre-allocate all-pivots buffer if needed
+    if (totalDensePivots > 0) {
+      devAllPivots.resizeToAtLeast(totalDensePivots);
+    }
+
+    // Pre-allocate perturbation counter buffer
+    if (!perturbCountBuf_) {
+      perturbCountBuf_ = [sym.device
+          newBufferWithLength:sizeof(uint32_t)
+                     options:MTLResourceStorageModeShared];
+      *(uint32_t*)[perturbCountBuf_ contents] = 0;
+    }
+  }
+
+  // Flush deferred pivot copies as device-to-device (keeps pivots on GPU).
+  // On Metal with unified memory, this is a simple memcpy between Metal buffer
+  // backing stores — both are CPU-accessible, so no D->H->D round-trip.
+  void flushDevicePivots(int64_t* devDstPivots) override {
+    flushPendingGemms();
+    if (pivotsOnGpu_ && allPivotsCount_ > 0) {
+      // On Metal unified memory, devAllPivots.ptr() and devDstPivots are both
+      // CPU-accessible pointers to Metal buffer backing stores.
+      memcpy(devDstPivots, devAllPivots.ptr(), allPivotsCount_ * sizeof(int64_t));
+      pivotsOnGpu_ = false;
+      allPivotsCpuBase_ = nullptr;
+      allPivotsCount_ = 0;
+    }
+  }
+
   int64_t deferredPerturbCount() override {
     // Read the accumulated GPU atomic counter (valid after flush/commitAndWait)
     int64_t count = 0;
@@ -2799,15 +2859,32 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Compute offset into pre-uploaded pivot buffer, or upload on-demand
+      // Determine pivot buffer and offset
+      id<MTLBuffer> pivotBuffer = nil;
       size_t pivotByteOffset = 0;
-      if (pivotsBase_ && pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+
+      if (externalDevPivots_ && pivotsBase_ &&
+          pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        // External device pivots: find the Metal buffer via registry
+        auto pivBufInfo = MetalBufferRegistry::instance().findBuffer(externalDevPivots_);
+        if (pivBufInfo.first) {
+          pivotBuffer = (__bridge id<MTLBuffer>)pivBufInfo.first;
+          pivotByteOffset = pivBufInfo.second + (pivots - pivotsBase_) * sizeof(int64_t);
+        }
+      }
+      if (!pivotBuffer && pivotsBase_ &&
+          pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        // Pre-uploaded pivots in devPivots
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
         pivotByteOffset = (pivots - pivotsBase_) * sizeof(int64_t);
-      } else {
+      }
+      if (!pivotBuffer) {
         // Fallback: no pre-upload, sync and copy per-call
         commitAndWait();
         devPivots.resizeToAtLeast(n);
         memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+        pivotByteOffset = 0;
       }
 
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
@@ -2824,7 +2901,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer()
+            [encoder setBuffer:pivotBuffer
                         offset:pivotByteOffset
                        atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
@@ -2842,15 +2919,32 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (n <= 0) return;
 
-      // Compute offset into pre-uploaded pivot buffer, or upload on-demand
+      // Determine pivot buffer and offset
+      id<MTLBuffer> pivotBuffer = nil;
       size_t pivotByteOffset = 0;
-      if (pivotsBase_ && pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+
+      if (externalDevPivots_ && pivotsBase_ &&
+          pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        // External device pivots: find the Metal buffer via registry
+        auto pivBufInfo = MetalBufferRegistry::instance().findBuffer(externalDevPivots_);
+        if (pivBufInfo.first) {
+          pivotBuffer = (__bridge id<MTLBuffer>)pivBufInfo.first;
+          pivotByteOffset = pivBufInfo.second + (pivots - pivotsBase_) * sizeof(int64_t);
+        }
+      }
+      if (!pivotBuffer && pivotsBase_ &&
+          pivots >= pivotsBase_ && pivots < pivotsBase_ + pivotsSize_) {
+        // Pre-uploaded pivots in devPivots
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
         pivotByteOffset = (pivots - pivotsBase_) * sizeof(int64_t);
-      } else {
+      }
+      if (!pivotBuffer) {
         // Fallback: no pre-upload, sync and copy per-call
         commitAndWait();
         devPivots.resizeToAtLeast(n);
         memcpy(devPivots.ptr(), pivots, n * sizeof(int64_t));
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+        pivotByteOffset = 0;
       }
 
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vec);
@@ -2867,7 +2961,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivots.buffer()
+            [encoder setBuffer:pivotBuffer
                         offset:pivotByteOffset
                        atIndex:0];
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
@@ -2920,12 +3014,34 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
   void flush() override { commitAndWait(); }
 
+  // Reset per-solve mutable state without deallocating any buffers.
+  // Allows reusing this context across multiple solveLU calls.
+  void reset() override {
+    pivotsBase_ = nullptr;
+    pivotsSize_ = 0;
+    externalDevPivots_ = nullptr;
+    // devPivots, tempVecBuffer are NOT freed — reused across calls.
+  }
+
+  // Point solve context at device-resident pivots (no H2D upload needed).
+  // Used when factorLU wrote pivots directly to device via flushDevicePivots.
+  // pivotsBase_ is set to devPivots so that offset computation works:
+  //   solveLU passes (devPivots + lumpStart[l]) to applyRowPermVec,
+  //   which computes offset = (devPivots + lumpStart[l]) - pivotsBase_ = lumpStart[l].
+  void useDevicePivots(const int64_t* devPivots_ext, int64_t totalSize) override {
+    (void)totalSize;
+    externalDevPivots_ = devPivots_ext;
+    pivotsBase_ = devPivots_ext;  // used for offset computation only
+    pivotsSize_ = totalSize;
+  }
+
   MetalSymbolicCtx& sym;
   int nRHS;
   MetalMirror<float> tempVecBuffer;
   MetalMirror<int64_t> devPivots;  // GPU buffer for LU pivots
   const int64_t* pivotsBase_ = nullptr;  // Base pointer of pre-uploaded pivots
   int64_t pivotsSize_ = 0;               // Size of pre-uploaded pivot buffer
+  const int64_t* externalDevPivots_ = nullptr;  // External device pivots (not owned)
 
   // Deferred sync state — batch multiple GPU dispatches into shared command buffers
   id<MTLCommandBuffer> pendingCmdBuf_ = nil;
