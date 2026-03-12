@@ -353,6 +353,170 @@ static vector<LUTimingResult> benchmarkLUMetal(
 
   return results;
 }
+// External encoder Metal benchmark: wraps factorLU in a single command buffer
+// via setExternalEncoder(). All kernel dispatches go into one encoder instead of
+// creating ~2500 separate command buffers. This should dramatically reduce
+// CPU→GPU scheduling overhead for small matrices.
+static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
+  if (matrices.empty()) return {};
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+
+  auto preproc = computeMaxTransversal(n, A0.rowPtr.data(), A0.colInd.data());
+
+  vector<int64_t> pRowPtr, pColInd;
+  vector<double> pValues;
+  applyRowPermToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                            preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+  SparseStructure ss = csrToSymmetricSparseStructure(n, pRowPtr.data(), pColInd.data());
+
+  vector<int64_t> paramSizes(n, 1);
+  vector<int64_t> blockSizes(n, 1);
+
+  Settings metalSettings;
+  metalSettings.backend = BackendMetal;
+  metalSettings.matrixType = MTYPE_GENERAL;
+  metalSettings.staticPivotThreshold = -1.0;  // disabled for external encoder
+
+  auto solver = createSolver(metalSettings, paramSizes, ss);
+  auto& symCtx = solver->internalSymbolicContext();
+
+  // Create persistent NumericCtx with pre-allocated buffers
+  auto numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
+  numCtx->preAllocateForLU(1, n);
+
+  // Recording pass: capture GemmWorkItem schedule (structure-dependent, done once)
+  {
+    MetalMirror<float> dummyData(vector<float>(solver->skel().totalDataSize(), 0.0f));
+    vector<int64_t> dummyPivots(n);
+    numCtx->beginRecording();
+    solver->factorLU(dummyData.ptr(), dummyPivots.data(), *numCtx);
+    numCtx->endRecording();
+  }
+
+  vector<float> data(solver->skel().totalDataSize());
+  vector<int64_t> pivots(n);
+  const auto& perm = solver->paramToSpan();
+
+  auto& metalCtx = MetalContext::instance();
+
+  vector<LUTimingResult> results;
+
+  for (size_t mi = 0; mi < matrices.size(); mi++) {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    LUTimingResult res;
+
+    applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                              preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+    vector<double> rowScale, colScale;
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale, colScale);
+
+    applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                                     preproc.rowPerm.data(), rowScale.data(), colScale.data(),
+                                     pRowPtr, pColInd, pValues);
+    vector<int64_t> sRowPtr = pRowPtr;
+    vector<int64_t> sColInd = pColInd;
+    vector<float> sValues(pValues.begin(), pValues.end());
+
+    fill(data.begin(), data.end(), 0.0f);
+    solver->loadFromCsr(sRowPtr.data(), sColInd.data(), blockSizes.data(), sValues.data(),
+                        data.data());
+
+    // Factor using external encoder: single command buffer
+    double factorTime;
+    {
+      MetalMirror<float> dataGpu(data);
+
+      numCtx->reset();
+      auto tFactor = Clock::now();
+
+      // Create single command buffer + encoder
+      void* cmdBuf = metalCtx.createCommandBuffer();
+      void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+
+      // Set external encoder — all kernel dispatches go into this encoder
+      symCtx.setExternalEncoder(cmdBuf, encoder);
+      solver->factorLU(dataGpu.ptr(), pivots.data(), *numCtx);
+      symCtx.clearExternalEncoder();
+
+      // End encoder, commit + wait
+      metalCtx.endEncoding(encoder);
+      metalCtx.commitAndWait(cmdBuf);
+
+      // Flush deferred GPU state (copies pivots from devAllPivots to host)
+      numCtx->flush();
+
+      factorTime = tdelta(Clock::now() - tFactor).count();
+      dataGpu.get(data);
+    }
+    res.factorTime = factorTime;
+    res.perturbCount = 0;
+
+    // Solve (still normal mode for now)
+    Eigen::VectorXf bp(n);
+    for (int64_t j = 0; j < n; j++) {
+      bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
+    }
+
+    MetalMirror<float> dataGpu(data);
+    MetalMirror<float> xGpu;
+    vector<float> xVec(n);
+
+    auto tSolve = Clock::now();
+    xGpu.load(vector<float>(bp.data(), bp.data() + n));
+    solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+    xGpu.get(xVec);
+    for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+
+    Eigen::VectorXd x(n);
+    for (int64_t j = 0; j < n; j++) {
+      x(j) = colScale[j] * double(bp(perm[j]));
+    }
+
+    double residual = computeResidualDouble(A, x, b);
+    res.refineSteps = 0;
+    const int maxRefine = 30;
+    for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
+      Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+      for (int64_t i = 0; i < n; i++) {
+        for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
+          r(i) += A.values[k] * x(A.colInd[k]);
+        }
+      }
+      r = b - r;
+
+      for (int64_t j = 0; j < n; j++) {
+        bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
+      }
+      xGpu.load(vector<float>(bp.data(), bp.data() + n));
+      solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
+      xGpu.get(xVec);
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+
+      for (int64_t j = 0; j < n; j++) {
+        x(j) += colScale[j] * double(bp(perm[j]));
+      }
+      residual = computeResidualDouble(A, x, b);
+      res.refineSteps++;
+    }
+    res.solveTime = tdelta(Clock::now() - tSolve).count();
+    res.residual = residual;
+
+    if (verbose) {
+      cout << "  [MetalExt] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
+           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+           << setprecision(2) << res.residual << ", refine=" << res.refineSteps << endl;
+    }
+
+    results.push_back(res);
+  }
+
+  return results;
+}
+
 // Pipelined Metal benchmark: overlaps GPU sparse elimination with CPU solve.
 // Uses MTLSharedEvent (inside NumericCtx) as sync points between phases.
 // Double-buffers GPU data via MetalMirror (unified memory — no redundant copies).
@@ -936,6 +1100,7 @@ void help() {
        << "  BaSpaCho_LU_CPU\n"
 #ifdef BASPACHO_USE_METAL
        << "  BaSpaCho_LU_Metal\n"
+       << "  BaSpaCho_LU_MetalExt   (external encoder: single command buffer)\n"
        << "  BaSpaCho_LU_MetalPipe  (pipelined: overlap N+1 sparse elim with N solve)\n"
 #endif
 #ifdef BASPACHO_USE_CUBLAS
@@ -1149,6 +1314,18 @@ int main(int argc, char* argv[]) {
 
     resultToRecords(problemName, "BaSpaCho_LU_Metal", timings, allRecords);
     if (!jsonOutput) printResults("BaSpaCho_LU_Metal", timings);
+  }
+
+  if (regex_search(string("BaSpaCho_LU_MetalExt"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_MetalExt (external encoder)..." << endl;
+    auto timings = benchmarkLUMetalExternalEncoder(matrices, verbose);
+
+    if (isWarmup && timings.size() > 1) {
+      timings.erase(timings.begin());
+    }
+
+    resultToRecords(problemName, "BaSpaCho_LU_MetalExt", timings, allRecords);
+    if (!jsonOutput) printResults("BaSpaCho_LU_MetalExt", timings);
   }
 
   if (regex_search(string("BaSpaCho_LU_MetalPipe"), selectSolvers)) {

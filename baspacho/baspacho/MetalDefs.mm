@@ -136,6 +136,36 @@ void* MetalContext::getPipelineState(const char* functionName) {
   return (__bridge void*)impl->getPipelineState(functionName);
 }
 
+void* MetalContext::createCommandBuffer() {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
+    return (__bridge_retained void*)cmdBuf;
+  }
+}
+
+void* MetalContext::createComputeEncoder(void* cmdBuf) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cmdBuf;
+    id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+    return (__bridge_retained void*)encoder;
+  }
+}
+
+void MetalContext::endEncoding(void* encoder) {
+  @autoreleasepool {
+    id<MTLComputeCommandEncoder> enc = (__bridge_transfer id<MTLComputeCommandEncoder>)encoder;
+    [enc endEncoding];
+  }
+}
+
+void MetalContext::commitAndWait(void* cmdBuf) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>)cmdBuf;
+    [cb commit];
+    [cb waitUntilCompleted];
+  }
+}
+
 bool MetalContext::beginCapture(const char* outputPath) {
   @autoreleasepool {
     MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];

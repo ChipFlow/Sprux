@@ -90,6 +90,13 @@ class MetalContext {
   // Get a compute pipeline state for a kernel function
   void* getPipelineState(const char* functionName);  // Returns id<MTLComputePipelineState>
 
+  // Command buffer helpers (for external encoder mode from C++ code).
+  // All return void* to avoid Objective-C types in the header.
+  void* createCommandBuffer();                  // Returns id<MTLCommandBuffer>
+  void* createComputeEncoder(void* cmdBuf);     // Returns id<MTLComputeCommandEncoder>
+  void endEncoding(void* encoder);              // [encoder endEncoding]
+  void commitAndWait(void* cmdBuf);             // [cmdBuf commit]; [cmdBuf waitUntilCompleted]
+
   // GPU trace capture (for profiling)
   // Set METAL_CAPTURE_ENABLED=1 env var, then call begin/endCapture
   // Writes a .gputrace file that can be opened in Xcode for full GPU timeline

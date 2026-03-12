@@ -2210,18 +2210,39 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   void flush() override {
     flushPendingGemms();
     if (explicitRecording_) return;  // skip pivot copies during recording
-    commitAndWait();
+
+    if (!sym.usingExternalEncoder) {
+      // Normal mode: commit pending work and wait for GPU to finish.
+      // waitForGpu() calls flushDeferredState() to copy pivots to host.
+      commitAndWait();
+    } else {
+      // External encoder mode: GPU work not committed yet. Skip pivot copy.
+      // Caller must call flush() again AFTER committing the command buffer
+      // and clearing the external encoder, to trigger the pivot copy below.
+    }
+
+    // Copy deferred GPU pivots to host. Safe to call in both modes:
+    // - Normal mode: GPU work completed above, data is valid
+    // - External encoder mode: this is a no-op because pivotsOnGpu_ is true
+    //   but the GPU hasn't run yet, UNLESS external encoder was already cleared
+    //   (post-commit call) in which case data IS valid
+    if (!sym.usingExternalEncoder) {
+      flushDeferredState();
+    }
 
     // Reset batched state for next factorization
     cachedDataBuffer_ = nil;
     cachedDataBaseOffset_ = 0;
-    // Reset append-only GEMM work buffer for next factorization
     gemmWorkBufUsedBytes_ = 0;
     gemmWorkBufInFlight_ = false;
-    // Reset pivot state for next factorization
-    allPivotsCpuBase_ = nullptr;
-    allPivotsCount_ = 0;
-    MetalContext::instance().synchronize();
+
+    if (!sym.usingExternalEncoder) {
+      // Only reset pivot state if NOT in external encoder mode — the caller
+      // will need to flush pivots after committing the external command buffer.
+      allPivotsCpuBase_ = nullptr;
+      allPivotsCount_ = 0;
+      MetalContext::instance().synchronize();
+    }
   }
 
   // Reset per-factorization mutable state without deallocating any buffers.
