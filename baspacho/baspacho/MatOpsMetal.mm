@@ -1786,101 +1786,162 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
-      // Ensure devPivots is large enough for this lump's pivots
-      devPivots.resizeToAtLeast(minMN);
-
-      // MPS LU factorization on GPU for all sizes.
       // Flush pending saveGemm work items first — ensures all Schur
       // complement updates are dispatched before factorization of this lump.
       flushPendingGemms();
 
-      // End pending compute encoder (MPS needs its own encoding)
-      if (pendingEncoder_) {
-        [pendingEncoder_ endEncoding];
-        pendingEncoder_ = nil;
-      }
-
-      // Ensure we have a command buffer
-      if (!pendingCmdBuf_) {
-        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
-      }
-
-      // Create MPSMatrix view for the block at data+offA (row-major, m×n, stride=n)
-      MPSMatrixDescriptor* descA = [MPSMatrixDescriptor
-          matrixDescriptorWithRows:m columns:n
-          rowBytes:n * sizeof(float) dataType:MPSDataTypeFloat32];
-      MPSMatrix* mpsA = [[MPSMatrix alloc]
-          initWithBuffer:dataBuffer
-          offset:dataBaseOffset + offA * sizeof(float)
-          descriptor:descA];
-
-      // Pivot buffer (UInt32 format required by MPS)
-      devPivotBuf32.resizeToAtLeast(minMN);
-      MPSMatrixDescriptor* descPiv = [MPSMatrixDescriptor
-          matrixDescriptorWithRows:1 columns:minMN
-          rowBytes:minMN * sizeof(uint32_t) dataType:MPSDataTypeUInt32];
-      MPSMatrix* mpsPiv = [[MPSMatrix alloc]
-          initWithBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
-          offset:0 descriptor:descPiv];
-
-      // Encode MPS LU factorization (in-place: resultMatrix = sourceMatrix)
-      MPSMatrixDecompositionLU* mpsLU = [[MPSMatrixDecompositionLU alloc]
-          initWithDevice:sym.device rows:m columns:n];
-      [mpsLU encodeToCommandBuffer:pendingCmdBuf_
-          sourceMatrix:mpsA resultMatrix:mpsA
-          pivotIndices:mpsPiv status:nil];
-
-      // When profiling, commit and wait to get per-getrf GPU timestamps
-      if (metalProfilingEnabled()) {
-        [pendingCmdBuf_ commit];
-        [pendingCmdBuf_ waitUntilCompleted];
-        double gpuTimeMs = ([pendingCmdBuf_ GPUEndTime] - [pendingCmdBuf_ GPUStartTime]) * 1000.0;
-        NSLog(@"[GPU] %-45s  size=%lldx%lld  gpu=%.3fms",
-              "MPS_LU_getrf", m, n, gpuTimeMs);
-        pendingCmdBuf_ = nil;
-      }
-
-      // GPU-resident pivot path: for general (LU) matrices with pre-allocated
-      // devAllPivots, encode a GPU-side uint32→int64 conversion kernel and
-      // keep pivots on GPU. For non-general matrices (e.g. simple LU tests),
-      // fall back to CPU conversion with commitAndWait.
-      if (devAllPivots.buffer()) {
-        // Compute offset into the persistent all-pivots buffer.
-        if (!allPivotsCpuBase_) {
-          allPivotsCpuBase_ = pivots;  // First getrf call — record base
-        }
-        int64_t pivotOffset = pivots - allPivotsCpuBase_;
-        allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
-
-        // Encode GPU-side pivot conversion (uint32→int64) into the same cmd buffer.
-        int64_t pivotByteOffset = pivotOffset * sizeof(int64_t);
-        id<MTLComputePipelineState> convertPipeline = getProfiledPipeline(
-                "lu_convertPivots_kernel_float");
-        encodeKernel(
-            convertPipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
-                          offset:0 atIndex:0];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
-                          offset:pivotByteOffset atIndex:1];
-              [encoder setBytes:&minMN length:sizeof(int64_t) atIndex:2];
-            },
-            (NSUInteger)minMN);
-
-        // Mark pivots as GPU-resident — applyRowPerm will skip memcpy.
-        pivotsOnGpu_ = true;
+      // External encoder mode: use custom compute kernel (encodeKernel-compatible).
+      // MPS encodeToCommandBuffer is incompatible with external encoder.
+      // Normal mode: use MPS for better performance on larger blocks.
+      if (sym.usingExternalEncoder) {
+        return getrfCustomKernel(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
       } else {
-        // Fallback: non-general matrix, commit and read pivots on CPU
-        commitPending();
-        waitForGpu();
-        uint32_t* mpsPivots = devPivotBuf32.ptr();
-        for (int64_t i = 0; i < minMN; i++) {
-          pivots[i] = static_cast<int64_t>(mpsPivots[i]);
-        }
+        return getrfMPS(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
       }
-
-      return 0;
     }
+  }
+
+  // Custom compute kernel for LU factorization — external encoder compatible.
+  // Single-threaded sequential LU with partial pivoting on GPU.
+  // Outputs int64_t pivots directly — no uint32→int64 conversion needed.
+  int getrfCustomKernel(int64_t m, int64_t n, int64_t minMN,
+                        id<MTLBuffer> dataBuffer, size_t dataBaseOffset,
+                        int64_t offA, int64_t* pivots) {
+    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+            "lu_getrf_kernel_float");
+
+    // Compute absolute offset from buffer start (element offset)
+    int64_t absOffA = (int64_t)(dataBaseOffset / sizeof(float)) + offA;
+
+    // Determine pivot output buffer and offset
+    id<MTLBuffer> pivotBuffer;
+    size_t pivotByteOffset = 0;
+    if (devAllPivots.buffer()) {
+      // GPU-resident pivot path: write directly into persistent devAllPivots
+      if (!allPivotsCpuBase_) {
+        allPivotsCpuBase_ = pivots;
+      }
+      int64_t pivotElemOffset = pivots - allPivotsCpuBase_;
+      allPivotsCount_ = std::max(allPivotsCount_, pivotElemOffset + minMN);
+      pivotBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
+      pivotByteOffset = pivotElemOffset * sizeof(int64_t);
+      pivotsOnGpu_ = true;
+    } else {
+      devPivots.resizeToAtLeast(minMN);
+      pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+      pivotByteOffset = 0;
+    }
+
+    encodeKernel(
+        pipeline,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:dataBuffer offset:0 atIndex:0];
+          [encoder setBytes:&absOffA length:sizeof(int64_t) atIndex:1];
+          [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
+          [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
+          [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:4];
+        },
+        1);
+
+    if (!devAllPivots.buffer()) {
+      // Non-general fallback: commit and read pivots back to CPU
+      commitPending();
+      waitForGpu();
+      int64_t* gpuPivots = devPivots.ptr();
+      for (int64_t i = 0; i < minMN; i++) {
+        pivots[i] = gpuPivots[i];
+      }
+    }
+
+    return 0;
+  }
+
+  // MPS-based LU factorization — faster for normal mode but incompatible
+  // with external encoder (MPS requires encodeToCommandBuffer, not compute encoder).
+  int getrfMPS(int64_t m, int64_t n, int64_t minMN,
+               id<MTLBuffer> dataBuffer, size_t dataBaseOffset,
+               int64_t offA, int64_t* pivots) {
+    // End pending compute encoder (MPS needs its own encoding)
+    if (pendingEncoder_) {
+      [pendingEncoder_ endEncoding];
+      pendingEncoder_ = nil;
+    }
+
+    // Ensure we have a command buffer
+    if (!pendingCmdBuf_) {
+      pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+    }
+
+    // Create MPSMatrix view for the block at data+offA (row-major, m×n, stride=n)
+    MPSMatrixDescriptor* descA = [MPSMatrixDescriptor
+        matrixDescriptorWithRows:m columns:n
+        rowBytes:n * sizeof(float) dataType:MPSDataTypeFloat32];
+    MPSMatrix* mpsA = [[MPSMatrix alloc]
+        initWithBuffer:dataBuffer
+        offset:dataBaseOffset + offA * sizeof(float)
+        descriptor:descA];
+
+    // Pivot buffer (UInt32 format required by MPS)
+    devPivotBuf32.resizeToAtLeast(minMN);
+    MPSMatrixDescriptor* descPiv = [MPSMatrixDescriptor
+        matrixDescriptorWithRows:1 columns:minMN
+        rowBytes:minMN * sizeof(uint32_t) dataType:MPSDataTypeUInt32];
+    MPSMatrix* mpsPiv = [[MPSMatrix alloc]
+        initWithBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
+        offset:0 descriptor:descPiv];
+
+    // Encode MPS LU factorization (in-place: resultMatrix = sourceMatrix)
+    MPSMatrixDecompositionLU* mpsLU = [[MPSMatrixDecompositionLU alloc]
+        initWithDevice:sym.device rows:m columns:n];
+    [mpsLU encodeToCommandBuffer:pendingCmdBuf_
+        sourceMatrix:mpsA resultMatrix:mpsA
+        pivotIndices:mpsPiv status:nil];
+
+    // When profiling, commit and wait to get per-getrf GPU timestamps
+    if (metalProfilingEnabled()) {
+      [pendingCmdBuf_ commit];
+      [pendingCmdBuf_ waitUntilCompleted];
+      double gpuTimeMs = ([pendingCmdBuf_ GPUEndTime] - [pendingCmdBuf_ GPUStartTime]) * 1000.0;
+      NSLog(@"[GPU] %-45s  size=%lldx%lld  gpu=%.3fms",
+            "MPS_LU_getrf", m, n, gpuTimeMs);
+      pendingCmdBuf_ = nil;
+    }
+
+    // GPU-resident pivot path: encode GPU-side uint32→int64 conversion
+    // and keep pivots on device. Non-general matrices fall back to CPU.
+    if (devAllPivots.buffer()) {
+      if (!allPivotsCpuBase_) {
+        allPivotsCpuBase_ = pivots;
+      }
+      int64_t pivotOffset = pivots - allPivotsCpuBase_;
+      allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
+
+      int64_t pivotByteOffset = pivotOffset * sizeof(int64_t);
+      id<MTLComputePipelineState> convertPipeline = getProfiledPipeline(
+              "lu_convertPivots_kernel_float");
+      encodeKernel(
+          convertPipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
+                        offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
+                        offset:pivotByteOffset atIndex:1];
+            [encoder setBytes:&minMN length:sizeof(int64_t) atIndex:2];
+          },
+          (NSUInteger)minMN);
+
+      pivotsOnGpu_ = true;
+    } else {
+      // Fallback: non-general matrix, commit and read pivots on CPU
+      commitPending();
+      waitForGpu();
+      uint32_t* mpsPivots = devPivotBuf32.ptr();
+      for (int64_t i = 0; i < minMN; i++) {
+        pivots[i] = static_cast<int64_t>(mpsPivots[i]);
+      }
+    }
+
+    return 0;
   }
 
   virtual void trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL, float* B,
