@@ -1134,6 +1134,25 @@ kernel void lu_batchedSaveGemm_kernel_float(
     }
 }
 
+// prepareAssemble: GPU kernel that replaces CPU loop + memcpy.
+// Reads device-resident skeleton arrays (chainColPtr, chainRowSpan, chainData)
+// and writes spanToChainOffset[chainRowSpan[i]] = chainData[i] for all chain
+// entries of the target lump. One thread per chain entry.
+kernel void prepareAssemble_kernel_float(
+    constant int64_t* chainColPtr [[buffer(0)]],
+    constant int64_t* chainRowSpan [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    device int64_t* spanToChainOffset [[buffer(3)]],
+    constant int64_t& targetLump [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t start = chainColPtr[targetLump];
+    int64_t end = chainColPtr[targetLump + 1];
+    if (int64_t(tid) >= end - start) return;
+    int64_t i = start + int64_t(tid);
+    spanToChainOffset[chainRowSpan[i]] = chainData[i];
+}
+
 // saveGemm: C -= L * U (all row-major with strides)
 kernel void lu_saveGemm_kernel_float(
     constant float* L [[buffer(0)]],

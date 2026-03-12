@@ -687,6 +687,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   // Signal start of dense LU operations — wait for deferred sparse elim GPU work.
   void beginDenseOps(float* data, int64_t totalDataSize) override {
+    if (recordingMode_) return;  // no-op during recording
     (void)data;
     (void)totalDataSize;
     waitForGpu();
@@ -706,6 +707,46 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // devGemmWorkBuf_, avoiding the need to wait for GPU to finish reading
   // previous data. Buffer reset happens at flush() time between factorizations.
   void flushPendingGemms() {
+    if (recordingMode_) {
+      // Recording mode: record flush point, skip GPU work
+      if (recordingBatchCount_ > 0) {
+        size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+        recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+        recordingBatchCount_ = 0;
+      }
+      pendingGemms_.clear();
+      return;
+    }
+
+    if (usePrecomputed_) {
+      // Pre-computed mode: dispatch from device-resident items
+      if (precomputedFlushIdx_ >= recordedFlushPoints_.size()) return;
+      auto [startIdx, count] = recordedFlushPoints_[precomputedFlushIdx_];
+      precomputedFlushIdx_++;
+      if (count == 0) return;
+
+      // Byte offset into pre-computed buffer (MetalMirror backing is already aligned)
+      size_t byteOffset = startIdx * sizeof(LUGemmWorkItem);
+
+      int64_t countI64 = (int64_t)count;
+
+      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+              "lu_batchedSaveGemm_kernel_float");
+
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:cachedDataBuffer_ offset:0 atIndex:0];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)devPrecomputedItems_.buffer()
+                        offset:byteOffset
+                       atIndex:1];
+            [encoder setBytes:&countI64 length:sizeof(int64_t) atIndex:2];
+          },
+          (NSUInteger)count);
+      pendingGemms_.clear();
+      return;
+    }
+
     if (pendingGemms_.empty()) return;
 
     int64_t count = (int64_t)pendingGemms_.size();
@@ -756,6 +797,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void pseudoFactorSpans(float* data, int64_t spanBegin, int64_t spanEnd) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -805,6 +847,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void doElimination(const SymElimCtx& elimData, float* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
@@ -903,6 +946,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void doEliminationLU(const SymElimCtx& elimData, float* data, int64_t lumpsBegin,
                                int64_t lumpsEnd, float staticPivotThreshold,
                                int64_t& perturbCount) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
@@ -1018,6 +1062,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                            const std::vector<int64_t>& ranges, float* data,
                            float staticPivotThreshold,
                            int64_t& totalPerturbCount) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1160,6 +1205,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   //   Phase 2: segmented sum per target in fixed order (deterministic)
   void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
                          const std::vector<int64_t>& ranges, float* data) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1286,6 +1332,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual double maxAbsDiag(const float* data, const int64_t* lumpStart, const int64_t* chainColPtr,
                             const int64_t* chainData, int64_t startLump, int64_t upToLump) override {
+    if (recordingMode_) return 0.0;
     @autoreleasepool {
       int64_t numLumps = upToLump - startLump;
       if (numLumps <= 0) return 0.0;
@@ -1332,6 +1379,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (n <= 0) return;
 
@@ -1387,6 +1435,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
@@ -1449,6 +1498,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                             int64_t offset) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
@@ -1528,6 +1578,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
+    if (recordingMode_) return;  // no-op during recording
+
     // Only flush if assemble() was actually called since last prepareAssemble.
     // For LU factorization (isGeneral()==true), eliminateBoardLU only calls
     // saveGemm — never assemble — so flushing is unnecessary and avoiding it
@@ -1537,22 +1589,36 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       assembleWasCalled_ = false;
     }
 
-    // Prepare chain offset mapping for assembly (same as CUDA version)
+    // GPU kernel: reads device-resident skeleton arrays, writes devSpanToChainOffset.
+    // All inputs (devChainColPtr, devChainRowSpan, devChainData) are already on device
+    // in MetalSymbolicCtx. No CPU loop, no memcpy — eliminates CPU→GPU sync point.
     const CoalescedBlockMatrixSkel& skel = sym.skel;
+    int64_t numEntries = skel.chainColPtr[targetLump + 1] - skel.chainColPtr[targetLump];
+    if (numEntries <= 0) return;
 
-    for (int64_t i = skel.chainColPtr[targetLump], iEnd = skel.chainColPtr[targetLump + 1]; i < iEnd;
-         i++) {
-      spanToChainOffset[skel.chainRowSpan[i]] = skel.chainData[i];
-    }
+    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+            "prepareAssemble_kernel_float");
 
-    // Copy to device
-    memcpy(devSpanToChainOffset.ptr(), spanToChainOffset.data(),
-           spanToChainOffset.size() * sizeof(int64_t));
+    encodeKernel(
+        pipeline,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                      offset:0 atIndex:0];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                      offset:0 atIndex:1];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                      offset:0 atIndex:2];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)devSpanToChainOffset.buffer()
+                      offset:0 atIndex:3];
+          [encoder setBytes:&targetLump length:sizeof(int64_t) atIndex:4];
+        },
+        (NSUInteger)numEntries);
   }
 
   virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
                         int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
                         int64_t numBlockCols) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
@@ -1636,6 +1702,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // CPU path for dense ops, GPU path for deferred execution.
   virtual int64_t perturbSmallDiagonals(int64_t n, float* data, int64_t offset, int64_t stride,
                                         float threshold) override {
+    if (recordingMode_) return 0;
     @autoreleasepool {
       if (n <= 0) return 0;
 
@@ -1695,6 +1762,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // ============ LU factorization methods ============
 
   virtual int getrf(int64_t m, int64_t n, float* data, int64_t offA, int64_t* pivots) override {
+    if (recordingMode_) { flushPendingGemms(); return 0; }
     @autoreleasepool {
       if (m <= 0 || n <= 0) return 0;
 
@@ -1807,6 +1875,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL, float* B,
                               int64_t offB, int64_t ldb) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
@@ -1857,6 +1926,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU, float* B,
                                int64_t offB, int64_t ldb) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
@@ -1977,6 +2047,18 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       item.n = n;
       item.k = k;
 
+      if (recordingMode_) {
+        recordedItems_.push_back(item);
+        recordingBatchCount_++;
+        sym.luGemmCalls++;
+        return;
+      }
+      if (usePrecomputed_) {
+        // Items already on device — dispatched from pre-computed buffer in flushPendingGemms
+        sym.luGemmCalls++;
+        return;
+      }
+
       pendingGemms_.push_back(item);
       sym.luGemmCalls++;
     }
@@ -1984,6 +2066,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData, int64_t ld,
                              int64_t numCols) override {
+    if (recordingMode_) return;
     @autoreleasepool {
       if (n <= 0 || numCols <= 0) return;
 
@@ -2048,6 +2131,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   void flush() override {
+    flushPendingGemms();
+    if (recordingMode_) return;  // skip pivot copies during recording
     commitAndWait();
 
     // Reset batched state for next factorization
@@ -2078,8 +2163,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     deferredElimPerturbBuf_ = nil;
     assembleWasCalled_ = false;
     potrfStatusPending_ = false;
+    // Reset pre-computed dispatch index (buffers persist across calls)
+    if (usePrecomputed_) {
+      precomputedFlushIdx_ = 0;
+    }
     // Buffers (tempBuffer, devSpanToChainOffset, devPivots, devAllPivots,
-    // devGemmWorkBuf_, perturbCountBuf_) are NOT freed — reused across calls.
+    // devGemmWorkBuf_, perturbCountBuf_, devPrecomputedItems_) are NOT freed — reused across calls.
   }
 
   // Pre-allocate all Metal buffers to max needed sizes so no allocation occurs
@@ -2112,6 +2201,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // backing stores — both are CPU-accessible, so no D->H->D round-trip.
   void flushDevicePivots(int64_t* devDstPivots) override {
     flushPendingGemms();
+    if (recordingMode_) return;
     if (pivotsOnGpu_ && allPivotsCount_ > 0) {
       // On Metal unified memory, devAllPivots.ptr() and devDstPivots are both
       // CPU-accessible pointers to Metal buffer backing stores.
@@ -2123,6 +2213,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   int64_t deferredPerturbCount() override {
+    if (recordingMode_) return 0;
     // Read the accumulated GPU atomic counter (valid after flush/commitAndWait)
     int64_t count = 0;
     if (perturbCountPending_ && perturbCountBuf_) {
@@ -2135,6 +2226,43 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     count += deferredElimPerturbCount_;
     deferredElimPerturbCount_ = 0;
     return count;
+  }
+
+  // ============ Recording mode API ============
+
+  void beginRecording() override {
+    recordingMode_ = true;
+    recordedItems_.clear();
+    recordedFlushPoints_.clear();
+    recordingBatchCount_ = 0;
+  }
+
+  void endRecording() override {
+    // Flush any remaining batch
+    if (recordingBatchCount_ > 0) {
+      size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+      recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+      recordingBatchCount_ = 0;
+    }
+
+    recordingMode_ = false;
+    totalPrecomputedItems_ = recordedItems_.size();
+
+    if (totalPrecomputedItems_ > 0) {
+      // Upload all recorded items to device (single memcpy at init time).
+      // On Metal unified memory this is fast — just a CPU write to shared buffer.
+      size_t bytes = totalPrecomputedItems_ * sizeof(LUGemmWorkItem);
+      size_t int64sNeeded = (bytes + sizeof(int64_t) - 1) / sizeof(int64_t);
+      devPrecomputedItems_.resizeToAtLeast(int64sNeeded);
+      memcpy(devPrecomputedItems_.ptr(), recordedItems_.data(), bytes);
+    }
+
+    usePrecomputed_ = true;
+    precomputedFlushIdx_ = 0;
+
+    // Free host recording buffers (data is now on device)
+    recordedItems_.clear();
+    recordedItems_.shrink_to_fit();
   }
 
   MetalSymbolicCtx& sym;
@@ -2184,6 +2312,20 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   // Scratch buffer for two-phase deterministic sparse elimination
   MetalMirror<float> elimScratchBuffer;
+
+  // ============ Recording mode for pre-computed GemmWorkItems ============
+  // During recording: capture all LUGemmWorkItems and flush boundaries.
+  // After endRecording(): dispatch from pre-computed device buffers.
+  // This eliminates per-lump CPU memcpy in flushPendingGemms.
+  bool recordingMode_ = false;
+  std::vector<LUGemmWorkItem> recordedItems_;          // all items across all flushes
+  std::vector<std::pair<size_t, size_t>> recordedFlushPoints_;  // (startIdx, count) per flush
+  size_t recordingBatchCount_ = 0;                     // items in current batch
+
+  bool usePrecomputed_ = false;
+  MetalMirror<int64_t> devPrecomputedItems_;           // LUGemmWorkItems on device (as int64_t for MetalMirror)
+  size_t precomputedFlushIdx_ = 0;                     // current flush point index during dispatch
+  size_t totalPrecomputedItems_ = 0;                   // total items for bounds checking
 
 };
 
