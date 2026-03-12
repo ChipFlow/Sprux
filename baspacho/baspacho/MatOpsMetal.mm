@@ -687,7 +687,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   // Signal start of dense LU operations — wait for deferred sparse elim GPU work.
   void beginDenseOps(float* data, int64_t totalDataSize) override {
-    if (recordingMode_) return;  // no-op during recording
+    if (explicitRecording_) return;  // no-op during explicit recording
     (void)data;
     (void)totalDataSize;
     waitForGpu();
@@ -707,8 +707,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // devGemmWorkBuf_, avoiding the need to wait for GPU to finish reading
   // previous data. Buffer reset happens at flush() time between factorizations.
   void flushPendingGemms() {
-    if (recordingMode_) {
-      // Recording mode: record flush point, skip GPU work
+    if (explicitRecording_) {
+      // Explicit recording mode (for graph capture): record flush point, skip GPU work
       if (recordingBatchCount_ > 0) {
         size_t startIdx = recordedItems_.size() - recordingBatchCount_;
         recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
@@ -718,7 +718,17 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       return;
     }
 
-    if (usePrecomputed_) {
+    if (recordState_ == RecordState::Recording) {
+      // Auto-recording: record flush point, then fall through to normal execution
+      if (recordingBatchCount_ > 0) {
+        size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+        recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+        recordingBatchCount_ = 0;
+      }
+      // Fall through to normal dispatch below
+    }
+
+    if (recordState_ == RecordState::Ready) {
       // Pre-computed mode: dispatch from device-resident items
       if (precomputedFlushIdx_ >= recordedFlushPoints_.size()) return;
       auto [startIdx, count] = recordedFlushPoints_[precomputedFlushIdx_];
@@ -797,7 +807,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void pseudoFactorSpans(float* data, int64_t spanBegin, int64_t spanEnd) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       // Find the MTLBuffer for data
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -847,7 +857,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void doElimination(const SymElimCtx& elimData, float* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
@@ -946,7 +956,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void doEliminationLU(const SymElimCtx& elimData, float* data, int64_t lumpsBegin,
                                int64_t lumpsEnd, float staticPivotThreshold,
                                int64_t& perturbCount) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
       BASPACHO_CHECK_NOTNULL(pElim);
@@ -1062,7 +1072,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                            const std::vector<int64_t>& ranges, float* data,
                            float staticPivotThreshold,
                            int64_t& totalPerturbCount) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1205,7 +1215,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   //   Phase 2: segmented sum per target in fixed order (deterministic)
   void doAllEliminations(const std::vector<SymElimCtxPtr>& elimCtxs,
                          const std::vector<int64_t>& ranges, float* data) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
@@ -1332,7 +1342,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual double maxAbsDiag(const float* data, const int64_t* lumpStart, const int64_t* chainColPtr,
                             const int64_t* chainData, int64_t startLump, int64_t upToLump) override {
-    if (recordingMode_) return 0.0;
+    if (explicitRecording_) return 0.0;
     @autoreleasepool {
       int64_t numLumps = upToLump - startLump;
       if (numLumps <= 0) return 0.0;
@@ -1379,7 +1389,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void potrf(int64_t n, float* data, int64_t offA) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (n <= 0) return;
 
@@ -1435,7 +1445,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void trsm(int64_t n, int64_t k, float* data, int64_t offA, int64_t offB) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (n <= 0 || k <= 0) return;
 
@@ -1498,7 +1508,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                             int64_t offset) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
@@ -1578,7 +1588,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   virtual void prepareAssemble(int64_t targetLump) override {
-    if (recordingMode_) return;  // no-op during recording
+    if (explicitRecording_) return;  // no-op during recording
 
     // Only flush if assemble() was actually called since last prepareAssemble.
     // For LU factorization (isGeneral()==true), eliminateBoardLU only calls
@@ -1618,7 +1628,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void assemble(float* data, int64_t rectRowBegin, int64_t dstStride,
                         int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
                         int64_t numBlockCols) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (numBlockRows <= 0 || numBlockCols <= 0) return;
       assembleWasCalled_ = true;
@@ -1702,7 +1712,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // CPU path for dense ops, GPU path for deferred execution.
   virtual int64_t perturbSmallDiagonals(int64_t n, float* data, int64_t offset, int64_t stride,
                                         float threshold) override {
-    if (recordingMode_) return 0;
+    if (explicitRecording_) return 0;
     @autoreleasepool {
       if (n <= 0) return 0;
 
@@ -1762,7 +1772,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // ============ LU factorization methods ============
 
   virtual int getrf(int64_t m, int64_t n, float* data, int64_t offA, int64_t* pivots) override {
-    if (recordingMode_) { flushPendingGemms(); return 0; }
+    if (explicitRecording_) { flushPendingGemms(); return 0; }
     @autoreleasepool {
       if (m <= 0 || n <= 0) return 0;
 
@@ -1875,7 +1885,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL, float* B,
                               int64_t offB, int64_t ldb) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
@@ -1926,7 +1936,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU, float* B,
                                int64_t offB, int64_t ldb) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (m <= 0 || n <= 0) return;
 
@@ -2047,13 +2057,19 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       item.n = n;
       item.k = k;
 
-      if (recordingMode_) {
+      if (explicitRecording_) {
+        // Explicit recording: capture item, skip GPU work
         recordedItems_.push_back(item);
         recordingBatchCount_++;
         sym.luGemmCalls++;
         return;
       }
-      if (usePrecomputed_) {
+      if (recordState_ == RecordState::Recording) {
+        // Auto-recording: capture item AND fall through to normal execution
+        recordedItems_.push_back(item);
+        recordingBatchCount_++;
+      }
+      if (recordState_ == RecordState::Ready) {
         // Items already on device — dispatched from pre-computed buffer in flushPendingGemms
         sym.luGemmCalls++;
         return;
@@ -2066,7 +2082,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData, int64_t ld,
                              int64_t numCols) override {
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     @autoreleasepool {
       if (n <= 0 || numCols <= 0) return;
 
@@ -2132,7 +2148,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   void flush() override {
     flushPendingGemms();
-    if (recordingMode_) return;  // skip pivot copies during recording
+    if (explicitRecording_) return;  // skip pivot copies during recording
     commitAndWait();
 
     // Reset batched state for next factorization
@@ -2163,9 +2179,34 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     deferredElimPerturbBuf_ = nil;
     assembleWasCalled_ = false;
     potrfStatusPending_ = false;
-    // Reset pre-computed dispatch index (buffers persist across calls)
-    if (usePrecomputed_) {
+
+    // Auto-recording state machine
+    if (recordState_ == RecordState::Recording && !explicitRecording_) {
+      // First factorLU completed — finalize recording and upload to device
+      if (recordingBatchCount_ > 0) {
+        size_t startIdx = recordedItems_.size() - recordingBatchCount_;
+        recordedFlushPoints_.push_back({startIdx, recordingBatchCount_});
+        recordingBatchCount_ = 0;
+      }
+      totalPrecomputedItems_ = recordedItems_.size();
+      if (totalPrecomputedItems_ > 0) {
+        size_t bytes = totalPrecomputedItems_ * sizeof(LUGemmWorkItem);
+        size_t int64sNeeded = (bytes + sizeof(int64_t) - 1) / sizeof(int64_t);
+        devPrecomputedItems_.resizeToAtLeast(int64sNeeded);
+        memcpy(devPrecomputedItems_.ptr(), recordedItems_.data(), bytes);
+      }
+      recordedItems_.clear();
+      recordedItems_.shrink_to_fit();
+      recordState_ = RecordState::Ready;
       precomputedFlushIdx_ = 0;
+    } else if (recordState_ == RecordState::Ready) {
+      precomputedFlushIdx_ = 0;
+    } else if (recordState_ == RecordState::Idle && !explicitRecording_) {
+      // Start auto-recording on next factorLU
+      recordState_ = RecordState::Recording;
+      recordedItems_.clear();
+      recordedFlushPoints_.clear();
+      recordingBatchCount_ = 0;
     }
     // Buffers (tempBuffer, devSpanToChainOffset, devPivots, devAllPivots,
     // devGemmWorkBuf_, perturbCountBuf_, devPrecomputedItems_) are NOT freed — reused across calls.
@@ -2201,7 +2242,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // backing stores — both are CPU-accessible, so no D->H->D round-trip.
   void flushDevicePivots(int64_t* devDstPivots) override {
     flushPendingGemms();
-    if (recordingMode_) return;
+    if (explicitRecording_) return;
     if (pivotsOnGpu_ && allPivotsCount_ > 0) {
       // On Metal unified memory, devAllPivots.ptr() and devDstPivots are both
       // CPU-accessible pointers to Metal buffer backing stores.
@@ -2213,7 +2254,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   int64_t deferredPerturbCount() override {
-    if (recordingMode_) return 0;
+    if (explicitRecording_) return 0;
     // Read the accumulated GPU atomic counter (valid after flush/commitAndWait)
     int64_t count = 0;
     if (perturbCountPending_ && perturbCountBuf_) {
@@ -2231,7 +2272,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // ============ Recording mode API ============
 
   void beginRecording() override {
-    recordingMode_ = true;
+    explicitRecording_ = true;
+    recordState_ = RecordState::Recording;
     recordedItems_.clear();
     recordedFlushPoints_.clear();
     recordingBatchCount_ = 0;
@@ -2245,7 +2287,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       recordingBatchCount_ = 0;
     }
 
-    recordingMode_ = false;
+    explicitRecording_ = false;
     totalPrecomputedItems_ = recordedItems_.size();
 
     if (totalPrecomputedItems_ > 0) {
@@ -2257,7 +2299,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       memcpy(devPrecomputedItems_.ptr(), recordedItems_.data(), bytes);
     }
 
-    usePrecomputed_ = true;
+    recordState_ = RecordState::Ready;
     precomputedFlushIdx_ = 0;
 
     // Free host recording buffers (data is now on device)
@@ -2313,16 +2355,26 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   // Scratch buffer for two-phase deterministic sparse elimination
   MetalMirror<float> elimScratchBuffer;
 
-  // ============ Recording mode for pre-computed GemmWorkItems ============
-  // During recording: capture all LUGemmWorkItems and flush boundaries.
-  // After endRecording(): dispatch from pre-computed device buffers.
-  // This eliminates per-lump CPU memcpy in flushPendingGemms.
-  bool recordingMode_ = false;
+  // ============ Auto-recording for pre-computed GemmWorkItems ============
+  // Transparent optimization: the first factorLU call records the GemmWorkItem
+  // schedule (structure-dependent, never changes) while executing normally.
+  // Subsequent calls dispatch from a pre-computed device buffer, eliminating
+  // per-lump CPU memcpy in flushPendingGemms.
+  //
+  // State machine (transitions happen in reset()):
+  //   Idle -> Recording  (first reset() call)
+  //   Recording -> Ready (second reset(): finalize + upload items to device)
+  //   Ready -> Ready     (subsequent reset(): just reset flush index)
+  //
+  // beginRecording()/endRecording() override auto-recording for explicit
+  // no-op recording (needed for CUDA graph capture via FFI).
+  enum class RecordState { Idle, Recording, Ready };
+  RecordState recordState_ = RecordState::Idle;
+  bool explicitRecording_ = false;                     // true when beginRecording() was called explicitly
   std::vector<LUGemmWorkItem> recordedItems_;          // all items across all flushes
   std::vector<std::pair<size_t, size_t>> recordedFlushPoints_;  // (startIdx, count) per flush
   size_t recordingBatchCount_ = 0;                     // items in current batch
 
-  bool usePrecomputed_ = false;
   MetalMirror<int64_t> devPrecomputedItems_;           // LUGemmWorkItems on device (as int64_t for MetalMirror)
   size_t precomputedFlushIdx_ = 0;                     // current flush point index during dispatch
   size_t totalPrecomputedItems_ = 0;                   // total items for bounds checking

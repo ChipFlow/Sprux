@@ -953,6 +953,7 @@ int main(int argc, char* argv[]) {
   string seqDir;
   int maxMatrices = -1;
   int numReps = 5;
+  int outerReps = 1;
   regex selectSolvers(".");
   bool jsonOutput = false;
   bool verbose = false;
@@ -971,6 +972,8 @@ int main(int argc, char* argv[]) {
       maxMatrices = stoi(argv[++i]);
     } else if (!strcmp(argv[i], "-n") && i < argc - 1) {
       numReps = stoi(argv[++i]);
+    } else if (!strcmp(argv[i], "-R") && i < argc - 1) {
+      outerReps = stoi(argv[++i]);
     } else if (!strcmp(argv[i], "-S") && i < argc - 1) {
       selectSolvers = regex(argv[++i]);
     } else if (!strcmp(argv[i], "-J")) {
@@ -1113,8 +1116,13 @@ int main(int argc, char* argv[]) {
     allRecords.push_back(std::move(rec));
   }
 
-  // Run selected solvers
+  // Run selected solvers (repeat outerReps times for profiling)
   bool isWarmup = seqDir.empty();  // Single-matrix mode has warmup run
+
+  for (int rep = 0; rep < outerReps; rep++) {
+  if (outerReps > 1 && !jsonOutput) {
+    cout << "\n=== Outer repetition " << (rep + 1) << "/" << outerReps << " ===" << endl;
+  }
 
   // CPU solver
   if (regex_search(string("BaSpaCho_LU_CPU"), selectSolvers)) {
@@ -1183,6 +1191,8 @@ int main(int argc, char* argv[]) {
     if (!jsonOutput) printResults("cuDSS_LU", timings);
   }
 #endif
+
+  }  // end outer repetition loop
 
   // JSON output
   if (jsonOutput) {
