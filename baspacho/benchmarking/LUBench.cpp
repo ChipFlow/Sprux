@@ -451,6 +451,9 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
     res.perturbCount = 0;
 
     // ---- Solve (timed): persistent SolveCtx, device-resident pivots ----
+    // Each solveLU call uses external encoder — all solve kernels in one command
+    // buffer per call (without this, each internal dispatch creates a separate
+    // command buffer, causing significant CPU→GPU scheduling overhead).
     Eigen::VectorXf bp(n);
     for (int64_t j = 0; j < n; j++) {
       bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
@@ -460,8 +463,15 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
 
     auto tSolve = Clock::now();
     memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
-    solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
-                    *solveCtx, PivotLocation::Device);
+    {
+      void* cmdBuf2 = metalCtx.createCommandBuffer();
+      void* encoder2 = metalCtx.createComputeEncoder(cmdBuf2);
+      symCtx.setExternalEncoder(cmdBuf2, encoder2);
+      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                      *solveCtx, PivotLocation::Device);
+      symCtx.clearExternalEncoder();
+      metalCtx.commitAndWait(cmdBuf2);
+    }
     memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
     for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
@@ -486,8 +496,15 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
         bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
       }
       memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
-      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
-                      *solveCtx, PivotLocation::Device);
+      {
+        void* cmdBuf2 = metalCtx.createCommandBuffer();
+        void* encoder2 = metalCtx.createComputeEncoder(cmdBuf2);
+        symCtx.setExternalEncoder(cmdBuf2, encoder2);
+        solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                        *solveCtx, PivotLocation::Device);
+        symCtx.clearExternalEncoder();
+        metalCtx.commitAndWait(cmdBuf2);
+      }
       memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
       for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
@@ -794,48 +811,48 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
                                      pRowPtr, pColInd, pValues);
     vector<float> sValues(pValues.begin(), pValues.end());
 
-    // ---- Factor (timed) ----
-    // Step 1: Zero devData (equivalent to cudaMemsetAsync in FFI Execute)
-    // Step 2: Scatter CSR → coalesced format (equivalent to denseToCoalesced kernel)
-    //         Uses CPU loadFromCsr — same result via Metal unified memory.
+    // ---- Fused factor + solve (timed together) ----
+    // Like the production FFI Execute: all GPU work in ONE command buffer.
+    // CPU writes (zero, scatter, permute) happen before commit — GPU sees
+    // them when it executes since Metal unified memory is coherent at commit.
     numCtx->reset();
     memset(dataGpu.ptr(), 0, totalDataSz * sizeof(float));
     solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
                         dataGpu.ptr());
 
-    auto tFactor = Clock::now();
-
-    // Step 3: factorLU with external encoder + device pivots (like FFI)
-    void* cmdBuf = metalCtx.createCommandBuffer();
-    void* encoder = metalCtx.createComputeEncoder(cmdBuf);
-
-    symCtx.setExternalEncoder(cmdBuf, encoder);
-    solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
-    symCtx.clearExternalEncoder();
-
-    metalCtx.commitAndWait(cmdBuf);
-    numCtx->flush();
-
-    res.factorTime = tdelta(Clock::now() - tFactor).count();
-    res.perturbCount = 0;
-
-    // ---- Solve (timed) ----
-    // Step 4: Permute RHS (equivalent to permuteForward kernel)
+    // Permute RHS on CPU (equivalent to permuteForward kernel)
     Eigen::VectorXf bp(n);
     for (int64_t j = 0; j < n; j++) {
       bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
     }
+    memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
 
     vector<float> xVec(n);
 
-    auto tSolve = Clock::now();
-    memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+    auto tFactor = Clock::now();
 
-    // Step 5: solveLU with persistent context + device pivots (like FFI)
-    solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
-                    *solveCtx, PivotLocation::Device);
+    // Single command buffer: factorLU + solveLU fused.
+    // Metal guarantees ordering within a command buffer — factor dispatches
+    // execute before solve dispatches, no explicit barrier needed.
+    {
+      void* cmdBuf = metalCtx.createCommandBuffer();
+      void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+      symCtx.setExternalEncoder(cmdBuf, encoder);
 
-    // Step 6: Unpermute solution (equivalent to permuteInverse kernel)
+      solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+      numCtx->flush();  // no-op in external encoder mode (flushes pending gemms)
+
+      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                      *solveCtx, PivotLocation::Device);
+
+      symCtx.clearExternalEncoder();
+      metalCtx.commitAndWait(cmdBuf);
+    }
+
+    res.factorTime = tdelta(Clock::now() - tFactor).count();
+    res.perturbCount = 0;
+
+    // Unpermute solution on CPU (equivalent to permuteInverse kernel)
     memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
     for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
@@ -845,6 +862,8 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     }
 
     // Iterative refinement (mixed-precision: residual in float64, correction in float32)
+    // Each refinement solve uses its own command buffer (CPU work between them).
+    auto tSolve = Clock::now();
     double residual = computeResidualDouble(A, x, b);
     res.refineSteps = 0;
     const int maxRefine = 30;
@@ -861,8 +880,15 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
         bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
       }
       memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
-      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
-                      *solveCtx, PivotLocation::Device);
+      {
+        void* cmdBuf = metalCtx.createCommandBuffer();
+        void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+        symCtx.setExternalEncoder(cmdBuf, encoder);
+        solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                        *solveCtx, PivotLocation::Device);
+        symCtx.clearExternalEncoder();
+        metalCtx.commitAndWait(cmdBuf);
+      }
       memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
       for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
