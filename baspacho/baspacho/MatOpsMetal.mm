@@ -2099,7 +2099,16 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         recordingBatchCount_++;
       }
       if (recordState_ == RecordState::Ready) {
-        // Items already on device — dispatched from pre-computed buffer in flushPendingGemms
+        // Items already on device — dispatched from pre-computed buffer in flushPendingGemms.
+        // Still need to cache the current data buffer so flushPendingGemms binds the
+        // correct MTLBuffer (data pointer may differ between factorLU calls).
+        if (!cachedDataBuffer_) {
+          auto bufferInfo = MetalBufferRegistry::instance().findBuffer(C);
+          if (bufferInfo.first) {
+            cachedDataBuffer_ = (__bridge id<MTLBuffer>)bufferInfo.first;
+            cachedDataBaseOffset_ = bufferInfo.second;
+          }
+        }
         sym.luGemmCalls++;
         return;
       }

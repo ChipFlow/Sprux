@@ -791,142 +791,186 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
 
   auto& metalCtx = MetalContext::instance();
 
-  // 7. Get refinement kernel pipeline state
+  // 7. Warmup pass: trigger MPS shader JIT compilation.
+  // The first MPS LU factorization after pipeline creation produces incorrect
+  // results during shader compilation. Run a dummy factorLU (results discarded)
+  // to force compilation before the production run.
+  {
+    // Load first matrix data for warmup (need valid data for MPS)
+    const CsrMatrix& A0 = matrices[0].first;
+    vector<int64_t> wRowPtr, wColInd;
+    vector<double> wValues;
+    applyRowPermToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                              preproc.rowPerm.data(), wRowPtr, wColInd, wValues);
+    vector<double> wRowScale, wColScale;
+    computeEquilibration(n, wRowPtr.data(), wColInd.data(), wValues.data(), wRowScale, wColScale);
+    applyRowPermAndScaleToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                                     preproc.rowPerm.data(), wRowScale.data(), wColScale.data(),
+                                     wRowPtr, wColInd, wValues);
+    vector<float> wSValues(wValues.begin(), wValues.end());
+    memset(dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+    solver->loadFromCsr(wRowPtr.data(), wColInd.data(), blockSizes.data(), wSValues.data(),
+                        dataGpu.ptr());
+
+    numCtx->reset();
+    solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+    numCtx->flush();
+  }
+
+  // 8. Get refinement kernel pipeline state
   void* refinePipeline = metalCtx.getPipelineState("refine_step_kernel_float");
 
-  // ==== FFI Execute equivalent (per matrix) ====
+  // ==== Phase 1: CPU preprocessing — prepare ALL matrices upfront ====
+  // All CPU work happens here. GPU encoding follows in one shot.
 
-  vector<LUTimingResult> results;
   const int maxRefine = 3;  // Fixed count — can't check convergence mid-command-buffer
+  size_t nMat = matrices.size();
 
-  for (size_t mi = 0; mi < matrices.size(); mi++) {
+  // Shared buffers (same sparsity structure for all matrices)
+  MetalMirror<int64_t> csrRowPtr(matrices[0].first.rowPtr);
+  MetalMirror<int64_t> csrColInd(matrices[0].first.colInd);
+  MetalMirror<int64_t> devPerm(vector<int64_t>(perm.begin(), perm.end()));
+  MetalMirror<int64_t> devRowPerm(preproc.rowPerm);
+
+  // Per-matrix GPU buffers (each matrix needs its own data/RHS/accum)
+  vector<MetalMirror<float>> matData(nMat);      // factorization data
+  vector<MetalMirror<float>> matXGpu(nMat);      // solve RHS/result
+  vector<MetalMirror<float>> matXAccum(nMat);    // accumulated solution
+  vector<MetalMirror<float>> matCsrVal(nMat);    // CSR values for refinement SpMV
+  vector<MetalMirror<float>> matRowScale(nMat);  // equilibration row scale
+  vector<MetalMirror<float>> matColScale(nMat);  // equilibration col scale
+  vector<MetalMirror<float>> matB(nMat);         // RHS in float32
+
+  for (size_t mi = 0; mi < nMat; mi++) {
     const CsrMatrix& A = matrices[mi].first;
     const Eigen::VectorXd& b = matrices[mi].second;
-    LUTimingResult res;
 
-    // ---- Preprocessing (outside timed region, done upstream in production) ----
+    // Row-permute and equilibrate
     applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
                               preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
     vector<double> rowScale, colScale;
     computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale, colScale);
-
     applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
                                      preproc.rowPerm.data(), rowScale.data(), colScale.data(),
                                      pRowPtr, pColInd, pValues);
     vector<float> sValues(pValues.begin(), pValues.end());
 
-    // Upload CSR matrix data for GPU refinement kernel (original A, not row-permuted)
-    vector<float> csrValuesF(A.values.begin(), A.values.end());
-    MetalMirror<int64_t> csrRowPtr(A.rowPtr);
-    MetalMirror<int64_t> csrColInd(A.colInd);
-    MetalMirror<float> csrValues(csrValuesF);
+    // Load factorization data
+    matData[mi].resizeToAtLeast(totalDataSz);
+    memset(matData[mi].ptr(), 0, totalDataSz * sizeof(float));
+    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
+                        matData[mi].ptr());
 
-    // Upload permutation and scaling arrays
-    MetalMirror<int64_t> devPerm(vector<int64_t>(perm.begin(), perm.end()));
-    MetalMirror<int64_t> devRowPerm(preproc.rowPerm);
+    // Permute initial RHS
+    matXGpu[mi].resizeToAtLeast(n);
+    Eigen::VectorXf bp(n);
+    for (int64_t j = 0; j < n; j++)
+      bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
+    memcpy(matXGpu[mi].ptr(), bp.data(), n * sizeof(float));
+
+    // Zero-init accumulated solution
+    matXAccum[mi].resizeToAtLeast(n);
+    memset(matXAccum[mi].ptr(), 0, n * sizeof(float));
+
+    // Upload refinement data
+    vector<float> csrValF(A.values.begin(), A.values.end());
+    matCsrVal[mi].load(csrValF);
     vector<float> rowScaleF(rowScale.begin(), rowScale.end());
+    matRowScale[mi].load(rowScaleF);
     vector<float> colScaleF(colScale.begin(), colScale.end());
-    MetalMirror<float> devRowScale(rowScaleF);
-    MetalMirror<float> devColScale(colScaleF);
-
-    // Upload RHS
+    matColScale[mi].load(colScaleF);
     vector<float> bF(n);
     for (int64_t i = 0; i < n; i++) bF[i] = float(b(i));
-    MetalMirror<float> devB(bF);
+    matB[mi].load(bF);
+  }
 
-    // Accumulated solution buffer (GPU-resident, initialized to 0)
-    MetalMirror<float> devXAccum;
-    devXAccum.resizeToAtLeast(n);
-    memset(devXAccum.ptr(), 0, n * sizeof(float));
+  // ==== Phase 2: GPU — encode ALL matrices into ONE command buffer ====
+  // Metal guarantees sequential execution within a command buffer.
+  // devPivots, numCtx, solveCtx are reused: factorLU_i writes pivots →
+  // solveLU_i reads them → factorLU_{i+1} overwrites them.
 
-    // ---- Fused factor + solve + refinement in ONE command buffer ----
+  auto tGpu = Clock::now();
+
+  void* cmdBuf = metalCtx.createCommandBuffer();
+  void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+  symCtx.setExternalEncoder(cmdBuf, encoder);
+
+  for (size_t mi = 0; mi < nMat; mi++) {
     numCtx->reset();
-    memset(dataGpu.ptr(), 0, totalDataSz * sizeof(float));
-    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
-                        dataGpu.ptr());
 
-    // Permute initial RHS on CPU
-    Eigen::VectorXf bp(n);
-    for (int64_t j = 0; j < n; j++) {
-      bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
-    }
-    memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+    // Factor
+    solver->factorLU(matData[mi].ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+    numCtx->flush();
 
-    auto tFactor = Clock::now();
+    // Initial solve
+    solver->solveLU(matData[mi].ptr(), devPivots.ptr(), matXGpu[mi].ptr(), n, 1,
+                    *solveCtx, PivotLocation::Device);
 
-    // Single command buffer: factorLU + solveLU + N×(refine_kernel + solveLU)
-    {
-      void* cmdBuf = metalCtx.createCommandBuffer();
-      void* encoder = metalCtx.createComputeEncoder(cmdBuf);
-      symCtx.setExternalEncoder(cmdBuf, encoder);
+    // Fused refinement: refine_kernel → solveLU → ...
+    for (int iter = 0; iter < maxRefine; iter++) {
+      void* enc = symCtx.getExternalEncoder();
 
-      // Factor
-      solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
-      numCtx->flush();
+      metalCtx.setPipelineState(enc, refinePipeline);
+      metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+      metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+      metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+      metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+      metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+      metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+      metalCtx.setBuffer(enc, matColScale[mi].buffer(), 6);
+      metalCtx.setBuffer(enc, matB[mi].buffer(), 7);
+      metalCtx.setBuffer(enc, matXAccum[mi].buffer(), 8);
+      metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+      metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
+      metalCtx.dispatchThreads(enc, refinePipeline, 1);
 
-      // Initial solve
-      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+      solver->solveLU(matData[mi].ptr(), devPivots.ptr(), matXGpu[mi].ptr(), n, 1,
                       *solveCtx, PivotLocation::Device);
-
-      // Fused refinement: refine_kernel → solveLU → refine_kernel → solveLU → ...
-      for (int iter = 0; iter < maxRefine; iter++) {
-        // Get current encoder (MPS may have cycled it during factorLU/solveLU)
-        void* enc = symCtx.getExternalEncoder();
-
-        // Dispatch refinement step kernel (unpermute + accumulate + SpMV + permute)
-        metalCtx.setPipelineState(enc, refinePipeline);
-        metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
-        metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
-        metalCtx.setBuffer(enc, csrValues.buffer(), 2);
-        metalCtx.setBuffer(enc, devPerm.buffer(), 3);
-        metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
-        metalCtx.setBuffer(enc, devRowScale.buffer(), 5);
-        metalCtx.setBuffer(enc, devColScale.buffer(), 6);
-        metalCtx.setBuffer(enc, devB.buffer(), 7);
-        metalCtx.setBuffer(enc, devXAccum.buffer(), 8);
-        metalCtx.setBuffer(enc, xGpu.buffer(), 9);
-        metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
-        metalCtx.dispatchThreads(enc, refinePipeline, 1);
-
-        // Solve correction
-        solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
-                        *solveCtx, PivotLocation::Device);
-      }
-
-      symCtx.clearExternalEncoder();
-      metalCtx.commitAndWait(cmdBuf);
     }
+  }
 
-    res.factorTime = tdelta(Clock::now() - tFactor).count();
-    res.perturbCount = 0;
-    res.refineSteps = maxRefine;
+  symCtx.clearExternalEncoder();
+  metalCtx.commitAndWait(cmdBuf);
 
-    // Final unpermute on CPU: apply last correction and read x_accum
-    // The last solveLU wrote correction to xGpu, but refine_kernel didn't run
-    // after it. Apply the final accumulation on CPU.
+  double totalGpuTime = tdelta(Clock::now() - tGpu).count();
+
+  // ==== Phase 3: CPU readback — compute residuals ====
+
+  vector<LUTimingResult> results;
+
+  for (size_t mi = 0; mi < nMat; mi++) {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    LUTimingResult res;
+
+    // Apply final correction (last solveLU result not yet accumulated by GPU kernel)
     vector<float> xVec(n);
-    memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
-    // x_accum already has sum of first maxRefine corrections (from GPU kernel).
-    // Add the final correction from the last solveLU.
+    memcpy(xVec.data(), matXGpu[mi].ptr(), n * sizeof(float));
     for (int64_t j = 0; j < n; j++) {
-      devXAccum.ptr()[j] += colScaleF[j] * xVec[perm[j]];
+      matXAccum[mi].ptr()[j] += matColScale[mi].ptr()[j] * xVec[perm[j]];
     }
 
     Eigen::VectorXd x(n);
-    for (int64_t j = 0; j < n; j++) x(j) = double(devXAccum.ptr()[j]);
+    for (int64_t j = 0; j < n; j++) x(j) = double(matXAccum[mi].ptr()[j]);
 
-    auto tSolve = Clock::now();
-    double residual = computeResidualDouble(A, x, b);
-    res.solveTime = tdelta(Clock::now() - tSolve).count();
-    res.residual = residual;
+    res.factorTime = totalGpuTime / double(nMat);  // approximate per-matrix
+    res.solveTime = 0;
+    res.residual = computeResidualDouble(A, x, b);
+    res.refineSteps = maxRefine;
+    res.perturbCount = 0;
 
     if (verbose) {
-      cout << "  [MetalFFI] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
-           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+      cout << "  [MetalFFI] Matrix #" << mi << ": total=" << fixed << setprecision(4)
+           << res.factorTime << "s, residual=" << scientific
            << setprecision(2) << res.residual << ", refine=" << res.refineSteps << endl;
     }
 
     results.push_back(res);
+  }
+
+  if (verbose) {
+    cout << "  [MetalFFI] Total GPU: " << fixed << setprecision(4) << totalGpuTime
+         << "s (" << nMat << " matrices in 1 command buffer)" << endl;
   }
 
   return results;
