@@ -436,6 +436,10 @@ struct MetalSymbolicCtx : SymbolicCtx {
     usingExternalEncoder = false;
   }
 
+  void* getExternalEncoder() override {
+    return (__bridge void*)externalEncoder;
+  }
+
   const CoalescedBlockMatrixSkel& skel;
 
   id<MTLDevice> device;

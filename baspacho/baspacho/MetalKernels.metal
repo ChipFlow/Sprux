@@ -1404,6 +1404,52 @@ kernel void lu_solveU_direct_kernel_float(
 }
 
 // ============================================================================
+// Iterative refinement step kernel (fused unpermute + accumulate + SpMV + permute)
+// ============================================================================
+
+// After solveLU writes correction to xGpu, this kernel:
+// 1. Unpermutes correction and accumulates into x: x[j] += colScale[j] * xGpu[perm[j]]
+// 2. Computes SpMV residual: r[i] = b[i] - sum_k(A[i,k] * x[k]) using CSR
+// 3. Permutes residual for next solveLU: xGpu[perm[j]] = rowScale[j] * r[rowPerm[j]]
+// Single-threaded for small matrices (n <= ~100).
+kernel void refine_step_kernel_float(
+    device const int64_t* csrRowPtr [[buffer(0)]],
+    device const int64_t* csrColInd [[buffer(1)]],
+    device const float* csrValues [[buffer(2)]],
+    device const int64_t* perm [[buffer(3)]],       // paramToSpan permutation
+    device const int64_t* rowPerm [[buffer(4)]],     // preprocessing rowPerm
+    device const float* rowScale [[buffer(5)]],
+    device const float* colScale [[buffer(6)]],
+    device const float* b [[buffer(7)]],             // original RHS (float32)
+    device float* x_accum [[buffer(8)]],             // accumulated solution
+    device float* xGpu [[buffer(9)]],                // correction in / residual out
+    constant int64_t& n [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid != 0) return;
+
+    // Step 1: Unpermute correction and accumulate
+    // CPU equivalent: x[j] += colScale[j] * xGpu[perm[j]]
+    for (int64_t j = 0; j < n; j++) {
+        x_accum[j] += colScale[j] * xGpu[perm[j]];
+    }
+
+    // Step 2+3: SpMV residual and permute for next solve
+    // For each output position perm[j]:
+    //   srcRow = rowPerm[j]
+    //   r = b[srcRow] - dot(A[srcRow,:], x_accum)
+    //   xGpu[perm[j]] = rowScale[j] * r
+    for (int64_t j = 0; j < n; j++) {
+        int64_t srcRow = rowPerm[j];
+        float dot = 0.0f;
+        for (int64_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
+            dot += csrValues[k] * x_accum[csrColInd[k]];
+        }
+        xGpu[perm[j]] = rowScale[j] * (b[srcRow] - dot);
+    }
+}
+
+// ============================================================================
 // Cholesky dense solve kernels
 // ============================================================================
 

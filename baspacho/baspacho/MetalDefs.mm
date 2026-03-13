@@ -166,6 +166,33 @@ void MetalContext::commitAndWait(void* cmdBuf) {
   }
 }
 
+void MetalContext::setPipelineState(void* encoder, void* pipelineState) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipelineState;
+  [enc setComputePipelineState:pso];
+}
+
+void MetalContext::setBuffer(void* encoder, void* buffer, int index) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
+  [enc setBuffer:buf offset:0 atIndex:index];
+}
+
+void MetalContext::setBytes(void* encoder, const void* data, size_t length, int index) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  [enc setBytes:data length:length atIndex:index];
+}
+
+void MetalContext::dispatchThreads(void* encoder, void* pipelineState, int numThreads) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipelineState;
+  NSUInteger threadGroupSize = MIN(pso.maxTotalThreadsPerThreadgroup, 256);
+  threadGroupSize = MIN(threadGroupSize, (NSUInteger)numThreads);
+  MTLSize threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+  MTLSize numGroups = MTLSizeMake(((NSUInteger)numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
+  [enc dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+}
+
 bool MetalContext::beginCapture(const char* outputPath) {
   @autoreleasepool {
     MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];

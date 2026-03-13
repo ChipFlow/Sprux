@@ -145,6 +145,11 @@ struct SymbolicCtx {
   // Clear external encoder mode, returning to normal self-managed mode.
   virtual void clearExternalEncoder() {}
 
+  // Get current external encoder (may differ from the one passed to
+  // setExternalEncoder if MPS cycled it). Returns nullptr if not in
+  // external encoder mode.
+  virtual void* getExternalEncoder() { return nullptr; }
+
   template <typename T>
   NumericCtxPtr<T> createNumericCtx(int64_t tempBufSize, const T* data);
 

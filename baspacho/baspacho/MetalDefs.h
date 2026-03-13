@@ -97,6 +97,12 @@ class MetalContext {
   void endEncoding(void* encoder);              // [encoder endEncoding]
   void commitAndWait(void* cmdBuf);             // [cmdBuf commit]; [cmdBuf waitUntilCompleted]
 
+  // Encoder helpers for dispatching custom kernels from C++ code
+  void setPipelineState(void* encoder, void* pipelineState);
+  void setBuffer(void* encoder, void* buffer, int index);
+  void setBytes(void* encoder, const void* data, size_t length, int index);
+  void dispatchThreads(void* encoder, void* pipelineState, int numThreads);
+
   // GPU trace capture (for profiling)
   // Set METAL_CAPTURE_ENABLED=1 env var, then call begin/endCapture
   // Writes a .gputrace file that can be opened in Xcode for full GPU timeline
