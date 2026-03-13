@@ -353,10 +353,10 @@ static vector<LUTimingResult> benchmarkLUMetal(
 
   return results;
 }
-// External encoder Metal benchmark: wraps factorLU in a single command buffer
-// via setExternalEncoder(). All kernel dispatches go into one encoder instead of
-// creating ~2500 separate command buffers. This should dramatically reduce
-// CPU→GPU scheduling overhead for small matrices.
+// External encoder Metal benchmark: mirrors the spineax FFI pattern exactly.
+// All buffers and contexts are pre-allocated once (like Instantiate), and the
+// per-iteration hot path does zero Metal buffer allocations (like Execute).
+// Uses external encoder for factorLU, persistent SolveCtx, device-resident pivots.
 static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
     const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
   if (matrices.empty()) return {};
@@ -382,23 +382,31 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
 
   auto solver = createSolver(metalSettings, paramSizes, ss);
   auto& symCtx = solver->internalSymbolicContext();
+  const auto& perm = solver->paramToSpan();
+  int64_t totalDataSz = solver->skel().totalDataSize();
 
-  // Create persistent NumericCtx with pre-allocated buffers
+  // ---- Instantiate phase: one-time allocation (mirrors spineax FFI) ----
+
+  // Persistent GPU buffers (allocated once, reused across iterations)
+  MetalMirror<float> dataGpu;
+  dataGpu.resizeToAtLeast(totalDataSz);
+  MetalMirror<float> xGpu;
+  xGpu.resizeToAtLeast(n);
+  MetalMirror<int64_t> devPivots;
+  devPivots.resizeToAtLeast(n);
+
+  // Persistent contexts (like spineax: created once, reset() per call)
   auto numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
   numCtx->preAllocateForLU(1, n);
+  auto solveCtx = symCtx.createSolveCtx<float>(1, static_cast<float*>(nullptr));
 
   // Recording pass: capture GemmWorkItem schedule (structure-dependent, done once)
   {
-    MetalMirror<float> dummyData(vector<float>(solver->skel().totalDataSize(), 0.0f));
     vector<int64_t> dummyPivots(n);
     numCtx->beginRecording();
-    solver->factorLU(dummyData.ptr(), dummyPivots.data(), *numCtx);
+    solver->factorLU(dataGpu.ptr(), dummyPivots.data(), *numCtx);
     numCtx->endRecording();
   }
-
-  vector<float> data(solver->skel().totalDataSize());
-  vector<int64_t> pivots(n);
-  const auto& perm = solver->paramToSpan();
 
   auto& metalCtx = MetalContext::instance();
 
@@ -409,6 +417,7 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
     const Eigen::VectorXd& b = matrices[mi].second;
     LUTimingResult res;
 
+    // ---- Preprocessing (CPU, outside timed region) ----
     applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
                               preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
     vector<double> rowScale, colScale;
@@ -417,60 +426,43 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
     applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
                                      preproc.rowPerm.data(), rowScale.data(), colScale.data(),
                                      pRowPtr, pColInd, pValues);
-    vector<int64_t> sRowPtr = pRowPtr;
-    vector<int64_t> sColInd = pColInd;
     vector<float> sValues(pValues.begin(), pValues.end());
 
-    fill(data.begin(), data.end(), 0.0f);
-    solver->loadFromCsr(sRowPtr.data(), sColInd.data(), blockSizes.data(), sValues.data(),
-                        data.data());
+    // Load matrix directly into persistent GPU buffer (unified memory — no alloc)
+    memset(dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
+                        dataGpu.ptr());
 
-    // Factor using external encoder: single command buffer
-    double factorTime;
-    {
-      MetalMirror<float> dataGpu(data);
+    // ---- Factor (timed): external encoder, device-resident pivots ----
+    numCtx->reset();
+    auto tFactor = Clock::now();
 
-      numCtx->reset();
-      auto tFactor = Clock::now();
+    void* cmdBuf = metalCtx.createCommandBuffer();
+    void* encoder = metalCtx.createComputeEncoder(cmdBuf);
 
-      // Create single command buffer + encoder
-      void* cmdBuf = metalCtx.createCommandBuffer();
-      void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+    symCtx.setExternalEncoder(cmdBuf, encoder);
+    solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+    symCtx.clearExternalEncoder();
 
-      // Set external encoder — all kernel dispatches go into this encoder
-      symCtx.setExternalEncoder(cmdBuf, encoder);
-      solver->factorLU(dataGpu.ptr(), pivots.data(), *numCtx);
+    metalCtx.commitAndWait(cmdBuf);
+    numCtx->flush();
 
-      // clearExternalEncoder ends the current encoder (which may have been
-      // replaced by getrfMPS if MPS was used for LU factorization).
-      symCtx.clearExternalEncoder();
-
-      // Commit + wait (encoder already ended by clearExternalEncoder)
-      metalCtx.commitAndWait(cmdBuf);
-
-      // Flush deferred GPU state (copies pivots from devAllPivots to host)
-      numCtx->flush();
-
-      factorTime = tdelta(Clock::now() - tFactor).count();
-      dataGpu.get(data);
-    }
-    res.factorTime = factorTime;
+    res.factorTime = tdelta(Clock::now() - tFactor).count();
     res.perturbCount = 0;
 
-    // Solve (still normal mode for now)
+    // ---- Solve (timed): persistent SolveCtx, device-resident pivots ----
     Eigen::VectorXf bp(n);
     for (int64_t j = 0; j < n; j++) {
       bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
     }
 
-    MetalMirror<float> dataGpu(data);
-    MetalMirror<float> xGpu;
     vector<float> xVec(n);
 
     auto tSolve = Clock::now();
-    xGpu.load(vector<float>(bp.data(), bp.data() + n));
-    solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
-    xGpu.get(xVec);
+    memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+    solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                    *solveCtx, PivotLocation::Device);
+    memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
     for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
     Eigen::VectorXd x(n);
@@ -493,9 +485,10 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
       for (int64_t j = 0; j < n; j++) {
         bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
       }
-      xGpu.load(vector<float>(bp.data(), bp.data() + n));
-      solver->solveLU(dataGpu.ptr(), pivots.data(), xGpu.ptr(), n, 1);
-      xGpu.get(xVec);
+      memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                      *solveCtx, PivotLocation::Device);
+      memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
       for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
 
       for (int64_t j = 0; j < n; j++) {
@@ -695,6 +688,200 @@ static vector<LUTimingResult> benchmarkLUMetalPipelined(
 
     results.push_back(res);
     cur = next;
+  }
+
+  return results;
+}
+// FFI-style Metal benchmark: mirrors the spineax BaspachoGpuInstantiate/Execute
+// code path exactly. Uses dense lower-triangular sparsity, persistent contexts,
+// device-resident pivots, recording pass, and external encoder — identical to
+// how the production solver runs inside JAX via XLA FFI.
+//
+// Differences from production FFI:
+//   - Scatter (denseToCoalesced) runs on CPU via loadFromCsr (not GPU kernel)
+//   - Permute/unpermute runs on CPU (not GPU kernels)
+//   Both are fine because Metal uses unified memory (MTLStorageModeShared)
+//   and these operations are O(n²)/O(n) — trivial for circuit sizes.
+static vector<LUTimingResult> benchmarkLUMetalFFI(
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
+  if (matrices.empty()) return {};
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+
+  // ---- Preprocessing (done upstream in production; here for correctness) ----
+  auto preproc = computeMaxTransversal(n, A0.rowPtr.data(), A0.colInd.data());
+
+  vector<int64_t> pRowPtr, pColInd;
+  vector<double> pValues;
+  applyRowPermToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                            preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+
+  // ==== FFI Instantiate equivalent ====
+
+  // 1. Build dense lower-triangular sparsity pattern (like BaspachoGpuInstantiate)
+  //    This is what the FFI does — it doesn't use the actual sparsity, it treats
+  //    the entire n×n Jacobian as dense.
+  vector<int64_t> densePtrs(n + 1);
+  vector<int64_t> denseInds;
+  densePtrs[0] = 0;
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j <= i; ++j) {
+      denseInds.push_back(j);
+    }
+    densePtrs[i + 1] = static_cast<int64_t>(denseInds.size());
+  }
+  SparseStructure ss{std::move(densePtrs), std::move(denseInds)};
+
+  // 2. Create solver (mirrors FFI settings exactly)
+  Settings settings;
+  settings.backend = BackendMetal;
+  settings.matrixType = MTYPE_GENERAL;
+  settings.findSparseEliminationRanges = false;  // fully dense, no sparse elim
+  settings.addFillPolicy = AddFillComplete;
+  settings.numThreads = 1;
+  settings.staticPivotThreshold = -1.0;  // disabled (like FFI)
+
+  vector<int64_t> paramSizes(n, 1);
+  vector<int64_t> blockSizes(n, 1);
+  auto solver = createSolver(settings, paramSizes, ss);
+  auto& symCtx = solver->internalSymbolicContext();
+  const auto& perm = solver->paramToSpan();
+  int64_t totalDataSz = solver->totalDataSize();
+
+  // 3. Disable OpStat timers (like FFI — prevents unnecessary GPU syncs)
+  symCtx.disableAllStats();
+
+  // 4. Allocate persistent GPU buffers (like FFI: DevMirror grow-only)
+  MetalMirror<float> dataGpu;
+  dataGpu.resizeToAtLeast(totalDataSz);
+  MetalMirror<float> xGpu;
+  xGpu.resizeToAtLeast(n);
+  MetalMirror<int64_t> devPivots;
+  devPivots.resizeToAtLeast(n);
+
+  // 5. Create persistent contexts (like FFI: one-time allocation, reused via reset)
+  auto numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
+  numCtx->preAllocateForLU(1, n);
+  auto solveCtx = symCtx.createSolveCtx<float>(1, static_cast<float*>(nullptr));
+
+  // 6. Recording pass: capture GemmWorkItem schedule (like FFI)
+  {
+    numCtx->beginRecording();
+    solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+    numCtx->endRecording();
+  }
+
+  auto& metalCtx = MetalContext::instance();
+
+  // ==== FFI Execute equivalent (per matrix) ====
+
+  vector<LUTimingResult> results;
+
+  for (size_t mi = 0; mi < matrices.size(); mi++) {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    LUTimingResult res;
+
+    // ---- Preprocessing (outside timed region, done upstream in production) ----
+    applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                              preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+    vector<double> rowScale, colScale;
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale, colScale);
+
+    applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                                     preproc.rowPerm.data(), rowScale.data(), colScale.data(),
+                                     pRowPtr, pColInd, pValues);
+    vector<float> sValues(pValues.begin(), pValues.end());
+
+    // ---- Factor (timed) ----
+    // Step 1: Zero devData (equivalent to cudaMemsetAsync in FFI Execute)
+    // Step 2: Scatter CSR → coalesced format (equivalent to denseToCoalesced kernel)
+    //         Uses CPU loadFromCsr — same result via Metal unified memory.
+    numCtx->reset();
+    memset(dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+    solver->loadFromCsr(pRowPtr.data(), pColInd.data(), blockSizes.data(), sValues.data(),
+                        dataGpu.ptr());
+
+    auto tFactor = Clock::now();
+
+    // Step 3: factorLU with external encoder + device pivots (like FFI)
+    void* cmdBuf = metalCtx.createCommandBuffer();
+    void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+
+    symCtx.setExternalEncoder(cmdBuf, encoder);
+    solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
+    symCtx.clearExternalEncoder();
+
+    metalCtx.commitAndWait(cmdBuf);
+    numCtx->flush();
+
+    res.factorTime = tdelta(Clock::now() - tFactor).count();
+    res.perturbCount = 0;
+
+    // ---- Solve (timed) ----
+    // Step 4: Permute RHS (equivalent to permuteForward kernel)
+    Eigen::VectorXf bp(n);
+    for (int64_t j = 0; j < n; j++) {
+      bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
+    }
+
+    vector<float> xVec(n);
+
+    auto tSolve = Clock::now();
+    memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+
+    // Step 5: solveLU with persistent context + device pivots (like FFI)
+    solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                    *solveCtx, PivotLocation::Device);
+
+    // Step 6: Unpermute solution (equivalent to permuteInverse kernel)
+    memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
+    for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+
+    Eigen::VectorXd x(n);
+    for (int64_t j = 0; j < n; j++) {
+      x(j) = colScale[j] * double(bp(perm[j]));
+    }
+
+    // Iterative refinement (mixed-precision: residual in float64, correction in float32)
+    double residual = computeResidualDouble(A, x, b);
+    res.refineSteps = 0;
+    const int maxRefine = 30;
+    for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
+      Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+      for (int64_t i = 0; i < n; i++) {
+        for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++) {
+          r(i) += A.values[k] * x(A.colInd[k]);
+        }
+      }
+      r = b - r;
+
+      for (int64_t j = 0; j < n; j++) {
+        bp(perm[j]) = float(rowScale[j] * r(preproc.rowPerm[j]));
+      }
+      memcpy(xGpu.ptr(), bp.data(), n * sizeof(float));
+      solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
+                      *solveCtx, PivotLocation::Device);
+      memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
+      for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
+
+      for (int64_t j = 0; j < n; j++) {
+        x(j) += colScale[j] * double(bp(perm[j]));
+      }
+      residual = computeResidualDouble(A, x, b);
+      res.refineSteps++;
+    }
+    res.solveTime = tdelta(Clock::now() - tSolve).count();
+    res.residual = residual;
+
+    if (verbose) {
+      cout << "  [MetalFFI] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
+           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+           << setprecision(2) << res.residual << ", refine=" << res.refineSteps << endl;
+    }
+
+    results.push_back(res);
   }
 
   return results;
@@ -1104,6 +1291,7 @@ void help() {
        << "  BaSpaCho_LU_Metal\n"
        << "  BaSpaCho_LU_MetalExt   (external encoder: single command buffer)\n"
        << "  BaSpaCho_LU_MetalPipe  (pipelined: overlap N+1 sparse elim with N solve)\n"
+       << "  BaSpaCho_LU_MetalFFI   (FFI-style: dense pattern, persistent ctx, device pivots)\n"
 #endif
 #ifdef BASPACHO_USE_CUBLAS
        << "  BaSpaCho_LU_CUDA\n"
@@ -1340,6 +1528,18 @@ int main(int argc, char* argv[]) {
 
     resultToRecords(problemName, "BaSpaCho_LU_MetalPipe", timings, allRecords);
     if (!jsonOutput) printResults("BaSpaCho_LU_MetalPipe", timings);
+  }
+
+  if (regex_search(string("BaSpaCho_LU_MetalFFI"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_MetalFFI (FFI-style)..." << endl;
+    auto timings = benchmarkLUMetalFFI(matrices, verbose);
+
+    if (isWarmup && timings.size() > 1) {
+      timings.erase(timings.begin());
+    }
+
+    resultToRecords(problemName, "BaSpaCho_LU_MetalFFI", timings, allRecords);
+    if (!jsonOutput) printResults("BaSpaCho_LU_MetalFFI", timings);
   }
 #endif
 
