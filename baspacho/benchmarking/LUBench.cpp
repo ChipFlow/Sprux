@@ -313,6 +313,10 @@ static vector<LUTimingResult> benchmarkLUMetal(
     }
 
     double residual = computeResidualDouble(A, x, b);
+    if (verbose) {
+      cout << "  [Metal] Matrix #" << mi << ": initial_residual="
+           << scientific << setprecision(2) << residual << endl;
+    }
     res.refineSteps = 0;
     const int maxRefine = 30;
     for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
@@ -736,28 +740,45 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
 
   // ==== FFI Instantiate equivalent ====
 
-  // 1. Build dense lower-triangular sparsity pattern (like BaspachoGpuInstantiate)
-  //    This is what the FFI does — it doesn't use the actual sparsity, it treats
-  //    the entire n×n Jacobian as dense.
-  vector<int64_t> densePtrs(n + 1);
-  vector<int64_t> denseInds;
-  densePtrs[0] = 0;
-  for (int64_t i = 0; i < n; ++i) {
-    for (int64_t j = 0; j <= i; ++j) {
-      denseInds.push_back(j);
-    }
-    densePtrs[i + 1] = static_cast<int64_t>(denseInds.size());
-  }
-  SparseStructure ss{std::move(densePtrs), std::move(denseInds)};
+  // 1. Build sparsity pattern from CSR structure
+  SparseStructure ss = csrToSymmetricSparseStructure(n, pRowPtr.data(), pColInd.data());
 
-  // 2. Create solver (mirrors FFI settings exactly)
+  // 2. Compute static pivot threshold from first matrix's equilibrated diagonal.
+  // This avoids D→H sync during factorization (needed for single-CB approach):
+  // BaSpaCho's auto threshold (=0) calls maxAbsDiag which does GPU→CPU readback.
+  // Instead, we compute it CPU-side from the equilibrated CSR diagonal.
+  double pivotThreshold;
+  {
+    vector<double> rowScale0, colScale0;
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale0, colScale0);
+    vector<int64_t> eqRowPtr, eqColInd;
+    vector<double> eqValues;
+    applyRowPermAndScaleToCsr<double>(n, A0.rowPtr.data(), A0.colInd.data(), A0.values.data(),
+                                     preproc.rowPerm.data(), rowScale0.data(), colScale0.data(),
+                                     eqRowPtr, eqColInd, eqValues);
+    double maxDiag = 0;
+    for (int64_t i = 0; i < n; i++) {
+      for (int64_t k = eqRowPtr[i]; k < eqRowPtr[i + 1]; k++) {
+        if (eqColInd[k] == i) {
+          maxDiag = max(maxDiag, abs(eqValues[k]));
+          break;
+        }
+      }
+    }
+    float epsScale = cbrt(numeric_limits<float>::epsilon());
+    pivotThreshold = double(epsScale) * max(maxDiag, double(epsScale));
+    if (verbose) {
+      cout << "  [MetalFFI] maxDiag=" << scientific << setprecision(3) << maxDiag
+           << ", pivotThreshold=" << pivotThreshold << endl;
+    }
+  }
+
+  // 3. Create solver with pre-computed threshold (positive → used directly, no GPU sync)
   Settings settings;
   settings.backend = BackendMetal;
   settings.matrixType = MTYPE_GENERAL;
-  settings.findSparseEliminationRanges = false;  // fully dense, no sparse elim
-  settings.addFillPolicy = AddFillComplete;
   settings.numThreads = 1;
-  settings.staticPivotThreshold = -1.0;  // disabled (like FFI)
+  settings.staticPivotThreshold = pivotThreshold;
 
   vector<int64_t> paramSizes(n, 1);
   vector<int64_t> blockSizes(n, 1);
@@ -817,13 +838,20 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     numCtx->flush();
   }
 
-  // 8. Get refinement kernel pipeline state
-  void* refinePipeline = metalCtx.getPipelineState("refine_step_kernel_float");
+  // 8. Get refinement kernel pipeline states
+  // Use parallel kernels for large matrices, single-threaded for small
+  bool useParallelRefine = (n > 256);
+  void* accumPipeline = useParallelRefine
+    ? metalCtx.getPipelineState("refine_accumulate_kernel_float") : nullptr;
+  void* spmvPipeline = useParallelRefine
+    ? metalCtx.getPipelineState("refine_spmv_kernel_float") : nullptr;
+  void* refinePipeline = !useParallelRefine
+    ? metalCtx.getPipelineState("refine_step_kernel_float") : nullptr;
 
   // ==== Phase 1: CPU preprocessing — prepare ALL matrices upfront ====
   // All CPU work happens here. GPU encoding follows in one shot.
 
-  const int maxRefine = 3;  // Fixed count — can't check convergence mid-command-buffer
+  const int maxRefine = 15;  // test convergence with GPU refinement
   size_t nMat = matrices.size();
 
   // Shared buffers (same sparsity structure for all matrices)
@@ -833,13 +861,14 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   MetalMirror<int64_t> devRowPerm(preproc.rowPerm);
 
   // Per-matrix GPU buffers (each matrix needs its own data/RHS/accum)
-  vector<MetalMirror<float>> matData(nMat);      // factorization data
-  vector<MetalMirror<float>> matXGpu(nMat);      // solve RHS/result
-  vector<MetalMirror<float>> matXAccum(nMat);    // accumulated solution
-  vector<MetalMirror<float>> matCsrVal(nMat);    // CSR values for refinement SpMV
-  vector<MetalMirror<float>> matRowScale(nMat);  // equilibration row scale
-  vector<MetalMirror<float>> matColScale(nMat);  // equilibration col scale
-  vector<MetalMirror<float>> matB(nMat);         // RHS in float32
+  vector<MetalMirror<float>> matData(nMat);       // factorization data
+  vector<MetalMirror<float>> matXGpu(nMat);       // solve RHS/result
+  vector<MetalMirror<float>> matXAccumHi(nMat);   // accumulated solution (double-float hi)
+  vector<MetalMirror<float>> matXAccumLo(nMat);   // accumulated solution (double-float lo)
+  vector<MetalMirror<float>> matCsrVal(nMat);     // CSR values for refinement SpMV
+  vector<MetalMirror<float>> matRowScale(nMat);   // equilibration row scale
+  vector<MetalMirror<float>> matColScale(nMat);   // equilibration col scale
+  vector<MetalMirror<float>> matB(nMat);          // RHS in float32
 
   for (size_t mi = 0; mi < nMat; mi++) {
     const CsrMatrix& A = matrices[mi].first;
@@ -868,9 +897,11 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
       bp(perm[j]) = float(rowScale[j] * b(preproc.rowPerm[j]));
     memcpy(matXGpu[mi].ptr(), bp.data(), n * sizeof(float));
 
-    // Zero-init accumulated solution
-    matXAccum[mi].resizeToAtLeast(n);
-    memset(matXAccum[mi].ptr(), 0, n * sizeof(float));
+    // Zero-init accumulated solution (double-float: hi + lo)
+    matXAccumHi[mi].resizeToAtLeast(n);
+    memset(matXAccumHi[mi].ptr(), 0, n * sizeof(float));
+    matXAccumLo[mi].resizeToAtLeast(n);
+    memset(matXAccumLo[mi].ptr(), 0, n * sizeof(float));
 
     // Upload refinement data
     vector<float> csrValF(A.values.begin(), A.values.end());
@@ -898,31 +929,61 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   for (size_t mi = 0; mi < nMat; mi++) {
     numCtx->reset();
 
-    // Factor
+    // Factor with device pivots in external encoder mode
     solver->factorLU(matData[mi].ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
-    numCtx->flush();
 
-    // Initial solve
+    // Initial solve with device pivots
     solver->solveLU(matData[mi].ptr(), devPivots.ptr(), matXGpu[mi].ptr(), n, 1,
                     *solveCtx, PivotLocation::Device);
 
-    // Fused refinement: refine_kernel → solveLU → ...
+    // Fused refinement: accumulate → SpMV → solveLU → ...
     for (int iter = 0; iter < maxRefine; iter++) {
       void* enc = symCtx.getExternalEncoder();
 
-      metalCtx.setPipelineState(enc, refinePipeline);
-      metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
-      metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
-      metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
-      metalCtx.setBuffer(enc, devPerm.buffer(), 3);
-      metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
-      metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
-      metalCtx.setBuffer(enc, matColScale[mi].buffer(), 6);
-      metalCtx.setBuffer(enc, matB[mi].buffer(), 7);
-      metalCtx.setBuffer(enc, matXAccum[mi].buffer(), 8);
-      metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
-      metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
-      metalCtx.dispatchThreads(enc, refinePipeline, 1);
+      if (useParallelRefine) {
+        // Kernel A: parallel accumulate with double-float (one thread per element)
+        metalCtx.setPipelineState(enc, accumPipeline);
+        metalCtx.setBuffer(enc, devPerm.buffer(), 0);
+        metalCtx.setBuffer(enc, matColScale[mi].buffer(), 1);
+        metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 2);
+        metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 3);
+        metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 4);
+        metalCtx.setBytes(enc, &n, sizeof(int64_t), 5);
+        metalCtx.dispatchThreads(enc, accumPipeline, n);
+
+        // Barrier: accumulate must finish before SpMV reads x_accum
+        metalCtx.memoryBarrier(enc);
+
+        // Kernel B: parallel SpMV with compensated dot product (one thread per row)
+        metalCtx.setPipelineState(enc, spmvPipeline);
+        metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+        metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+        metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+        metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+        metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+        metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+        metalCtx.setBuffer(enc, matB[mi].buffer(), 6);
+        metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 7);
+        metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 8);
+        metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+        metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
+        metalCtx.dispatchThreads(enc, spmvPipeline, n);
+      } else {
+        // Small matrix: single-threaded kernel (simple float32)
+        metalCtx.setPipelineState(enc, refinePipeline);
+        metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+        metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+        metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+        metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+        metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+        metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+        metalCtx.setBuffer(enc, matColScale[mi].buffer(), 6);
+        metalCtx.setBuffer(enc, matB[mi].buffer(), 7);
+        metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 8);
+        metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+        metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
+        metalCtx.dispatchThreads(enc, refinePipeline, 1);
+      }
 
       solver->solveLU(matData[mi].ptr(), devPivots.ptr(), matXGpu[mi].ptr(), n, 1,
                       *solveCtx, PivotLocation::Device);
@@ -944,14 +1005,16 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     LUTimingResult res;
 
     // Apply final correction (last solveLU result not yet accumulated by GPU kernel)
+    // Use float64 for the final accumulation to recover full double-float precision
     vector<float> xVec(n);
     memcpy(xVec.data(), matXGpu[mi].ptr(), n * sizeof(float));
-    for (int64_t j = 0; j < n; j++) {
-      matXAccum[mi].ptr()[j] += matColScale[mi].ptr()[j] * xVec[perm[j]];
-    }
 
     Eigen::VectorXd x(n);
-    for (int64_t j = 0; j < n; j++) x(j) = double(matXAccum[mi].ptr()[j]);
+    for (int64_t j = 0; j < n; j++) {
+      double accum = double(matXAccumHi[mi].ptr()[j]) + double(matXAccumLo[mi].ptr()[j]);
+      accum += double(matColScale[mi].ptr()[j]) * double(xVec[perm[j]]);
+      x(j) = accum;
+    }
 
     res.factorTime = totalGpuTime / double(nMat);  // approximate per-matrix
     res.solveTime = 0;

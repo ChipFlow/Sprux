@@ -193,6 +193,11 @@ void MetalContext::dispatchThreads(void* encoder, void* pipelineState, int numTh
   [enc dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
 }
 
+void MetalContext::memoryBarrier(void* encoder) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
 bool MetalContext::beginCapture(const char* outputPath) {
   @autoreleasepool {
     MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];

@@ -1723,8 +1723,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (n <= 0) return 0;
 
-      // CPU path: no pending GPU work, operate directly
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
+      // CPU path: no pending GPU work AND not using external encoder.
+      // In external encoder mode, GPU work is encoded but not yet executed,
+      // so CPU reads would see stale pre-factorization data.
+      if (!pendingEncoder_ && !pendingCmdBuf_ && !sym.usingExternalEncoder) {
         int64_t count = 0;
         for (int64_t i = 0; i < n; i++) {
           int64_t idx = offset + i * stride + i;
@@ -1882,7 +1884,27 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       int64_t pivotOffset = pivots - allPivotsCpuBase_;
       allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
 
-      int64_t pivotByteOffset = pivotOffset * sizeof(int64_t);
+      // Determine destination buffer for converted pivots.
+      // In external encoder mode, write directly to the caller's pivot buffer
+      // to avoid a CPU memcpy that would read stale (pre-execution) data.
+      // In normal mode, write to devAllPivots (flushed via commitAndWait+memcpy).
+      id<MTLBuffer> dstBuffer;
+      int64_t dstByteOffset;
+      if (sym.usingExternalEncoder) {
+        auto bufInfo = MetalBufferRegistry::instance().findBuffer(allPivotsCpuBase_);
+        if (bufInfo.first) {
+          dstBuffer = (__bridge id<MTLBuffer>)bufInfo.first;
+          dstByteOffset = (int64_t)bufInfo.second + pivotOffset * (int64_t)sizeof(int64_t);
+        } else {
+          // Fallback: use devAllPivots (will need memcpy later)
+          dstBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
+          dstByteOffset = pivotOffset * (int64_t)sizeof(int64_t);
+        }
+      } else {
+        dstBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
+        dstByteOffset = pivotOffset * (int64_t)sizeof(int64_t);
+      }
+
       id<MTLComputePipelineState> convertPipeline = getProfiledPipeline(
               "lu_convertPivots_kernel_float");
       encodeKernel(
@@ -1890,8 +1912,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)devPivotBuf32.buffer()
                         offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)devAllPivots.buffer()
-                        offset:pivotByteOffset atIndex:1];
+            [encoder setBuffer:dstBuffer
+                        offset:(NSUInteger)dstByteOffset atIndex:1];
             [encoder setBytes:&minMN length:sizeof(int64_t) atIndex:2];
           },
           (NSUInteger)minMN);
@@ -2303,9 +2325,15 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     flushPendingGemms();
     if (explicitRecording_) return;
     if (pivotsOnGpu_ && allPivotsCount_ > 0) {
-      // On Metal unified memory, devAllPivots.ptr() and devDstPivots are both
-      // CPU-accessible pointers to Metal buffer backing stores.
-      memcpy(devDstPivots, devAllPivots.ptr(), allPivotsCount_ * sizeof(int64_t));
+      if (sym.usingExternalEncoder) {
+        // External encoder mode: convert kernel already wrote directly to
+        // devDstPivots buffer (see getrfMPS). No memcpy needed — data will
+        // be valid when the command buffer executes.
+      } else {
+        // Normal mode: commit GPU work and copy from devAllPivots to host.
+        commitAndWait();
+        memcpy(devDstPivots, devAllPivots.ptr(), allPivotsCount_ * sizeof(int64_t));
+      }
       pivotsOnGpu_ = false;
       allPivotsCpuBase_ = nullptr;
       allPivotsCount_ = 0;

@@ -1407,38 +1407,137 @@ kernel void lu_solveU_direct_kernel_float(
 // Iterative refinement step kernel (fused unpermute + accumulate + SpMV + permute)
 // ============================================================================
 
-// After solveLU writes correction to xGpu, this kernel:
-// 1. Unpermutes correction and accumulates into x: x[j] += colScale[j] * xGpu[perm[j]]
-// 2. Computes SpMV residual: r[i] = b[i] - sum_k(A[i,k] * x[k]) using CSR
-// 3. Permutes residual for next solveLU: xGpu[perm[j]] = rowScale[j] * r[rowPerm[j]]
-// Single-threaded for small matrices (n <= ~100).
+// ============================================================================
+// Iterative refinement with compensated (double-float) arithmetic.
+// Metal has no native float64; instead we use (hi, lo) float32 pairs
+// that together represent a value with ~48 bits of mantissa.
+// This enables convergence of iterative refinement for large matrices
+// where float32 alone would diverge.
+// ============================================================================
+
+// Two-Sum: exact floating-point addition a + b = s + t
+// where s = fl(a+b) and t captures the rounding error exactly
+inline void twoSum(float a, float b, thread float& s, thread float& t) {
+    s = a + b;
+    float v = s - a;
+    t = (a - (s - v)) + (b - v);
+}
+
+// Two-Prod via FMA: exact floating-point multiplication a * b = p + e
+// where p = fl(a*b) and e captures the rounding error exactly
+inline void twoProd(float a, float b, thread float& p, thread float& e) {
+    p = a * b;
+    e = fma(a, b, -p);  // Metal supports hardware FMA
+}
+
+// Double-float addition: (a_hi, a_lo) + b → (s_hi, s_lo)
+inline void dfAdd(float a_hi, float a_lo, float b,
+                  thread float& s_hi, thread float& s_lo) {
+    float t1, t2;
+    twoSum(a_hi, b, t1, t2);
+    t2 += a_lo;
+    twoSum(t1, t2, s_hi, s_lo);
+}
+
+// Double-float addition: (a_hi, a_lo) + (b_hi, b_lo) → (s_hi, s_lo)
+inline void dfAdd2(float a_hi, float a_lo, float b_hi, float b_lo,
+                   thread float& s_hi, thread float& s_lo) {
+    float t1, t2;
+    twoSum(a_hi, b_hi, t1, t2);
+    t2 += a_lo + b_lo;
+    twoSum(t1, t2, s_hi, s_lo);
+}
+
+// Step 1: Unpermute correction and accumulate into double-float solution.
+// One thread per element.
+// x_accum = (hi, lo) pair; correction = colScale[j] * xGpu[perm[j]]
+kernel void refine_accumulate_kernel_float(
+    device const int64_t* perm [[buffer(0)]],
+    device const float* colScale [[buffer(1)]],
+    device float* x_accum_hi [[buffer(2)]],
+    device float* x_accum_lo [[buffer(3)]],
+    device const float* xGpu [[buffer(4)]],
+    constant int64_t& n [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(n)) return;
+    int64_t j = int64_t(tid);
+    float correction = colScale[j] * xGpu[perm[j]];
+    float hi, lo;
+    dfAdd(x_accum_hi[j], x_accum_lo[j], correction, hi, lo);
+    x_accum_hi[j] = hi;
+    x_accum_lo[j] = lo;
+}
+
+// Step 2: SpMV residual with double-float precision.
+// One thread per row. Uses TwoProd (FMA) for exact A*x products and
+// compensated summation for the dot product. Achieves ~float64 residual
+// precision, enabling iterative refinement convergence for κ(A) up to ~1e14.
+kernel void refine_spmv_kernel_float(
+    device const int64_t* csrRowPtr [[buffer(0)]],
+    device const int64_t* csrColInd [[buffer(1)]],
+    device const float* csrValues [[buffer(2)]],
+    device const int64_t* perm [[buffer(3)]],
+    device const int64_t* rowPerm [[buffer(4)]],
+    device const float* rowScale [[buffer(5)]],
+    device const float* b_hi [[buffer(6)]],
+    device const float* x_accum_hi [[buffer(7)]],
+    device const float* x_accum_lo [[buffer(8)]],
+    device float* xGpu [[buffer(9)]],
+    constant int64_t& n [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(n)) return;
+    int64_t j = int64_t(tid);
+    int64_t srcRow = rowPerm[j];
+
+    // Double-float dot product: sum = A[srcRow,:] * x_accum
+    // Each product uses TwoProd for exact error capture, then
+    // accumulated via double-float addition.
+    float sum_hi = 0.0f, sum_lo = 0.0f;
+    for (int64_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
+        int64_t col = csrColInd[k];
+        float val = csrValues[k];
+        float x_hi = x_accum_hi[col];
+        float x_lo = x_accum_lo[col];
+
+        // TwoProd: val * x_hi = prod_hi + prod_err (exact via FMA)
+        float prod_hi, prod_err;
+        twoProd(val, x_hi, prod_hi, prod_err);
+        // Full product ≈ prod_hi + (prod_err + val * x_lo)
+        float prod_lo = prod_err + val * x_lo;
+
+        // Accumulate (prod_hi, prod_lo) into (sum_hi, sum_lo)
+        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+    }
+    // Residual: b - sum, computed in double-float
+    // (sum_hi + sum_lo) ≈ A[row,:] * x with ~float64 precision
+    float residual = (b_hi[srcRow] - sum_hi) - sum_lo;
+    xGpu[perm[j]] = rowScale[j] * residual;
+}
+
+// Legacy single-threaded version for small matrices (n <= ~100).
+// Uses simple float32 — sufficient for well-conditioned small systems.
 kernel void refine_step_kernel_float(
     device const int64_t* csrRowPtr [[buffer(0)]],
     device const int64_t* csrColInd [[buffer(1)]],
     device const float* csrValues [[buffer(2)]],
-    device const int64_t* perm [[buffer(3)]],       // paramToSpan permutation
-    device const int64_t* rowPerm [[buffer(4)]],     // preprocessing rowPerm
+    device const int64_t* perm [[buffer(3)]],
+    device const int64_t* rowPerm [[buffer(4)]],
     device const float* rowScale [[buffer(5)]],
     device const float* colScale [[buffer(6)]],
-    device const float* b [[buffer(7)]],             // original RHS (float32)
-    device float* x_accum [[buffer(8)]],             // accumulated solution
-    device float* xGpu [[buffer(9)]],                // correction in / residual out
+    device const float* b [[buffer(7)]],
+    device float* x_accum [[buffer(8)]],
+    device float* xGpu [[buffer(9)]],
     constant int64_t& n [[buffer(10)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0) return;
 
-    // Step 1: Unpermute correction and accumulate
-    // CPU equivalent: x[j] += colScale[j] * xGpu[perm[j]]
     for (int64_t j = 0; j < n; j++) {
         x_accum[j] += colScale[j] * xGpu[perm[j]];
     }
 
-    // Step 2+3: SpMV residual and permute for next solve
-    // For each output position perm[j]:
-    //   srcRow = rowPerm[j]
-    //   r = b[srcRow] - dot(A[srcRow,:], x_accum)
-    //   xGpu[perm[j]] = rowScale[j] * r
     for (int64_t j = 0; j < n; j++) {
         int64_t srcRow = rowPerm[j];
         float dot = 0.0f;

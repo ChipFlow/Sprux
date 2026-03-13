@@ -102,6 +102,7 @@ class MetalContext {
   void setBuffer(void* encoder, void* buffer, int index);
   void setBytes(void* encoder, const void* data, size_t length, int index);
   void dispatchThreads(void* encoder, void* pipelineState, int numThreads);
+  void memoryBarrier(void* encoder);  // MTLBarrierScopeBuffers
 
   // GPU trace capture (for profiling)
   // Set METAL_CAPTURE_ENABLED=1 env var, then call begin/endCapture
