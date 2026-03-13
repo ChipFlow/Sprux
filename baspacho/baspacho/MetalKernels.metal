@@ -1326,23 +1326,6 @@ kernel void lu_gemvDirect_kernel_float(
     }
 }
 
-// LU getrf kernel: standalone (for when not using fused lump kernel)
-// In-place LU with partial pivoting on a single block
-kernel void lu_getrf_kernel_float(
-    device float* data [[buffer(0)]],
-    constant int64_t& offA [[buffer(1)]],
-    constant int64_t& m [[buffer(2)]],
-    constant int64_t& n [[buffer(3)]],
-    device int64_t* pivots [[buffer(4)]],
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid != 0) return;
-
-    int64_t minMN = m < n ? m : n;
-    device float* A = data + offA;
-    lu_factor(A, int(n), int(minMN), pivots);
-}
-
 // Convert MPS uint32_t pivots to int64_t (MPS outputs 0-based uint32, BaSpaCho uses int64)
 kernel void lu_convertPivots_kernel_float(
     device const uint32_t* src [[buffer(0)]],

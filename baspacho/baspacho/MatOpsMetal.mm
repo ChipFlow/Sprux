@@ -1801,61 +1801,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  // Custom compute kernel for LU factorization — external encoder compatible.
-  // Single-threaded sequential LU with partial pivoting on GPU.
-  // Outputs int64_t pivots directly — no uint32→int64 conversion needed.
-  int getrfCustomKernel(int64_t m, int64_t n, int64_t minMN,
-                        id<MTLBuffer> dataBuffer, size_t dataBaseOffset,
-                        int64_t offA, int64_t* pivots) {
-    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
-            "lu_getrf_kernel_float");
-
-    // Compute absolute offset from buffer start (element offset)
-    int64_t absOffA = (int64_t)(dataBaseOffset / sizeof(float)) + offA;
-
-    // Determine pivot output buffer and offset
-    id<MTLBuffer> pivotBuffer;
-    size_t pivotByteOffset = 0;
-    if (devAllPivots.buffer()) {
-      // GPU-resident pivot path: write directly into persistent devAllPivots
-      if (!allPivotsCpuBase_) {
-        allPivotsCpuBase_ = pivots;
-      }
-      int64_t pivotElemOffset = pivots - allPivotsCpuBase_;
-      allPivotsCount_ = std::max(allPivotsCount_, pivotElemOffset + minMN);
-      pivotBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
-      pivotByteOffset = pivotElemOffset * sizeof(int64_t);
-      pivotsOnGpu_ = true;
-    } else {
-      devPivots.resizeToAtLeast(minMN);
-      pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
-      pivotByteOffset = 0;
-    }
-
-    encodeKernel(
-        pipeline,
-        ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBuffer:dataBuffer offset:0 atIndex:0];
-          [encoder setBytes:&absOffA length:sizeof(int64_t) atIndex:1];
-          [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
-          [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
-          [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:4];
-        },
-        1);
-
-    if (!devAllPivots.buffer()) {
-      // Non-general fallback: commit and read pivots back to CPU
-      commitPending();
-      waitForGpu();
-      int64_t* gpuPivots = devPivots.ptr();
-      for (int64_t i = 0; i < minMN; i++) {
-        pivots[i] = gpuPivots[i];
-      }
-    }
-
-    return 0;
-  }
-
   // MPS-based LU factorization. In external encoder mode, temporarily ends
   // the compute encoder, encodes MPS to the same command buffer, then creates
   // a new compute encoder for subsequent kernel dispatches.
