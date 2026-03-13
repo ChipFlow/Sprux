@@ -428,6 +428,9 @@ struct MetalSymbolicCtx : SymbolicCtx {
   }
 
   void clearExternalEncoder() override {
+    if (externalEncoder) {
+      [externalEncoder endEncoding];
+    }
     externalCmdBuf = nil;
     externalEncoder = nil;
     usingExternalEncoder = false;
@@ -1790,14 +1793,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // complement updates are dispatched before factorization of this lump.
       flushPendingGemms();
 
-      // External encoder mode: use custom compute kernel (encodeKernel-compatible).
-      // MPS encodeToCommandBuffer is incompatible with external encoder.
-      // Normal mode: use MPS for better performance on larger blocks.
-      if (sym.usingExternalEncoder) {
-        return getrfCustomKernel(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
-      } else {
-        return getrfMPS(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
-      }
+      // Always use MPS for LU factorization — faster than custom kernel.
+      // In external encoder mode, getrfMPS temporarily ends the compute
+      // encoder, encodes MPS to the same command buffer, then creates a
+      // new compute encoder for subsequent dispatches.
+      return getrfMPS(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
     }
   }
 
@@ -1856,20 +1856,30 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     return 0;
   }
 
-  // MPS-based LU factorization — faster for normal mode but incompatible
-  // with external encoder (MPS requires encodeToCommandBuffer, not compute encoder).
+  // MPS-based LU factorization. In external encoder mode, temporarily ends
+  // the compute encoder, encodes MPS to the same command buffer, then creates
+  // a new compute encoder for subsequent kernel dispatches.
   int getrfMPS(int64_t m, int64_t n, int64_t minMN,
                id<MTLBuffer> dataBuffer, size_t dataBaseOffset,
                int64_t offA, int64_t* pivots) {
-    // End pending compute encoder (MPS needs its own encoding)
-    if (pendingEncoder_) {
-      [pendingEncoder_ endEncoding];
-      pendingEncoder_ = nil;
-    }
+    id<MTLCommandBuffer> cmdBuf;
 
-    // Ensure we have a command buffer
-    if (!pendingCmdBuf_) {
-      pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+    if (sym.usingExternalEncoder) {
+      // External encoder mode: end the current external encoder so MPS
+      // can encode to the same command buffer. We'll create a new encoder after.
+      [sym.externalEncoder endEncoding];
+      sym.externalEncoder = nil;
+      cmdBuf = sym.externalCmdBuf;
+    } else {
+      // Normal mode: end pending compute encoder (MPS needs its own encoding)
+      if (pendingEncoder_) {
+        [pendingEncoder_ endEncoding];
+        pendingEncoder_ = nil;
+      }
+      if (!pendingCmdBuf_) {
+        pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+      }
+      cmdBuf = pendingCmdBuf_;
     }
 
     // Create MPSMatrix view for the block at data+offA (row-major, m×n, stride=n)
@@ -1893,18 +1903,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     // Encode MPS LU factorization (in-place: resultMatrix = sourceMatrix)
     MPSMatrixDecompositionLU* mpsLU = [[MPSMatrixDecompositionLU alloc]
         initWithDevice:sym.device rows:m columns:n];
-    [mpsLU encodeToCommandBuffer:pendingCmdBuf_
+    [mpsLU encodeToCommandBuffer:cmdBuf
         sourceMatrix:mpsA resultMatrix:mpsA
         pivotIndices:mpsPiv status:nil];
 
-    // When profiling, commit and wait to get per-getrf GPU timestamps
-    if (metalProfilingEnabled()) {
+    // When profiling in normal mode, commit and wait to get per-getrf GPU timestamps
+    if (!sym.usingExternalEncoder && metalProfilingEnabled()) {
       [pendingCmdBuf_ commit];
       [pendingCmdBuf_ waitUntilCompleted];
       double gpuTimeMs = ([pendingCmdBuf_ GPUEndTime] - [pendingCmdBuf_ GPUStartTime]) * 1000.0;
       NSLog(@"[GPU] %-45s  size=%lldx%lld  gpu=%.3fms",
             "MPS_LU_getrf", m, n, gpuTimeMs);
       pendingCmdBuf_ = nil;
+    }
+
+    if (sym.usingExternalEncoder) {
+      // Create a new compute encoder on the same command buffer for
+      // subsequent kernel dispatches (pivot conversion + rest of factorLU)
+      sym.externalEncoder = [sym.externalCmdBuf computeCommandEncoder];
+      pendingDispatchCount_ = 0;
     }
 
     // GPU-resident pivot path: encode GPU-side uint32→int64 conversion
@@ -1933,8 +1950,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       pivotsOnGpu_ = true;
     } else {
       // Fallback: non-general matrix, commit and read pivots on CPU
-      commitPending();
-      waitForGpu();
+      if (!sym.usingExternalEncoder) {
+        commitPending();
+        waitForGpu();
+      }
       uint32_t* mpsPivots = devPivotBuf32.ptr();
       for (int64_t i = 0; i < minMN; i++) {
         pivots[i] = static_cast<int64_t>(mpsPivots[i]);

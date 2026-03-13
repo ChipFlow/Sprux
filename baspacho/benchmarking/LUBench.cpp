@@ -440,10 +440,12 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
       // Set external encoder — all kernel dispatches go into this encoder
       symCtx.setExternalEncoder(cmdBuf, encoder);
       solver->factorLU(dataGpu.ptr(), pivots.data(), *numCtx);
+
+      // clearExternalEncoder ends the current encoder (which may have been
+      // replaced by getrfMPS if MPS was used for LU factorization).
       symCtx.clearExternalEncoder();
 
-      // End encoder, commit + wait
-      metalCtx.endEncoding(encoder);
+      // Commit + wait (encoder already ended by clearExternalEncoder)
       metalCtx.commitAndWait(cmdBuf);
 
       // Flush deferred GPU state (copies pivots from devAllPivots to host)
