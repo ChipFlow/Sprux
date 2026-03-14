@@ -1018,6 +1018,22 @@ kernel void lu_factor_lump_kernel_float(
                       belowDiagBlockPtr, int(lumpSize), int(numRows));
 }
 
+// Simple per-lump getrf kernel for the dense factorization path.
+// Dispatched as 1 thread per lump. Calls the existing lu_factor() inline.
+// Outputs int64_t pivots directly — no uint32 conversion needed (unlike MPS path).
+kernel void lu_getrf_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& offA [[buffer(1)]],
+    constant int64_t& m [[buffer(2)]],
+    constant int64_t& n [[buffer(3)]],
+    device int64_t* pivots [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid > 0) return;
+    int64_t minMN = min(m, n);
+    lu_factor(data + offA, int(n), int(minMN), pivots);
+}
+
 // Apply row permutation to factored matrix columns (for the block above diagonal in LU)
 // pivots[i] indicates row i should be swapped with row pivots[i]
 // Data is column-major with stride ld
@@ -1323,18 +1339,6 @@ kernel void lu_gemvDirect_kernel_float(
             sum += data[offset + row * nCols + col] * vec[srcOff + col + rhs * ldVec];
         }
         vec[dstOff + row + rhs * ldVec] += alpha * sum;
-    }
-}
-
-// Convert MPS uint32_t pivots to int64_t (MPS outputs 0-based uint32, BaSpaCho uses int64)
-kernel void lu_convertPivots_kernel_float(
-    device const uint32_t* src [[buffer(0)]],
-    device int64_t* dst [[buffer(1)]],
-    constant int64_t& count [[buffer(2)]],
-    uint tid [[thread_position_in_grid]])
-{
-    if (tid < uint(count)) {
-        dst[tid] = int64_t(src[tid]);
     }
 }
 
