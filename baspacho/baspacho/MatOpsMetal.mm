@@ -14,7 +14,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <typeindex>
-#include <unordered_map>
 
 #include <Eigen/Dense>
 #include "baspacho/baspacho/CoalescedBlockMatrix.h"
@@ -481,38 +480,15 @@ struct MetalOps : Ops {
   }
 };
 
-// Helper to dispatch a Metal compute kernel
-// GPU profiling: set BASPACHO_METAL_PROFILE=1 to log kernel names + GPU times
-static bool metalProfilingEnabled() {
-  static bool enabled = [] {
-    const char* val = getenv("BASPACHO_METAL_PROFILE");
-    return val && std::string(val) == "1";
-  }();
-  return enabled;
-}
-
-// Map pipeline states to their kernel names for profiling output
-static std::unordered_map<const void*, std::string>& pipelineNameMap() {
-  static std::unordered_map<const void*, std::string> map;
-  return map;
-}
-
-static id<MTLComputePipelineState> getProfiledPipeline(const char* name) {
-  auto pipeline =
-      (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(name);
-  if (metalProfilingEnabled()) {
-    pipelineNameMap()[(__bridge const void*)pipeline] = name;
-  }
-  return pipeline;
+// Helper to get a Metal compute pipeline by kernel name
+static id<MTLComputePipelineState> getPipeline(const char* name) {
+  return (__bridge id<MTLComputePipelineState>)
+      MetalContext::instance().getPipelineState(name);
 }
 
 static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
                            void (^encodeBlock)(id<MTLComputeCommandEncoder>),
-                           NSUInteger numThreads, bool sync = true,
-                           const char* kernelName = nullptr) {
-  // When profiling, force sync to read GPU timestamps
-  if (metalProfilingEnabled()) sync = true;
-
+                           NSUInteger numThreads, bool sync = true) {
   @autoreleasepool {
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -533,23 +509,6 @@ static void dispatchKernel(id<MTLCommandQueue> queue, id<MTLComputePipelineState
 
     if (sync) {
       [cmdBuf waitUntilCompleted];
-    }
-
-    if (sync && metalProfilingEnabled()) {
-      double gpuTimeMs = ([cmdBuf GPUEndTime] - [cmdBuf GPUStartTime]) * 1000.0;
-      const char* name = kernelName;
-      std::string lookupName;
-      if (!name) {
-        auto it = pipelineNameMap().find((__bridge const void*)pipeline);
-        if (it != pipelineNameMap().end()) {
-          lookupName = it->second;
-          name = lookupName.c_str();
-        }
-      }
-      if (name) {
-        NSLog(@"[GPU] %-45s  threads=%-6lu  gpu=%.3fms",
-              name, (unsigned long)numThreads, gpuTimeMs);
-      }
     }
   }
 }
@@ -747,7 +706,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       int64_t countI64 = (int64_t)count;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_batchedSaveGemm_kernel_float");
 
       encodeKernel(
@@ -794,7 +753,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     size_t writeOffset = gemmWorkBufUsedBytes_;
     memcpy((char*)devGemmWorkBuf_.ptr() + writeOffset, pendingGemms_.data(), bytesNeeded);
 
-    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+    id<MTLComputePipelineState> pipeline = getPipeline(
             "lu_batchedSaveGemm_kernel_float");
 
     encodeKernel(
@@ -825,7 +784,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       size_t dataBaseOffset = bufferInfo.second;
 
       // Get pipeline state for factor_spans_kernel_float
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "factor_spans_kernel_float");
 
       int64_t numSpans = spanEnd - spanBegin;
@@ -1095,11 +1054,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       *(uint32_t*)[perturbBuf contents] = 0;
 
       id<MTLComputePipelineState> factorPipeline =
-          getProfiledPipeline("lu_factor_lumps_kernel_float");
+          getPipeline("lu_factor_lumps_kernel_float");
       id<MTLComputePipelineState> phase1Pipeline =
-          getProfiledPipeline("lu_sparse_elim_phase1_float");
+          getPipeline("lu_sparse_elim_phase1_float");
       id<MTLComputePipelineState> phase2Pipeline =
-          getProfiledPipeline("sparse_elim_phase2_float");
+          getPipeline("sparse_elim_phase2_float");
 
       // Compute max scratch buffer size across all levels
       int64_t maxScratchSize = 0;
@@ -1233,11 +1192,11 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       size_t dataBaseOffset = bufferInfo.second;
 
       id<MTLComputePipelineState> factorPipeline =
-          getProfiledPipeline("factor_lumps_kernel_float");
+          getPipeline("factor_lumps_kernel_float");
       id<MTLComputePipelineState> cholPhase1Pipeline =
-          getProfiledPipeline("chol_sparse_elim_phase1_float");
+          getPipeline("chol_sparse_elim_phase1_float");
       id<MTLComputePipelineState> phase2Pipeline =
-          getProfiledPipeline("sparse_elim_phase2_float");
+          getPipeline("sparse_elim_phase2_float");
 
       // Compute max scratch buffer size across all levels
       int64_t maxScratchSize = 0;
@@ -1366,7 +1325,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       resultBuf.resizeToAtLeast(1);
       resultBuf.ptr()[0] = 0;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline("maxAbsDiag_kernel_float");
+      id<MTLComputePipelineState> pipeline = getPipeline("maxAbsDiag_kernel_float");
 
       int wgs = 256;
       int numGroups = (int)((numLumps + wgs - 1) / wgs);
@@ -1613,7 +1572,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     int64_t numEntries = skel.chainColPtr[targetLump + 1] - skel.chainColPtr[targetLump];
     if (numEntries <= 0) return;
 
-    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+    id<MTLComputePipelineState> pipeline = getPipeline(
             "prepareAssemble_kernel_float");
 
     encodeKernel(
@@ -1650,7 +1609,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       size_t dataBaseOffset = bufferInfo.second;
 
       // Get pipeline state
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "assemble_kernel_float");
 
       int64_t numThreads = numBlockRows * numBlockCols;
@@ -1658,35 +1617,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Compute startRow = chainRowsTillEnd[srcColDataOffset - 1] (element before chain start)
       // This matches CPU ref where startRow = pChainRowsTillEnd[-1] after offsetting the pointer
       int64_t startRow = (srcColDataOffset > 0) ? sym.skel.chainRowsTillEnd[srcColDataOffset - 1] : 0;
-
-      // Profiling fallback: use dispatchKernel for per-kernel GPU timestamps
-      if (metalProfilingEnabled()) {
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBytes:&numBlockRows length:sizeof(int64_t) atIndex:0];
-              [encoder setBytes:&numBlockCols length:sizeof(int64_t) atIndex:1];
-              [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:2];
-              [encoder setBytes:&srcRectWidth length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&dstStride length:sizeof(int64_t) atIndex:4];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
-                          offset:srcColDataOffset * sizeof(int64_t)
-                         atIndex:5];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                          offset:srcColDataOffset * sizeof(int64_t)
-                         atIndex:6];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)devSpanToChainOffset.buffer()
-                          offset:0
-                         atIndex:7];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanOffsetInLump.buffer()
-                          offset:0
-                         atIndex:8];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)tempBuffer.buffer() offset:0 atIndex:9];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:10];
-            },
-            (NSUInteger)numThreads);
-        return;
-      }
 
       encodeKernel(
           pipeline,
@@ -1756,7 +1686,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         perturbCountPending_ = true;
       }
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_perturbDiag_kernel_float");
 
       // Adjust offset to be relative to the MTLBuffer start
@@ -1848,24 +1778,10 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     // Absolute element offset into the data buffer
     int64_t absOffA = (int64_t)(dataBaseOffset / sizeof(float)) + offA;
 
-    id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+    id<MTLComputePipelineState> pipeline = getPipeline(
             "lu_getrf_kernel_float");
 
-    // Profiling path: individual dispatch for per-kernel timing
-    if (metalProfilingEnabled()) {
-      dispatchKernel(
-          sym.commandQueue, pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:dataBuffer offset:0 atIndex:0];
-            [encoder setBytes:&absOffA length:sizeof(int64_t) atIndex:1];
-            [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
-            [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
-            [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:4];
-          }, 1);
-      return 0;
-    }
-
-    // Normal path: dispatch via encodeKernel (stays in same encoder)
+    // Dispatch via encodeKernel (stays in same encoder)
     encodeKernel(
         pipeline,
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1896,24 +1812,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
       size_t bBaseOffset = bBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_trsmLowerUnit_kernel_float");
-
-      if (metalProfilingEnabled()) {
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
-              [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
-              [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
-              [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
-              [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
-            },
-            1);
-        return;
-      }
 
       encodeKernel(
           pipeline,
@@ -1947,24 +1847,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> bBuffer = (__bridge id<MTLBuffer>)bBufferInfo.first;
       size_t bBaseOffset = bBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_trsmUpperRight_kernel_float");
-
-      if (metalProfilingEnabled()) {
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:0];
-              [encoder setBytes:&offU length:sizeof(int64_t) atIndex:1];
-              [encoder setBuffer:bBuffer offset:bBaseOffset atIndex:2];
-              [encoder setBytes:&offB length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&m length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
-              [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
-            },
-            1);
-        return;
-      }
 
       encodeKernel(
           pipeline,
@@ -1986,46 +1870,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                          int64_t offC, int64_t ldC) override {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
-
-      // Profiling path: dispatch individually for per-kernel GPU timestamps
-      if (metalProfilingEnabled()) {
-        auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
-        auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
-        auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
-        if (!lBufferInfo.first || !uBufferInfo.first || !cBufferInfo.first) {
-          throw std::runtime_error("MetalNumericCtx<float>::saveGemm: buffer not found");
-        }
-        id<MTLBuffer> lBuffer = (__bridge id<MTLBuffer>)lBufferInfo.first;
-        size_t lBaseOffset = lBufferInfo.second;
-        id<MTLBuffer> uBuffer = (__bridge id<MTLBuffer>)uBufferInfo.first;
-        size_t uBaseOffset = uBufferInfo.second;
-        id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
-        size_t cBaseOffset = cBufferInfo.second;
-
-        id<MTLComputePipelineState> pipeline = getProfiledPipeline(
-                "lu_saveGemm_kernel_float");
-
-        int64_t numThreads = m * n;
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:lBuffer offset:lBaseOffset atIndex:0];
-              [encoder setBytes:&offL length:sizeof(int64_t) atIndex:1];
-              [encoder setBytes:&ldL length:sizeof(int64_t) atIndex:2];
-              [encoder setBuffer:uBuffer offset:uBaseOffset atIndex:3];
-              [encoder setBytes:&offU length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&ldU length:sizeof(int64_t) atIndex:5];
-              [encoder setBuffer:cBuffer offset:cBaseOffset atIndex:6];
-              [encoder setBytes:&offC length:sizeof(int64_t) atIndex:7];
-              [encoder setBytes:&ldC length:sizeof(int64_t) atIndex:8];
-              [encoder setBytes:&m length:sizeof(int64_t) atIndex:9];
-              [encoder setBytes:&n length:sizeof(int64_t) atIndex:10];
-              [encoder setBytes:&k length:sizeof(int64_t) atIndex:11];
-            },
-            (NSUInteger)numThreads);
-        sym.luGemmCalls++;
-        return;
-      }
 
       // Batched GPU path: buffer work items, flush later in flushPendingGemms()
       // On first call, cache the data buffer info (L, U, C all share the same buffer)
@@ -2099,7 +1943,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_applyRowPerm_kernel_float");
 
       // Determine pivot buffer and offset.
@@ -2121,21 +1965,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // Dispatch as single threadgroup with min(256, numCols) threads
       // (threadgroup_barrier in kernel requires single threadgroup)
       NSUInteger numThreads = (NSUInteger)std::min((int64_t)256, numCols);
-
-      if (metalProfilingEnabled()) {
-        dispatchKernel(
-            sym.commandQueue, pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:0];
-              [encoder setBytes:&n length:sizeof(int64_t) atIndex:1];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:2];
-              [encoder setBytes:&offData length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&ld length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&numCols length:sizeof(int64_t) atIndex:5];
-            },
-            numThreads);
-        return;
-      }
 
       encodeKernel(
           pipeline,
@@ -2518,7 +2347,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       if (numLumps <= 0) return;
 
       // Encode diagonal solve kernel
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "sparseElim_diagSolveL_float");
 
       int64_t nRHS64 = nRHS;
@@ -2540,7 +2369,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (NSUInteger)numLumps);
 
       // Encode below-diagonal multiply: matQ -= block * matC
-      id<MTLComputePipelineState> subDiagPipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> subDiagPipeline = getPipeline(
               "sparseElim_subDiagMult_float");
 
       encodeKernel(
@@ -2589,7 +2418,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t nRHS64 = nRHS;
 
       // Encode below-diagonal transpose multiply first: matC -= block^T * matQ
-      id<MTLComputePipelineState> subDiagPipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> subDiagPipeline = getPipeline(
               "sparseElim_subDiagMultT_float");
 
       encodeKernel(
@@ -2614,7 +2443,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (NSUInteger)numLumps);
 
       // Then encode diagonal solve kernel
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "sparseElim_diagSolveLt_float");
 
       encodeKernel(
@@ -2662,7 +2491,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       // No diagonal solve for unit L (diagonal is implicitly 1)
       // Only encode below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
       id<MTLComputePipelineState> subDiagPipeline =
-          getProfiledPipeline("sparseElim_subDiagMult_float");
+          getPipeline("sparseElim_subDiagMult_float");
 
       encodeKernel(
           subDiagPipeline,
@@ -2712,7 +2541,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
       id<MTLComputePipelineState> gatherPipeline =
-          getProfiledPipeline("sparseElim_upperGather_float");
+          getPipeline("sparseElim_upperGather_float");
 
       encodeKernel(
           gatherPipeline,
@@ -2740,7 +2569,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
       // Then: diagonal U solve: v[lump] /= U_diagonal
       id<MTLComputePipelineState> diagPipeline =
-          getProfiledPipeline("sparseElim_diagDivU_float");
+          getPipeline("sparseElim_diagDivU_float");
 
       encodeKernel(
           diagPipeline,
@@ -2779,7 +2608,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t cBaseOffset = cBufferInfo.second;
       size_t dBaseOffset = dBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "cholesky_symm_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -2816,7 +2645,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "cholesky_solveL_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -2852,7 +2681,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataBaseOffset = dataBufferInfo.second;
       size_t aBaseOffset = aBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "cholesky_gemv_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -2885,7 +2714,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "assembleVec_kernel_float");
 
       // startRow = chainRowsTillEnd[chainColPtr - 1] (element before chain start)
@@ -2929,7 +2758,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "cholesky_solveLt_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -2963,7 +2792,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataBaseOffset = dataBufferInfo.second;
       size_t aBaseOffset = aBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "cholesky_gemvT_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -2997,7 +2826,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> cBuffer = (__bridge id<MTLBuffer>)cBufferInfo.first;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "assembleVecT_kernel_float");
 
       // startRow = chainRowsTillEnd[chainColPtr - 1] (element before chain start)
@@ -3044,7 +2873,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_solveLUnit_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -3079,7 +2908,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_solveU_direct_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -3153,7 +2982,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_applyRowPermVec_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -3213,7 +3042,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_applyRowPermVecInv_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -3249,7 +3078,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataBaseOffset = dataBufferInfo.second;
       size_t vecBaseOffset = vecBufferInfo.second;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline(
+      id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_gemvDirect_kernel_float");
 
       int64_t nRHS64 = nRHS;
@@ -3350,7 +3179,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
       // Step 1: Factor lumps - loop dispatch of non-batched kernel
       {
         id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("factor_lumps_kernel_float");
+            getPipeline("factor_lumps_kernel_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -3404,9 +3233,9 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         elimScratchBuffer_.resizeToAtLeast(elim.numCholWorkItems);
 
         id<MTLComputePipelineState> p1Pipeline =
-            getProfiledPipeline("chol_sparse_elim_phase1_float");
+            getPipeline("chol_sparse_elim_phase1_float");
         id<MTLComputePipelineState> p2Pipeline =
-            getProfiledPipeline("sparse_elim_phase2_float");
+            getPipeline("sparse_elim_phase2_float");
 
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
@@ -3671,7 +3500,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         gpuAssemblyUsed_ = true;
       }
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline("assemble_kernel_float");
+      id<MTLComputePipelineState> pipeline = getPipeline("assemble_kernel_float");
 
       int64_t numThreads = numBlockRows * numBlockCols;
       int64_t startRow =
@@ -3772,7 +3601,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Step 1: Diagonal solve L - loop dispatch of non-batched kernel
       {
         id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("sparseElim_diagSolveL_float");
+            getPipeline("sparseElim_diagSolveL_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -3822,7 +3651,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Step 2: Sub-diagonal multiply - loop dispatch of non-batched kernel
       {
         id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("sparseElim_subDiagMult_float");
+            getPipeline("sparseElim_subDiagMult_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -3891,7 +3720,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Step 1: Sub-diagonal transpose multiply - loop dispatch of non-batched kernel
       {
         id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("sparseElim_subDiagMultT_float");
+            getPipeline("sparseElim_subDiagMultT_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -3947,7 +3776,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Step 2: Diagonal solve Lt - loop dispatch of non-batched kernel
       {
         id<MTLComputePipelineState> pipeline =
-            getProfiledPipeline("sparseElim_diagSolveLt_float");
+            getPipeline("sparseElim_diagSolveLt_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -4064,7 +3893,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
     @autoreleasepool {
       if (numColItems <= 0) return;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline("assembleVec_kernel_float");
+      id<MTLComputePipelineState> pipeline = getPipeline("assembleVec_kernel_float");
 
       int64_t startRow =
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
@@ -4161,7 +3990,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
     @autoreleasepool {
       if (numColItems <= 0) return;
 
-      id<MTLComputePipelineState> pipeline = getProfiledPipeline("assembleVecT_kernel_float");
+      id<MTLComputePipelineState> pipeline = getPipeline("assembleVecT_kernel_float");
 
       int64_t startRow =
           (chainColPtr > 0) ? sym.devChainRowsTillEnd.ptr()[chainColPtr - 1] : 0;
