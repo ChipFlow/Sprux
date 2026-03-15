@@ -376,6 +376,25 @@ struct NumericCtx : NumericCtxBase {
     throw std::runtime_error("applyRowPerm: LU not supported by this backend");
   }
 
+  // Whether this backend provides a batched kernel for factorLumpLU's upper spans loop
+  // (applyRowPerm + trsmLowerUnit for each upper chain entry, fused into one dispatch).
+  virtual bool hasBatchFactorUpperSpans() const { return false; }
+
+  // Batched applyRowPerm + trsmLowerUnit for all upper spans of a lump.
+  // Only called when hasBatchFactorUpperSpans() returns true.
+  // Metal override dispatches a single kernel with one threadgroup per span.
+  virtual void batchFactorUpperSpans(T* data, int64_t diagOffset, int64_t lumpSize,
+                                     int64_t* pivots, int64_t pivotOffset, int64_t lump,
+                                     int64_t upperDataBase) {
+    (void)data;
+    (void)diagOffset;
+    (void)lumpSize;
+    (void)pivots;
+    (void)pivotOffset;
+    (void)lump;
+    (void)upperDataBase;
+  }
+
   // Signal start of dense LU operations — GPU backends can sync and copy data
   // to host for CPU BLAS fallback (avoids per-op GPU dispatch overhead).
   // Called before the dense loop in internalFactorRangeLU.

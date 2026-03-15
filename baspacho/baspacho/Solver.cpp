@@ -553,22 +553,30 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
 
   // Process U row to the right of diagonal (if upper triangle storage exists)
   if (factorSkel.isGeneral()) {
-    int64_t upperRowStart = factorSkel.upperChainRowPtr[lump];
-    int64_t upperRowEnd = factorSkel.upperChainRowPtr[lump + 1];
     int64_t upperDataBase = factorSkel.dataSize();  // Upper data starts after lower data
 
-    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
-      int64_t colSpan = factorSkel.upperChainColSpan[i];
-      int64_t colSize = factorSkel.spanStart[colSpan + 1] - factorSkel.spanStart[colSpan];
-      int64_t upperBlockOffset = upperDataBase + factorSkel.upperChainData[i];
+    if (numCtx.hasBatchFactorUpperSpans()) {
+      // Batched path: single kernel dispatch for all upper spans
+      numCtx.batchFactorUpperSpans(data, diagBlockOffset, lumpSize, pivots, pivotOffset, lump,
+                                   upperDataBase);
+    } else {
+      // Default path: per-span dispatch loop
+      int64_t upperRowStart = factorSkel.upperChainRowPtr[lump];
+      int64_t upperRowEnd = factorSkel.upperChainRowPtr[lump + 1];
 
-      // Apply row permutation to upper block (pivots are within lumpSize rows)
-      numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, upperBlockOffset, colSize, 1);
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = factorSkel.upperChainColSpan[i];
+        int64_t colSize = factorSkel.spanStart[colSpan + 1] - factorSkel.spanStart[colSpan];
+        int64_t upperBlockOffset = upperDataBase + factorSkel.upperChainData[i];
 
-      // Solve L * U_block = A_block for U_block
-      // L is unit lower triangular from diagonal block
-      numCtx.trsmLowerUnit(lumpSize, colSize, data, diagBlockOffset, data, upperBlockOffset,
-                           colSize);
+        // Apply row permutation to upper block (pivots are within lumpSize rows)
+        numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, upperBlockOffset, colSize, 1);
+
+        // Solve L * U_block = A_block for U_block
+        // L is unit lower triangular from diagonal block
+        numCtx.trsmLowerUnit(lumpSize, colSize, data, diagBlockOffset, data, upperBlockOffset,
+                             colSize);
+      }
     }
   }
 }

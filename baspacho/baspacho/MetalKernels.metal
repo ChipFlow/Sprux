@@ -1285,6 +1285,58 @@ kernel void lu_trsmUpperRight_kernel_float(
     }
 }
 
+// ============================================================================
+// Batched upper span processing for LU factorization dense loop.
+// Each threadgroup handles one upper chain entry: applyRowPerm + trsmLowerUnit.
+// Replaces numSpans × 2 separate dispatches with a single dispatch.
+// ============================================================================
+kernel void lu_batchUpperTrsmPivot_kernel_float(
+    device float* data [[buffer(0)]],
+    constant float* dataConst [[buffer(1)]],   // same buffer, constant for L reads
+    device int64_t* pivots [[buffer(2)]],
+    constant int64_t& pivotOffset [[buffer(3)]],
+    constant int64_t& diagOffset [[buffer(4)]],
+    constant int64_t& lumpSize [[buffer(5)]],
+    constant int64_t* upperChainColSpan [[buffer(6)]],
+    constant int64_t* upperChainData [[buffer(7)]],
+    constant int64_t* spanStartArr [[buffer(8)]],
+    constant int64_t& upperDataBase [[buffer(9)]],
+    constant int64_t& rangeStart [[buffer(10)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    int64_t idx = rangeStart + int64_t(tg_id);
+
+    int64_t colSpan = upperChainColSpan[idx];
+    int64_t colSize = spanStartArr[colSpan + 1] - spanStartArr[colSpan];
+    int64_t blockOffset = upperDataBase + upperChainData[idx];
+
+    device float* block = data + blockOffset;
+    device int64_t* piv = pivots + pivotOffset;
+
+    // Phase 1: Apply row permutation (same logic as lu_applyRowPerm_kernel_float
+    // with ld=colSize, numCols=1). For colSize=1 (scalar spans, e.g. c6288),
+    // only thread 0 does sequential swaps — no per-step barrier needed.
+    for (int64_t i = 0; i < lumpSize; i++) {
+        int64_t swapRow = piv[i];
+        if (swapRow != i) {
+            for (int64_t c = int64_t(tid); c < colSize; c += int64_t(tg_size)) {
+                float tmp = block[i + c * colSize];
+                block[i + c * colSize] = block[swapRow + c * colSize];
+                block[swapRow + c * colSize] = tmp;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // Phase 2: TRSM Lower Unit (L * X = B, unit lower triangular)
+    // L diagonal block at dataConst + diagOffset, lumpSize × lumpSize, ld = lumpSize
+    // B upper block at block, lumpSize × colSize, ldb = colSize
+    iterativeTrsmLowerUnit(dataConst + diagOffset, lumpSize,
+                           block, colSize, lumpSize, colSize, tid, tg_size);
+}
+
 // Work item for batched saveGemm: one thread computes one full C -= L * U block
 struct LUGemmWorkItem {
     int64_t offL, ldL;   // L block element offset and row stride
