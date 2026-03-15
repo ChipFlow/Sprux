@@ -1781,6 +1781,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     id<MTLComputePipelineState> pipeline = getPipeline(
             "lu_getrf_kernel_float");
 
+    // Compute power-of-2 threadgroup size (matches CUDA dispatch pattern).
+    // Single threadgroup — all threads cooperate via threadgroup_barrier.
+    int threads = std::min((int)std::max(m, n), (int)256);
+    int t = 1;
+    while (t < threads) t <<= 1;
+    NSUInteger numThreads = (NSUInteger)t;
+
     // Dispatch via encodeKernel (stays in same encoder)
     encodeKernel(
         pipeline,
@@ -1790,7 +1797,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           [encoder setBytes:&m length:sizeof(int64_t) atIndex:2];
           [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
           [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:4];
-        }, 1);  // Single thread
+        }, numThreads);
 
     return 0;
   }

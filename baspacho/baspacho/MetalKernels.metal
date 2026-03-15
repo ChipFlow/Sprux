@@ -1018,20 +1018,93 @@ kernel void lu_factor_lump_kernel_float(
                       belowDiagBlockPtr, int(lumpSize), int(numRows));
 }
 
-// Simple per-lump getrf kernel for the dense factorization path.
-// Dispatched as 1 thread per lump. Calls the existing lu_factor() inline.
-// Outputs int64_t pivots directly — no uint32 conversion needed (unlike MPS path).
+// Parallel right-looking LU factorization kernel.
+// Single threadgroup, all threads cooperate on each column k:
+//   1. Parallel pivot search (max |A[i,k]|) via reduction in threadgroup memory
+//   2. Parallel row swap
+//   3. Parallel column scale (A[i,k] /= A[k,k])
+//   4. Parallel trailing matrix update (A[i,j] -= A[i,k]*A[k,j])
+// Same algorithm as sequential lu_factor() — identical pivots and numerical results.
+// Ported from CUDA luFactorRowMajorKernel (MatOpsCuda.cu:773).
 kernel void lu_getrf_kernel_float(
     device float* data [[buffer(0)]],
     constant int64_t& offA [[buffer(1)]],
     constant int64_t& m [[buffer(2)]],
     constant int64_t& n [[buffer(3)]],
     device int64_t* pivots [[buffer(4)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    if (tid > 0) return;
+    // Threadgroup memory for parallel max-abs reduction
+    threadgroup float svals[256];
+    threadgroup int64_t sidx[256];
+
+    device float* A = data + offA;
     int64_t minMN = min(m, n);
-    lu_factor(data + offA, int(n), int(minMN), pivots);
+
+    for (int64_t k = 0; k < minMN; k++) {
+        // Step 1: Find pivot row — max |A[i,k]| for i in [k, m)
+        float myMaxAbs = 0.0f;
+        int64_t myBestRow = k;
+        for (int64_t i = k + tid; i < m; i += nt) {
+            float val = A[i * n + k];
+            float absVal = (val >= 0.0f) ? val : -val;
+            if (absVal > myMaxAbs) {
+                myMaxAbs = absVal;
+                myBestRow = i;
+            }
+        }
+        svals[tid] = myMaxAbs;
+        sidx[tid] = myBestRow;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Parallel reduction (requires power-of-2 threadgroup size)
+        for (uint s = nt / 2; s > 0; s >>= 1) {
+            if (tid < s && tid + s < nt) {
+                if (svals[tid + s] > svals[tid]) {
+                    svals[tid] = svals[tid + s];
+                    sidx[tid] = sidx[tid + s];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        int64_t pivotRow = sidx[0];
+        if (tid == 0) {
+            pivots[k] = pivotRow;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 2: Swap rows k and pivotRow (all columns)
+        if (pivotRow != k) {
+            for (int64_t j = tid; j < n; j += nt) {
+                float tmp = A[k * n + j];
+                A[k * n + j] = A[pivotRow * n + j];
+                A[pivotRow * n + j] = tmp;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Step 3: Scale column k below diagonal
+        float diag = A[k * n + k];
+        if (diag != 0.0f) {
+            float invDiag = 1.0f / diag;
+            for (int64_t i = k + 1 + tid; i < m; i += nt) {
+                A[i * n + k] *= invDiag;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Step 4: Rank-1 update of trailing matrix
+        // A[i,j] -= A[i,k] * A[k,j] for i in [k+1,m), j in [k+1,n)
+        for (int64_t i = k + 1 + tid; i < m; i += nt) {
+            float lik = A[i * n + k];
+            for (int64_t j = k + 1; j < n; j++) {
+                A[i * n + j] -= lik * A[k * n + j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
 }
 
 // Apply row permutation to factored matrix columns (for the block above diagonal in LU)
