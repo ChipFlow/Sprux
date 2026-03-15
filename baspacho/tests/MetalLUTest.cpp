@@ -26,12 +26,6 @@ using namespace ::BaSpaCho::testing_utils;
 using namespace std;
 using namespace ::testing;
 
-// Helper: check if GPU capture was requested via BASPACHO_GPU_CAPTURE=1
-static bool gpuCaptureRequested() {
-  const char* val = getenv("BASPACHO_GPU_CAPTURE");
-  return val && string(val) == "1";
-}
-
 template <typename T>
 using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
 
@@ -154,10 +148,7 @@ TEST(MetalLU, SolveSimple_float) {
 
 // Test LU on 2-block sparse matrix (supports GPU trace capture)
 TEST(MetalLU, BlockSparse_float) {
-  bool capturing = gpuCaptureRequested();
-  if (capturing) {
-    MetalContext::instance().beginCapture("/tmp/baspacho_lu.gputrace");
-  }
+  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_lu.gputrace");
   vector<set<int64_t>> colBlocks{{0, 1}, {1}};
   SparseStructure ss = columnsToCscStruct(colBlocks).transpose().addFullEliminationFill();
   vector<int64_t> spanStart{0, 3, 5};
@@ -247,7 +238,7 @@ TEST(MetalLU, BlockSparse_float) {
   float residual = (fullMat * x - b).norm() / b.norm();
 
   if (capturing) {
-    MetalContext::instance().endCapture();
+    MetalContext::instance().endCaptureIfActive();
   }
 
   ASSERT_LT(residual, Epsilon<float>::value2) << "Block-sparse LU solve residual too large";

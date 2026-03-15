@@ -236,6 +236,18 @@ void MetalContext::endCapture() {
   }
 }
 
+bool MetalContext::beginCaptureIfRequested(const char* outputPath) {
+  const char* val = getenv("BASPACHO_GPU_CAPTURE");
+  if (val && std::string(val) == "1") {
+    return beginCapture(outputPath);
+  }
+  return false;
+}
+
+void MetalContext::endCaptureIfActive() {
+  endCapture();  // endCapture already checks isCapturing
+}
+
 // MetalMirror template implementation
 template <typename T>
 void MetalMirror<T>::clear() {

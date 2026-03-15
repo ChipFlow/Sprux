@@ -727,6 +727,8 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
   if (matrices.empty()) return {};
 
+  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_ffi.gputrace");
+
   const CsrMatrix& A0 = matrices[0].first;
   int64_t n = A0.nRows;
 
@@ -1034,6 +1036,10 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   if (verbose) {
     cout << "  [MetalFFI] Total GPU: " << fixed << setprecision(4) << totalGpuTime
          << "s (" << nMat << " matrices in 1 command buffer)" << endl;
+  }
+
+  if (capturing) {
+    MetalContext::instance().endCaptureIfActive();
   }
 
   return results;
