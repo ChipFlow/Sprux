@@ -2171,6 +2171,47 @@ kernel void sparseElim_subDiagMultT_float(
     }
 }
 
+// Size-1 lump specialization: flat dispatch (1 thread per lump).
+// For circuits like c6288 where all sparse lumps are size-1, the threadgroup
+// kernel wastes 255/256 threads. This kernel gives every thread useful work.
+kernel void sparseElim_subDiagMultT_size1_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* chainColPtr [[buffer(2)]],
+    constant int64_t* chainRowSpan [[buffer(3)]],
+    constant int64_t* chainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + int64_t(tid);
+    if (lump >= lumpIndexEnd) return;
+
+    int64_t lumpStart = lumpStarts[lump];
+    // lumpSize is always 1: column loop disappears, leaving a dot product
+    int64_t colStart = chainColPtr[lump];
+    int64_t colEnd = chainColPtr[lump + 1];
+
+    for (int64_t colPtr = colStart + 1; colPtr < colEnd; colPtr++) {
+        int64_t rowSpan = chainRowSpan[colPtr];
+        int64_t rowSpanStart = spanStarts[rowSpan];
+        int64_t rowSpanSize = spanStarts[rowSpan + 1] - rowSpanStart;
+        int64_t blockPtr = chainData[colPtr];
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            float sum = 0.0f;
+            for (int64_t r = 0; r < rowSpanSize; r++) {
+                sum += data[blockPtr + r] * v[rowSpanStart + r + rhs * ldc];
+            }
+            v[lumpStart + rhs * ldc] -= sum;
+        }
+    }
+}
+
 // ============================================================================
 // LU solve kernels: upper triangle gather and diagonal divide
 // ============================================================================
@@ -2264,6 +2305,71 @@ kernel void sparseElim_diagDivU_float(
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
         iterativeSolveUpper(diagBlock, lumpSize, lumpSize,
                             v + lumpStart + ldc * rhs, tid, nt);
+    }
+}
+
+// Size-1 lump specialization for upper gather: flat dispatch (1 thread per lump).
+kernel void sparseElim_upperGather_size1_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* upperChainRowPtr [[buffer(2)]],
+    constant int64_t* upperChainColSpan [[buffer(3)]],
+    constant int64_t* upperChainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    constant int64_t& upperDataBase [[buffer(11)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + int64_t(tid);
+    if (lump >= lumpIndexEnd) return;
+
+    int64_t lumpStart = lumpStarts[lump];
+    // lumpSize is always 1: row loop disappears, leaving a dot product
+    int64_t uRowStart = upperChainRowPtr[lump];
+    int64_t uRowEnd = upperChainRowPtr[lump + 1];
+
+    for (int64_t uIdx = uRowStart; uIdx < uRowEnd; uIdx++) {
+        int64_t colSpan = upperChainColSpan[uIdx];
+        int64_t colStart = spanStarts[colSpan];
+        int64_t colSize = spanStarts[colSpan + 1] - colStart;
+        int64_t uDataOffset = upperDataBase + upperChainData[uIdx];
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            float sum = 0.0f;
+            for (int64_t c = 0; c < colSize; c++) {
+                sum += data[uDataOffset + c] * v[colStart + c + rhs * ldc];
+            }
+            v[lumpStart + rhs * ldc] -= sum;
+        }
+    }
+}
+
+// Size-1 lump specialization for diagonal U divide: flat dispatch (1 thread per lump).
+// The recursive TRSV collapses to a single scalar division.
+kernel void sparseElim_diagDivU_size1_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* chainColPtr [[buffer(1)]],
+    constant int64_t* chainData [[buffer(2)]],
+    device float* data [[buffer(3)]],
+    device float* v [[buffer(4)]],
+    constant int64_t& ldc [[buffer(5)]],
+    constant int64_t& nRHS [[buffer(6)]],
+    constant int64_t& lumpIndexStart [[buffer(7)]],
+    constant int64_t& lumpIndexEnd [[buffer(8)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + int64_t(tid);
+    if (lump >= lumpIndexEnd) return;
+
+    int64_t lumpStart = lumpStarts[lump];
+    int64_t diagDataPtr = chainData[chainColPtr[lump]];
+
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        v[lumpStart + rhs * ldc] /= data[diagDataPtr];
     }
 }
 

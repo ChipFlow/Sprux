@@ -2271,6 +2271,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     commitAndWait();
   }
 
+  // Check if all lumps in [lumpsBegin, lumpsEnd) are size-1.
+  // Uses host-side skel.lumpStart — no GPU readback needed.
+  bool allLumpsSize1(int64_t lumpsBegin, int64_t lumpsEnd) const {
+    return sym.skel.lumpStart[lumpsEnd] - sym.skel.lumpStart[lumpsBegin]
+           == (lumpsEnd - lumpsBegin);
+  }
+
   // Encode a kernel dispatch onto a persistent compute encoder within the
   // pending command buffer. Uses a single encoder for all dispatches with
   // memory barriers between them to ensure correct data ordering.
@@ -2473,32 +2480,36 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t nRHS64 = nRHS;
 
       // Encode below-diagonal transpose multiply first: matC -= block^T * matQ
-      // Dispatched as 1 threadgroup per lump for parallel GEMV across columns
-      id<MTLComputePipelineState> subDiagPipeline = getPipeline(
-              "sparseElim_subDiagMultT_float");
+      // Use size-1 flat kernel when all lumps are size-1 (e.g. c6288)
+      auto subDiagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                    offset:0
+                   atIndex:2];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                    offset:0
+                   atIndex:3];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:4];
+        [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+        [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+        [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+        [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+      };
 
-      NSUInteger subDiagTgSize = MIN(subDiagPipeline.maxTotalThreadsPerThreadgroup, 256);
-
-      encodeKernelWithGroups(
-          subDiagPipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                        offset:0
-                       atIndex:2];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                        offset:0
-                       atIndex:3];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:4];
-            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
-            [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
-            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
-            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
-            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
-          },
-          (NSUInteger)numLumps, subDiagTgSize);
+      if (allLumpsSize1(lumpsBegin, lumpsEnd)) {
+        id<MTLComputePipelineState> subDiagPipeline = getPipeline(
+                "sparseElim_subDiagMultT_size1_float");
+        encodeKernel(subDiagPipeline, subDiagEncodeBlock, (NSUInteger)numLumps);
+      } else {
+        id<MTLComputePipelineState> subDiagPipeline = getPipeline(
+                "sparseElim_subDiagMultT_float");
+        NSUInteger subDiagTgSize = MIN(subDiagPipeline.maxTotalThreadsPerThreadgroup, 256);
+        encodeKernelWithGroups(subDiagPipeline, subDiagEncodeBlock,
+                               (NSUInteger)numLumps, subDiagTgSize);
+      }
 
       // Then encode diagonal solve kernel
       id<MTLComputePipelineState> pipeline = getPipeline(
@@ -2598,60 +2609,68 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t upperDataBase = sym.skel.dataSize();
 
       // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
-      // Dispatched as 1 threadgroup per lump for parallel GEMV across rows
-      id<MTLComputePipelineState> gatherPipeline =
-          getPipeline("sparseElim_upperGather_float");
+      // Use size-1 flat kernel when all lumps are size-1
+      auto gatherEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                    offset:0
+                   atIndex:2];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                    offset:0
+                   atIndex:3];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                    offset:0
+                   atIndex:4];
+        [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+        [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+        [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+        [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+        [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
+      };
 
-      NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
+      bool size1 = allLumpsSize1(lumpsBegin, lumpsEnd);
 
-      encodeKernelWithGroups(
-          gatherPipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
-                        offset:0
-                       atIndex:2];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                        offset:0
-                       atIndex:3];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                        offset:0
-                       atIndex:4];
-            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
-            [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
-            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
-            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
-            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
-            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
-          },
-          (NSUInteger)numLumps, gatherTgSize);
+      if (size1) {
+        id<MTLComputePipelineState> gatherPipeline =
+            getPipeline("sparseElim_upperGather_size1_float");
+        encodeKernel(gatherPipeline, gatherEncodeBlock, (NSUInteger)numLumps);
+      } else {
+        id<MTLComputePipelineState> gatherPipeline =
+            getPipeline("sparseElim_upperGather_float");
+        NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
+        encodeKernelWithGroups(gatherPipeline, gatherEncodeBlock,
+                               (NSUInteger)numLumps, gatherTgSize);
+      }
 
       // Then: diagonal U solve: v[lump] /= U_diagonal
-      // Dispatched as 1 threadgroup per lump for recursive TRSV→GEMV parallelism
-      id<MTLComputePipelineState> diagPipeline =
-          getPipeline("sparseElim_diagDivU_float");
+      auto diagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
+        [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+        [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+        [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+        [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+      };
 
-      // Power-of-2 threads per threadgroup, capped at 256
-      NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
-
-      encodeKernelWithGroups(
-          diagPipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                        offset:0
-                       atIndex:1];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
-            [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
-            [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
-            [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
-            [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-            [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-          },
-          (NSUInteger)numLumps, tgSize);
+      if (size1) {
+        id<MTLComputePipelineState> diagPipeline =
+            getPipeline("sparseElim_diagDivU_size1_float");
+        encodeKernel(diagPipeline, diagEncodeBlock, (NSUInteger)numLumps);
+      } else {
+        id<MTLComputePipelineState> diagPipeline =
+            getPipeline("sparseElim_diagDivU_float");
+        NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
+        encodeKernelWithGroups(diagPipeline, diagEncodeBlock,
+                               (NSUInteger)numLumps, tgSize);
+      }
     }
   }
 
@@ -3793,10 +3812,13 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       MTLSize threadsPerGroup, numGroups;
 
       // Step 1: Sub-diagonal transpose multiply - loop dispatch of non-batched kernel
-      // 1 threadgroup per lump for parallel GEMV across columns
+      // Use size-1 flat kernel when all lumps are size-1
+      bool size1 = sym.skel.lumpStart[lumpsEnd] - sym.skel.lumpStart[lumpsBegin]
+                   == (lumpsEnd - lumpsBegin);
       {
-        id<MTLComputePipelineState> pipeline =
-            getPipeline("sparseElim_subDiagMultT_float");
+        id<MTLComputePipelineState> pipeline = size1
+            ? getPipeline("sparseElim_subDiagMultT_size1_float")
+            : getPipeline("sparseElim_subDiagMultT_float");
         id<MTLCommandBuffer> cmdBuf = [sym.commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
@@ -3821,9 +3843,19 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
         [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
 
-        threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
-        threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
-        numGroups = MTLSizeMake((NSUInteger)numLumps, 1, 1);
+        if (size1) {
+          // Flat dispatch: 1 thread per lump
+          threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
+          threadGroupSize = MIN(threadGroupSize, (NSUInteger)numLumps);
+          threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+          numGroups = MTLSizeMake(
+              ((NSUInteger)numLumps + threadGroupSize - 1) / threadGroupSize, 1, 1);
+        } else {
+          // Threadgroup dispatch: 1 threadgroup per lump
+          threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
+          threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+          numGroups = MTLSizeMake((NSUInteger)numLumps, 1, 1);
+        }
 
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
