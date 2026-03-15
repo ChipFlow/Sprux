@@ -2545,6 +2545,56 @@ kernel void sparseElim_diagDivU_size1_float(
     }
 }
 
+// Size-1 lump specialization: fused upper gather + diagonal U divide in one dispatch.
+// Combines sparseElim_upperGather_size1 + sparseElim_diagDivU_size1 to halve dispatch count.
+kernel void sparseElim_fusedSolveU_size1_float(
+    constant int64_t* lumpStarts [[buffer(0)]],
+    constant int64_t* spanStarts [[buffer(1)]],
+    constant int64_t* upperChainRowPtr [[buffer(2)]],
+    constant int64_t* upperChainColSpan [[buffer(3)]],
+    constant int64_t* upperChainData [[buffer(4)]],
+    constant float* data [[buffer(5)]],
+    device float* v [[buffer(6)]],
+    constant int64_t& ldc [[buffer(7)]],
+    constant int64_t& nRHS [[buffer(8)]],
+    constant int64_t& lumpIndexStart [[buffer(9)]],
+    constant int64_t& lumpIndexEnd [[buffer(10)]],
+    constant int64_t& upperDataBase [[buffer(11)]],
+    constant int64_t* chainColPtr [[buffer(12)]],
+    constant int64_t* chainData [[buffer(13)]],
+    uint tid [[thread_position_in_grid]])
+{
+    int64_t lump = lumpIndexStart + int64_t(tid);
+    if (lump >= lumpIndexEnd) return;
+
+    int64_t lumpStart = lumpStarts[lump];
+
+    // Phase 1: upper gather — v[lump] -= U_row * v[colSpan]
+    int64_t uRowStart = upperChainRowPtr[lump];
+    int64_t uRowEnd = upperChainRowPtr[lump + 1];
+
+    for (int64_t uIdx = uRowStart; uIdx < uRowEnd; uIdx++) {
+        int64_t colSpan = upperChainColSpan[uIdx];
+        int64_t colStart = spanStarts[colSpan];
+        int64_t colSize = spanStarts[colSpan + 1] - colStart;
+        int64_t uDataOffset = upperDataBase + upperChainData[uIdx];
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            float sum = 0.0f;
+            for (int64_t c = 0; c < colSize; c++) {
+                sum += data[uDataOffset + c] * v[colStart + c + rhs * ldc];
+            }
+            v[lumpStart + rhs * ldc] -= sum;
+        }
+    }
+
+    // Phase 2: diagonal divide — v[lump] /= U_diagonal
+    int64_t diagDataPtr = chainData[chainColPtr[lump]];
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        v[lumpStart + rhs * ldc] /= data[diagDataPtr];
+    }
+}
+
 // ============================================================================
 // Utility kernel: transpose square matrix in-place
 // ============================================================================

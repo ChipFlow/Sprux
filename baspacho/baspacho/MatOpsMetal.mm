@@ -2634,37 +2634,68 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       bool size1 = allLumpsSize1(lumpsBegin, lumpsEnd);
 
       if (size1) {
-        id<MTLComputePipelineState> gatherPipeline =
-            getPipeline("sparseElim_upperGather_size1_float");
-        encodeKernel(gatherPipeline, gatherEncodeBlock, (NSUInteger)numLumps);
+        // Fused kernel: upper gather + diagonal divide in one dispatch
+        id<MTLComputePipelineState> fusedPipeline =
+            getPipeline("sparseElim_fusedSolveU_size1_float");
+        encodeKernel(
+            fusedPipeline,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                          offset:0
+                         atIndex:0];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                          offset:0
+                         atIndex:1];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                          offset:0
+                         atIndex:4];
+              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
+              [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
+              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
+              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
+              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
+              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
+              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                          offset:0
+                         atIndex:12];
+              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                          offset:0
+                         atIndex:13];
+            },
+            (NSUInteger)numLumps);
       } else {
         id<MTLComputePipelineState> gatherPipeline =
             getPipeline("sparseElim_upperGather_float");
         NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
         encodeKernelWithGroups(gatherPipeline, gatherEncodeBlock,
                                (NSUInteger)numLumps, gatherTgSize);
-      }
 
-      // Then: diagonal U solve: v[lump] /= U_diagonal
-      auto diagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                    offset:0
-                   atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer() offset:0 atIndex:2];
-        [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
-        [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
-        [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
-        [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
-        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-      };
+        // Then: diagonal U solve: v[lump] /= U_diagonal
+        auto diagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                      offset:0
+                     atIndex:0];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                      offset:0
+                     atIndex:1];
+          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                      offset:0
+                     atIndex:2];
+          [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+          [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+          [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+          [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+          [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+          [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+        };
 
-      if (size1) {
-        id<MTLComputePipelineState> diagPipeline =
-            getPipeline("sparseElim_diagDivU_size1_float");
-        encodeKernel(diagPipeline, diagEncodeBlock, (NSUInteger)numLumps);
-      } else {
         id<MTLComputePipelineState> diagPipeline =
             getPipeline("sparseElim_diagDivU_float");
         NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
