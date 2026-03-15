@@ -2473,10 +2473,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t nRHS64 = nRHS;
 
       // Encode below-diagonal transpose multiply first: matC -= block^T * matQ
+      // Dispatched as 1 threadgroup per lump for parallel GEMV across columns
       id<MTLComputePipelineState> subDiagPipeline = getPipeline(
               "sparseElim_subDiagMultT_float");
 
-      encodeKernel(
+      NSUInteger subDiagTgSize = MIN(subDiagPipeline.maxTotalThreadsPerThreadgroup, 256);
+
+      encodeKernelWithGroups(
           subDiagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
@@ -2495,7 +2498,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
           },
-          (NSUInteger)numLumps);
+          (NSUInteger)numLumps, subDiagTgSize);
 
       // Then encode diagonal solve kernel
       id<MTLComputePipelineState> pipeline = getPipeline(
@@ -2595,10 +2598,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       int64_t upperDataBase = sym.skel.dataSize();
 
       // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
+      // Dispatched as 1 threadgroup per lump for parallel GEMV across rows
       id<MTLComputePipelineState> gatherPipeline =
           getPipeline("sparseElim_upperGather_float");
 
-      encodeKernel(
+      NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
+
+      encodeKernelWithGroups(
           gatherPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
@@ -2620,7 +2626,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
             [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
           },
-          (NSUInteger)numLumps);
+          (NSUInteger)numLumps, gatherTgSize);
 
       // Then: diagonal U solve: v[lump] /= U_diagonal
       // Dispatched as 1 threadgroup per lump for recursive TRSV→GEMV parallelism
@@ -3787,6 +3793,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       MTLSize threadsPerGroup, numGroups;
 
       // Step 1: Sub-diagonal transpose multiply - loop dispatch of non-batched kernel
+      // 1 threadgroup per lump for parallel GEMV across columns
       {
         id<MTLComputePipelineState> pipeline =
             getPipeline("sparseElim_subDiagMultT_float");
@@ -3815,10 +3822,8 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
 
         threadGroupSize = MIN(pipeline.maxTotalThreadsPerThreadgroup, 256);
-        threadGroupSize = MIN(threadGroupSize, (NSUInteger)numLumps);
         threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
-        numGroups = MTLSizeMake(
-            ((NSUInteger)numLumps + threadGroupSize - 1) / threadGroupSize, 1, 1);
+        numGroups = MTLSizeMake((NSUInteger)numLumps, 1, 1);
 
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);

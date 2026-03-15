@@ -2116,6 +2116,10 @@ kernel void sparseElim_subDiagMult_float(
 
 // Backward solve: matC -= block^T * matQ for below-diagonal blocks
 // One thread per lump.
+// Forward L^T solve: transpose sub-diagonal gather
+// For each lump, computes v[lump] -= block^T * v[rowSpan]
+// One threadgroup per lump — parallelize inner GEMV across columns.
+// Safe: each lump writes only to its own v[lumpStart..lumpStart+lumpSize].
 kernel void sparseElim_subDiagMultT_float(
     constant int64_t* lumpStarts [[buffer(0)]],
     constant int64_t* spanStarts [[buffer(1)]],
@@ -2128,9 +2132,11 @@ kernel void sparseElim_subDiagMultT_float(
     constant int64_t& nRHS [[buffer(8)]],
     constant int64_t& lumpIndexStart [[buffer(9)]],
     constant int64_t& lumpIndexEnd [[buffer(10)]],
-    uint tid [[thread_position_in_grid]])
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    int64_t lump = lumpIndexStart + tid;
+    int64_t lump = lumpIndexStart + int64_t(gid);
     if (lump >= lumpIndexEnd) {
         return;
     }
@@ -2149,8 +2155,9 @@ kernel void sparseElim_subDiagMultT_float(
 
         // block is rowSpanSize × lumpSize (row-major)
         // matC -= block^T * matQ
+        // Parallelize across columns (c) — each thread handles a subset
         for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-            for (int64_t c = 0; c < lumpSize; c++) {
+            for (int64_t c = int64_t(tid); c < lumpSize; c += int64_t(nt)) {
                 float sum = 0.0f;
                 for (int64_t r = 0; r < rowSpanSize; r++) {
                     sum += data[blockPtr + r * lumpSize + c] * v[rowSpanStart + r + rhs * ldc];
@@ -2158,6 +2165,9 @@ kernel void sparseElim_subDiagMultT_float(
                 v[lumpStart + c + rhs * ldc] -= sum;
             }
         }
+        // Barrier between chain entries: next entry reads from v[rowSpan]
+        // which may overlap with v[lump] written above
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
@@ -2167,7 +2177,8 @@ kernel void sparseElim_subDiagMultT_float(
 
 // Backward U solve: gather from upper triangle entries
 // For each lump, computes v[lump] -= U[lump, colSpan] * v[colSpan]
-// One thread per lump.
+// One threadgroup per lump — parallelize inner GEMV across rows.
+// Safe: each lump writes only to its own v[lumpStart..lumpStart+lumpSize].
 kernel void sparseElim_upperGather_float(
     constant int64_t* lumpStarts [[buffer(0)]],
     constant int64_t* spanStarts [[buffer(1)]],
@@ -2181,9 +2192,11 @@ kernel void sparseElim_upperGather_float(
     constant int64_t& lumpIndexStart [[buffer(9)]],
     constant int64_t& lumpIndexEnd [[buffer(10)]],
     constant int64_t& upperDataBase [[buffer(11)]],
-    uint tid [[thread_position_in_grid]])
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    int64_t lump = lumpIndexStart + tid;
+    int64_t lump = lumpIndexStart + int64_t(gid);
     if (lump >= lumpIndexEnd) {
         return;
     }
@@ -2201,8 +2214,9 @@ kernel void sparseElim_upperGather_float(
 
         // U block: lumpSize x colSize, row-major
         // v[lump] -= U * v[colSpan]
+        // Parallelize across rows (r) — each thread handles a subset
         for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-            for (int64_t r = 0; r < lumpSize; r++) {
+            for (int64_t r = int64_t(tid); r < lumpSize; r += int64_t(nt)) {
                 float sum = 0.0f;
                 for (int64_t c = 0; c < colSize; c++) {
                     sum += data[uDataOffset + r * colSize + c] * v[colStart + c + rhs * ldc];
@@ -2210,6 +2224,9 @@ kernel void sparseElim_upperGather_float(
                 v[lumpStart + r + rhs * ldc] -= sum;
             }
         }
+        // Barrier between upper chain entries: ensures all rows updated
+        // before next entry's GEMV reads from potentially overlapping v
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
