@@ -1286,55 +1286,117 @@ kernel void lu_trsmUpperRight_kernel_float(
 }
 
 // ============================================================================
-// Batched upper span processing for LU factorization dense loop.
-// Each threadgroup handles one upper chain entry: applyRowPerm + trsmLowerUnit.
-// Replaces numSpans × 2 separate dispatches with a single dispatch.
+// Fused post-getrf kernel for LU factorization dense loop.
+// Combines perturbSmallDiagonals + below-diag (applyRowPerm + trsmUpperRight)
+// + all upper spans (applyRowPerm + trsmLowerUnit) into a single dispatch.
+//
+// Threadgroup 0: perturbDiag → below-diag pivot swap → trsmUpperRight
+// Threadgroups 1..N: upper span pivot swap → trsmLowerUnit (each independent)
 // ============================================================================
-kernel void lu_batchUpperTrsmPivot_kernel_float(
+kernel void lu_postGetrf_kernel_float(
     device float* data [[buffer(0)]],
     constant float* dataConst [[buffer(1)]],   // same buffer, constant for L reads
     device int64_t* pivots [[buffer(2)]],
     constant int64_t& pivotOffset [[buffer(3)]],
     constant int64_t& diagOffset [[buffer(4)]],
     constant int64_t& lumpSize [[buffer(5)]],
-    constant int64_t* upperChainColSpan [[buffer(6)]],
-    constant int64_t* upperChainData [[buffer(7)]],
-    constant int64_t* spanStartArr [[buffer(8)]],
-    constant int64_t& upperDataBase [[buffer(9)]],
-    constant int64_t& rangeStart [[buffer(10)]],
+    // perturbDiag params
+    constant float& threshold [[buffer(6)]],
+    device atomic_uint* perturbCount [[buffer(7)]],
+    constant int& enablePerturb [[buffer(8)]],
+    // below-diag params
+    constant int64_t& belowDiagOffset [[buffer(9)]],
+    constant int64_t& numRowsBelowDiag [[buffer(10)]],
+    // upper span params
+    constant int64_t* upperChainColSpan [[buffer(11)]],
+    constant int64_t* upperChainData [[buffer(12)]],
+    constant int64_t* spanStartArr [[buffer(13)]],
+    constant int64_t& upperDataBase [[buffer(14)]],
+    constant int64_t& rangeStart [[buffer(15)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]])
 {
-    int64_t idx = rangeStart + int64_t(tg_id);
-
-    int64_t colSpan = upperChainColSpan[idx];
-    int64_t colSize = spanStartArr[colSpan + 1] - spanStartArr[colSpan];
-    int64_t blockOffset = upperDataBase + upperChainData[idx];
-
-    device float* block = data + blockOffset;
     device int64_t* piv = pivots + pivotOffset;
 
-    // Phase 1: Apply row permutation (same logic as lu_applyRowPerm_kernel_float
-    // with ld=colSize, numCols=1). For colSize=1 (scalar spans, e.g. c6288),
-    // only thread 0 does sequential swaps — no per-step barrier needed.
-    for (int64_t i = 0; i < lumpSize; i++) {
-        int64_t swapRow = piv[i];
-        if (swapRow != i) {
-            for (int64_t c = int64_t(tid); c < colSize; c += int64_t(tg_size)) {
-                float tmp = block[i + c * colSize];
-                block[i + c * colSize] = block[swapRow + c * colSize];
-                block[swapRow + c * colSize] = tmp;
+    if (tg_id == 0) {
+        // === Threadgroup 0: perturbDiag + below-diag processing ===
+        device float* diag = data + diagOffset;
+
+        // Phase 0: Perturb small diagonals (thread-parallel scan)
+        if (enablePerturb) {
+            for (int64_t i = int64_t(tid); i < lumpSize; i += int64_t(tg_size)) {
+                float val = diag[i * lumpSize + i];
+                if (!isfinite(val) || abs(val) < threshold) {
+                    diag[i * lumpSize + i] = (val >= 0.0f) ? threshold : -threshold;
+                    atomic_fetch_add_explicit(perturbCount, 1u, memory_order_relaxed);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+
+        // Phases 1-2: Below-diag processing (if any rows below diagonal)
+        if (numRowsBelowDiag > 0) {
+            device float* belowDiag = data + belowDiagOffset;
+
+            // Phase 1: Apply row permutation (ld=lumpSize, numCols=numRowsBelowDiag)
+            for (int64_t i = 0; i < lumpSize; i++) {
+                int64_t swapRow = piv[i];
+                if (swapRow != i) {
+                    for (int64_t c = int64_t(tid); c < numRowsBelowDiag;
+                         c += int64_t(tg_size)) {
+                        float tmp = belowDiag[i + c * lumpSize];
+                        belowDiag[i + c * lumpSize] = belowDiag[swapRow + c * lumpSize];
+                        belowDiag[swapRow + c * lumpSize] = tmp;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+
+            // Phase 2: trsmUpperRight (X * U = B, parallel across rows)
+            // U at diag (upper triangle), B at belowDiag
+            // Read U through device pointer (not constant) since perturbDiag modified it
+            for (int64_t j = 0; j < lumpSize; j++) {
+                float inv_diag = 1.0f / diag[j * lumpSize + j];
+                for (int64_t i = int64_t(tid); i < numRowsBelowDiag;
+                     i += int64_t(tg_size)) {
+                    float val = belowDiag[i * lumpSize + j];
+                    for (int64_t k = 0; k < j; k++) {
+                        val -= belowDiag[i * lumpSize + k] * diag[k * lumpSize + j];
+                    }
+                    belowDiag[i * lumpSize + j] = val * inv_diag;
+                }
+                threadgroup_barrier(mem_flags::mem_device);
             }
         }
-        threadgroup_barrier(mem_flags::mem_device);
-    }
+    } else {
+        // === Threadgroups 1..N: upper span processing ===
+        int64_t idx = rangeStart + int64_t(tg_id) - 1;
 
-    // Phase 2: TRSM Lower Unit (L * X = B, unit lower triangular)
-    // L diagonal block at dataConst + diagOffset, lumpSize × lumpSize, ld = lumpSize
-    // B upper block at block, lumpSize × colSize, ldb = colSize
-    iterativeTrsmLowerUnit(dataConst + diagOffset, lumpSize,
-                           block, colSize, lumpSize, colSize, tid, tg_size);
+        int64_t colSpan = upperChainColSpan[idx];
+        int64_t colSize = spanStartArr[colSpan + 1] - spanStartArr[colSpan];
+        int64_t blockOffset = upperDataBase + upperChainData[idx];
+
+        device float* block = data + blockOffset;
+
+        // Phase 1: Apply row permutation (ld=colSize, numCols=1)
+        for (int64_t i = 0; i < lumpSize; i++) {
+            int64_t swapRow = piv[i];
+            if (swapRow != i) {
+                for (int64_t c = int64_t(tid); c < colSize; c += int64_t(tg_size)) {
+                    float tmp = block[i + c * colSize];
+                    block[i + c * colSize] = block[swapRow + c * colSize];
+                    block[swapRow + c * colSize] = tmp;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+
+        // Phase 2: TRSM Lower Unit (L * X = B, unit lower triangular)
+        // L reads through constant address space (not modified by perturbDiag)
+        iterativeTrsmLowerUnit(dataConst + diagOffset, lumpSize,
+                               block, colSize, lumpSize, colSize, tid, tg_size);
+    }
 }
 
 // Work item for batched saveGemm: one thread computes one full C -= L * U block

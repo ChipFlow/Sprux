@@ -522,15 +522,6 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
     throw std::runtime_error("getrf failed with info = " + std::to_string(info));
   }
 
-  // Static pivoting: scan all diagonals when enabled (near-zero values that aren't
-  // exactly zero can still cause catastrophic growth in the L factor)
-  if (staticPivotThreshold_ >= 0) {
-    using ValT = typename std::remove_pointer<decltype(data)>::type;
-    ValT threshold = static_cast<ValT>(effectiveStaticPivotThreshold_);
-    staticPivotPerturbCount_ +=
-        numCtx.perturbSmallDiagonals(lumpSize, data, diagBlockOffset, lumpSize, threshold);
-  }
-
   int64_t boardColBegin = factorSkel.boardColPtr[lump];
   int64_t boardColEnd = factorSkel.boardColPtr[lump + 1];
   int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
@@ -538,28 +529,43 @@ void Solver::factorLumpLU(NumericCtx<T>& numCtx, T* data, int64_t* pivots, int64
   int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
   int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
                              factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+  int64_t upperDataBase = factorSkel.isGeneral() ? factorSkel.dataSize() : 0;
 
-  // Process L column below diagonal (if any rows below)
-  if (numRowsBelowDiag > 0) {
-    // Apply row permutation to column below diagonal
-    numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, belowDiagOffset, lumpSize,
-                        numRowsBelowDiag);
+  if (numCtx.hasPostGetrfFused()) {
+    // Fused path: perturbDiag + below-diag + upper spans in one GPU dispatch
+    using ValT = typename std::remove_pointer<decltype(data)>::type;
+    ValT threshold = (staticPivotThreshold_ >= 0)
+                         ? static_cast<ValT>(effectiveStaticPivotThreshold_)
+                         : ValT(0);
+    numCtx.postGetrfFused(data, diagBlockOffset, lumpSize, pivots, pivotOffset, threshold,
+                          /*enablePerturb=*/staticPivotThreshold_ >= 0, belowDiagOffset,
+                          numRowsBelowDiag, lump, upperDataBase);
+  } else {
+    // Default path: separate dispatches
 
-    // Solve for L column below diagonal: L_below * U_diag = A_below
-    // => solve: X * U = B where U is upper triangular part of diagonal block
-    numCtx.trsmUpperRight(numRowsBelowDiag, lumpSize, data, diagBlockOffset, data, belowDiagOffset,
-                          lumpSize);
-  }
+    // Static pivoting: scan all diagonals when enabled (near-zero values that aren't
+    // exactly zero can still cause catastrophic growth in the L factor)
+    if (staticPivotThreshold_ >= 0) {
+      using ValT = typename std::remove_pointer<decltype(data)>::type;
+      ValT threshold = static_cast<ValT>(effectiveStaticPivotThreshold_);
+      staticPivotPerturbCount_ +=
+          numCtx.perturbSmallDiagonals(lumpSize, data, diagBlockOffset, lumpSize, threshold);
+    }
 
-  // Process U row to the right of diagonal (if upper triangle storage exists)
-  if (factorSkel.isGeneral()) {
-    int64_t upperDataBase = factorSkel.dataSize();  // Upper data starts after lower data
+    // Process L column below diagonal (if any rows below)
+    if (numRowsBelowDiag > 0) {
+      // Apply row permutation to column below diagonal
+      numCtx.applyRowPerm(pivots + pivotOffset, lumpSize, data, belowDiagOffset, lumpSize,
+                          numRowsBelowDiag);
 
-    if (numCtx.hasBatchFactorUpperSpans()) {
-      // Batched path: single kernel dispatch for all upper spans
-      numCtx.batchFactorUpperSpans(data, diagBlockOffset, lumpSize, pivots, pivotOffset, lump,
-                                   upperDataBase);
-    } else {
+      // Solve for L column below diagonal: L_below * U_diag = A_below
+      // => solve: X * U = B where U is upper triangular part of diagonal block
+      numCtx.trsmUpperRight(numRowsBelowDiag, lumpSize, data, diagBlockOffset, data,
+                            belowDiagOffset, lumpSize);
+    }
+
+    // Process U row to the right of diagonal (if upper triangle storage exists)
+    if (factorSkel.isGeneral()) {
       // Default path: per-span dispatch loop
       int64_t upperRowStart = factorSkel.upperChainRowPtr[lump];
       int64_t upperRowEnd = factorSkel.upperChainRowPtr[lump + 1];
@@ -863,7 +869,8 @@ void Solver::finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t start
        l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
     auto tLumpStart = verbose ? ClockT::now() : ClockT::time_point{};
 
-    numCtxRaw->prepareAssemble(l);
+    // NOTE: prepareAssemble is NOT needed for LU — eliminateBoardLU uses saveGemm directly.
+    // Cholesky uses assemble() which requires prepareAssemble(), but LU does not.
 
     int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
                                                : factorSkel.boardRowPtr[l];

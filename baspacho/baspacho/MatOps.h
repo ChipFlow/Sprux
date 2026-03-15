@@ -376,21 +376,29 @@ struct NumericCtx : NumericCtxBase {
     throw std::runtime_error("applyRowPerm: LU not supported by this backend");
   }
 
-  // Whether this backend provides a batched kernel for factorLumpLU's upper spans loop
-  // (applyRowPerm + trsmLowerUnit for each upper chain entry, fused into one dispatch).
-  virtual bool hasBatchFactorUpperSpans() const { return false; }
+  // Whether this backend provides a fused post-getrf kernel that combines
+  // perturbSmallDiagonals + below-diag (applyRowPerm + trsmUpperRight)
+  // + all upper spans (applyRowPerm + trsmLowerUnit) into a single GPU dispatch.
+  virtual bool hasPostGetrfFused() const { return false; }
 
-  // Batched applyRowPerm + trsmLowerUnit for all upper spans of a lump.
-  // Only called when hasBatchFactorUpperSpans() returns true.
-  // Metal override dispatches a single kernel with one threadgroup per span.
-  virtual void batchFactorUpperSpans(T* data, int64_t diagOffset, int64_t lumpSize,
-                                     int64_t* pivots, int64_t pivotOffset, int64_t lump,
-                                     int64_t upperDataBase) {
+  // Fused post-getrf: perturbDiag + below-diag processing + upper spans in one dispatch.
+  // Only called when hasPostGetrfFused() returns true.
+  // Metal override dispatches lu_postGetrf_kernel_float with threadgroup 0 for
+  // below-diag + perturb and threadgroups 1..N for upper spans.
+  virtual void postGetrfFused(T* data, int64_t diagOffset, int64_t lumpSize,
+                              int64_t* pivots, int64_t pivotOffset,
+                              T threshold, bool enablePerturb,
+                              int64_t belowDiagOffset, int64_t numRowsBelowDiag,
+                              int64_t lump, int64_t upperDataBase) {
     (void)data;
     (void)diagOffset;
     (void)lumpSize;
     (void)pivots;
     (void)pivotOffset;
+    (void)threshold;
+    (void)enablePerturb;
+    (void)belowDiagOffset;
+    (void)numRowsBelowDiag;
     (void)lump;
     (void)upperDataBase;
   }

@@ -2035,105 +2035,90 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  bool hasBatchFactorUpperSpans() const override { return true; }
+  bool hasPostGetrfFused() const override { return true; }
 
-  void batchFactorUpperSpans(float* data, int64_t diagOffset, int64_t lumpSize,
-                             int64_t* pivots, int64_t pivotOffset, int64_t lump,
-                             int64_t upperDataBase) override {
+  void postGetrfFused(float* data, int64_t diagOffset, int64_t lumpSize,
+                      int64_t* pivots, int64_t pivotOffset,
+                      float threshold, bool enablePerturb,
+                      int64_t belowDiagOffset, int64_t numRowsBelowDiag,
+                      int64_t lump, int64_t upperDataBase) override {
     if (explicitRecording_) return;
     @autoreleasepool {
-      int64_t rangeStart = sym.skel.upperChainRowPtr[lump];
-      int64_t rangeEnd = sym.skel.upperChainRowPtr[lump + 1];
-      int64_t numSpans = rangeEnd - rangeStart;
-      if (numSpans <= 0) return;
+      // Count upper spans for threadgroup dispatch
+      int64_t rangeStart = sym.skel.isGeneral() ? sym.skel.upperChainRowPtr[lump] : 0;
+      int64_t rangeEnd = sym.skel.isGeneral() ? sym.skel.upperChainRowPtr[lump + 1] : 0;
+      int64_t numUpperSpans = rangeEnd - rangeStart;
+
+      // Total threadgroups: 1 (below-diag + perturb) + numUpperSpans
+      int64_t numThreadgroups = 1 + numUpperSpans;
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
         throw std::runtime_error(
-            "MetalNumericCtx<float>::batchFactorUpperSpans: data buffer not found");
+            "MetalNumericCtx<float>::postGetrfFused: data buffer not found");
       }
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
+      // Allocate perturb count buffer on first call (same as perturbSmallDiagonals)
+      if (!perturbCountBuf_) {
+        perturbCountBuf_ = [sym.device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+        *(uint32_t*)[perturbCountBuf_ contents] = 0;
+        perturbCountPending_ = true;
+      }
+      int enablePerturbInt = enablePerturb ? 1 : 0;
+
+      // Threadgroup size based on lumpSize (for TRSM parallelism within each threadgroup)
+      int thr = std::min((int)lumpSize, 256);
+      int t = 1;
+      while (t < thr) t <<= 1;
+      NSUInteger tgSize = (NSUInteger)t;
+
+      id<MTLComputePipelineState> pipeline = getPipeline("lu_postGetrf_kernel_float");
+
       // Resolve pivot buffer (same logic as applyRowPerm)
       id<MTLBuffer> pivotBuffer;
       size_t pivotByteOffset = 0;
+      int64_t zeroPivotOffset = 0;
       if (pivotsOnGpu_ && allPivotsCpuBase_) {
         int64_t pivotElemOffset = (pivots + pivotOffset) - allPivotsCpuBase_;
         pivotBuffer = (__bridge id<MTLBuffer>)devAllPivots.buffer();
         pivotByteOffset = pivotElemOffset * sizeof(int64_t);
-        // Kernel uses pivotOffset=0 since offset is baked into pivotByteOffset
-        int64_t zeroPivotOffset = 0;
-
-        id<MTLComputePipelineState> pipeline =
-            getPipeline("lu_batchUpperTrsmPivot_kernel_float");
-
-        // Threadgroup size based on lumpSize (for TRSM parallelism)
-        int thr = std::min((int)lumpSize, 256);
-        int t = 1;
-        while (t < thr) t <<= 1;
-        NSUInteger tgSize = (NSUInteger)t;
-
-        encodeKernelWithGroups(
-            pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:1];
-              [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:2];
-              [encoder setBytes:&zeroPivotOffset length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&diagOffset length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&lumpSize length:sizeof(int64_t) atIndex:5];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                          offset:0
-                         atIndex:6];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                          offset:0
-                         atIndex:7];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                          offset:0
-                         atIndex:8];
-              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:9];
-              [encoder setBytes:&rangeStart length:sizeof(int64_t) atIndex:10];
-            },
-            (NSUInteger)numSpans, tgSize);
       } else {
         // Pivots on CPU — copy to device first
         devPivots.resizeToAtLeast(lumpSize);
         memcpy(devPivots.ptr(), pivots + pivotOffset, lumpSize * sizeof(int64_t));
         pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
-        int64_t zeroPivotOffset = 0;
-
-        id<MTLComputePipelineState> pipeline =
-            getPipeline("lu_batchUpperTrsmPivot_kernel_float");
-
-        int thr = std::min((int)lumpSize, 256);
-        int t = 1;
-        while (t < thr) t <<= 1;
-        NSUInteger tgSize = (NSUInteger)t;
-
-        encodeKernelWithGroups(
-            pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:1];
-              [encoder setBuffer:pivotBuffer offset:0 atIndex:2];
-              [encoder setBytes:&zeroPivotOffset length:sizeof(int64_t) atIndex:3];
-              [encoder setBytes:&diagOffset length:sizeof(int64_t) atIndex:4];
-              [encoder setBytes:&lumpSize length:sizeof(int64_t) atIndex:5];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                          offset:0
-                         atIndex:6];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                          offset:0
-                         atIndex:7];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                          offset:0
-                         atIndex:8];
-              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:9];
-              [encoder setBytes:&rangeStart length:sizeof(int64_t) atIndex:10];
-            },
-            (NSUInteger)numSpans, tgSize);
       }
+
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:1];   // constant alias
+            [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:2];
+            [encoder setBytes:&zeroPivotOffset length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&diagOffset length:sizeof(int64_t) atIndex:4];
+            [encoder setBytes:&lumpSize length:sizeof(int64_t) atIndex:5];
+            [encoder setBytes:&threshold length:sizeof(float) atIndex:6];
+            [encoder setBuffer:perturbCountBuf_ offset:0 atIndex:7];
+            [encoder setBytes:&enablePerturbInt length:sizeof(int) atIndex:8];
+            [encoder setBytes:&belowDiagOffset length:sizeof(int64_t) atIndex:9];
+            [encoder setBytes:&numRowsBelowDiag length:sizeof(int64_t) atIndex:10];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                        offset:0
+                       atIndex:11];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                        offset:0
+                       atIndex:12];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0
+                       atIndex:13];
+            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:14];
+            [encoder setBytes:&rangeStart length:sizeof(int64_t) atIndex:15];
+          },
+          (NSUInteger)numThreadgroups, tgSize);
     }
   }
 
