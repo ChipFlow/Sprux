@@ -1138,6 +1138,7 @@ kernel void lu_applyRowPerm_kernel_float(
 
 // TRSM: Solve L * X = B where L is m×m unit lower triangular (row-major)
 // B is m×n row-major with stride ldb
+// Parallel across columns (threads divide j), barrier after each row
 kernel void lu_trsmLowerUnit_kernel_float(
     constant float* L [[buffer(0)]],
     constant int64_t& offL [[buffer(1)]],
@@ -1146,27 +1147,27 @@ kernel void lu_trsmLowerUnit_kernel_float(
     constant int64_t& m [[buffer(4)]],
     constant int64_t& n [[buffer(5)]],
     constant int64_t& ldb [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    // Single-threaded (sequential data dependencies)
-    if (tid != 0) return;
-
     device float* Bp = B + offB;
-    // Copy L from constant to work with - we need device pointer for template
-    // Actually L is in the same data buffer, just const. Use direct access.
+    constant float* Lp = L + offL;
+
     for (int64_t i = 0; i < m; i++) {
-        for (int64_t j = 0; j < n; j++) {
+        for (int64_t j = tid; j < n; j += nt) {
             float val = Bp[i * ldb + j];
             for (int64_t k = 0; k < i; k++) {
-                val -= L[offL + i * m + k] * Bp[k * ldb + j];
+                val -= Lp[i * m + k] * Bp[k * ldb + j];
             }
             Bp[i * ldb + j] = val;
         }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
 // TRSM: Solve X * U = B where U is n×n upper triangular (row-major)
 // B is m×n row-major with stride ldb
+// Parallel across rows (threads divide i), barrier after each column
 kernel void lu_trsmUpperRight_kernel_float(
     constant float* U [[buffer(0)]],
     constant int64_t& offU [[buffer(1)]],
@@ -1175,19 +1176,22 @@ kernel void lu_trsmUpperRight_kernel_float(
     constant int64_t& m [[buffer(4)]],
     constant int64_t& n [[buffer(5)]],
     constant int64_t& ldb [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    if (tid != 0) return;
-
     device float* Bp = B + offB;
+    constant float* Up = U + offU;
+
     for (int64_t j = 0; j < n; j++) {
-        for (int64_t i = 0; i < m; i++) {
+        float inv_diag = 1.0f / Up[j * n + j];
+        for (int64_t i = tid; i < m; i += nt) {
             float val = Bp[i * ldb + j];
             for (int64_t k = 0; k < j; k++) {
-                val -= Bp[i * ldb + k] * U[offU + k * n + j];
+                val -= Bp[i * ldb + k] * Up[k * n + j];
             }
-            Bp[i * ldb + j] = val / U[offU + j * n + j];
+            Bp[i * ldb + j] = val * inv_diag;
         }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 

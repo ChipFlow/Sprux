@@ -1822,6 +1822,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_trsmLowerUnit_kernel_float");
 
+      // Power-of-2 threadgroup size for parallel column processing
+      int thr = std::min((int)n, 256);
+      int t = 1;
+      while (t < thr) t <<= 1;
+      NSUInteger numThreads = (NSUInteger)t;
+
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1833,7 +1839,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
             [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
           },
-          1);
+          numThreads);
     }
   }
 
@@ -1857,6 +1863,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_trsmUpperRight_kernel_float");
 
+      // Power-of-2 threadgroup size for parallel row processing
+      int thr = std::min((int)m, 256);
+      int t = 1;
+      while (t < thr) t <<= 1;
+      NSUInteger numThreads = (NSUInteger)t;
+
       encodeKernel(
           pipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1868,7 +1880,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             [encoder setBytes:&n length:sizeof(int64_t) atIndex:5];
             [encoder setBytes:&ldb length:sizeof(int64_t) atIndex:6];
           },
-          1);
+          numThreads);
     }
   }
 
