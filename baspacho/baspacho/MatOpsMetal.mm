@@ -2895,6 +2895,11 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_solveLUnit_direct_kernel_float");
 
+      // Power-of-2 threadgroup size for recursive TRSV→GEMV parallelism
+      int thr = std::min((int)n, 256);
+      int numThreads = 1;
+      while (numThreads < thr) numThreads <<= 1;
+
       int64_t nRHS64 = nRHS;
       encodeKernel(
           pipeline,
@@ -2907,7 +2912,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
           },
-          1);
+          (NSUInteger)numThreads);
     }
   }
 
@@ -2930,6 +2935,11 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_solveU_direct_kernel_float");
 
+      // Power-of-2 threadgroup size for recursive TRSV→GEMV parallelism
+      int thr = std::min((int)n, 256);
+      int numThreads = 1;
+      while (numThreads < thr) numThreads <<= 1;
+
       int64_t nRHS64 = nRHS;
       encodeKernel(
           pipeline,
@@ -2942,7 +2952,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
             [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
           },
-          1);
+          (NSUInteger)numThreads);
     }
   }
 

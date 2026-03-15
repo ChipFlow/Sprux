@@ -1441,11 +1441,173 @@ kernel void lu_perturbDiag_kernel_float(
 }
 
 // ============================================================================
+// Recursive TRSV→GEMV for parallel triangular solve
+// ============================================================================
+//
+// Converts O(n²) single-thread triangular solve into recursive decomposition:
+//   TRSV(n) = TRSV(n/2) + GEMV(n/2) + TRSV(n/2)
+// The GEMV steps are parallelized across threadgroup threads while base-case
+// TRSV (n ≤ THRESHOLD) uses existing sequential solvers on thread 0.
+//
+// Uses iterative traversal with per-thread stack in registers. All threads
+// compute identical control flow (stack transitions are deterministic), so
+// no threadgroup memory is needed for the stack. Only the vector v (in device
+// memory) is shared, synchronized via threadgroup_barrier(mem_flags::mem_device).
+//
+// Reference: arXiv 2504.13821 (recursive TRSM→GEMM on Apple Silicon Metal)
+// ============================================================================
+
+constant constexpr int TRSV_THRESHOLD = 16;
+constant constexpr int TRSV_MAX_DEPTH = 12;  // supports n up to 16 * 2^12 = 65536
+
+// Iterative recursive forward substitution: L * x = b (unit lower triangular)
+// L is row-major with leading dimension ldl, sub-problem within [0, n).
+// All threads in the threadgroup cooperate on GEMV steps.
+template <typename T>
+inline void iterativeSolveLowerUnit(device T* L, int64_t ldl, int64_t n,
+                                     device T* v, uint tid, uint nt)
+{
+    // Per-thread stack (all threads compute identical values)
+    int depth = 0;
+    int64_t s_off[TRSV_MAX_DEPTH];
+    int64_t s_size[TRSV_MAX_DEPTH];
+    int8_t  s_phase[TRSV_MAX_DEPTH];
+
+    s_off[0] = 0;
+    s_size[0] = n;
+    s_phase[0] = 0;
+
+    while (depth >= 0) {
+        int64_t off = s_off[depth];
+        int64_t sz = s_size[depth];
+        int8_t phase = s_phase[depth];
+
+        if (sz <= TRSV_THRESHOLD) {
+            // Base case: thread 0 runs sequential forward substitution
+            if (tid == 0) {
+                solveLowerUnit_rm(L + off * ldl + off, int(ldl), int(sz), v + off);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            depth--;
+            if (depth >= 0) s_phase[depth]++;
+            continue;
+        }
+
+        int64_t mid = sz / 2;
+
+        if (phase == 0) {
+            // Descend left: solve L11 * x1 = b1 (top-left block, size mid)
+            depth++;
+            s_off[depth] = off;
+            s_size[depth] = mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        if (phase == 1) {
+            // Left child done. GEMV: b2 -= L21 * x1
+            // L21 is at L[(off+mid)*ldl + off], size (sz-mid) × mid
+            int64_t rows = sz - mid;
+            for (int64_t i = int64_t(tid); i < rows; i += int64_t(nt)) {
+                T sum = T(0);
+                for (int64_t k = 0; k < mid; k++) {
+                    sum += L[(off + mid + i) * ldl + off + k] * v[off + k];
+                }
+                v[off + mid + i] -= sum;
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+
+            // Descend right: solve L22 * x2 = b2 (bottom-right block, size sz-mid)
+            depth++;
+            s_off[depth] = off + mid;
+            s_size[depth] = sz - mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        // phase >= 2: right child done, pop this frame
+        depth--;
+        if (depth >= 0) s_phase[depth]++;
+    }
+}
+
+// Iterative recursive backward substitution: U * x = b (upper triangular)
+// U is row-major with leading dimension ldu, sub-problem within [0, n).
+// Solves bottom-right first, then GEMV, then top-left.
+template <typename T>
+inline void iterativeSolveUpper(device T* U, int64_t ldu, int64_t n,
+                                 device T* v, uint tid, uint nt)
+{
+    int depth = 0;
+    int64_t s_off[TRSV_MAX_DEPTH];
+    int64_t s_size[TRSV_MAX_DEPTH];
+    int8_t  s_phase[TRSV_MAX_DEPTH];
+
+    s_off[0] = 0;
+    s_size[0] = n;
+    s_phase[0] = 0;
+
+    while (depth >= 0) {
+        int64_t off = s_off[depth];
+        int64_t sz = s_size[depth];
+        int8_t phase = s_phase[depth];
+
+        if (sz <= TRSV_THRESHOLD) {
+            // Base case: thread 0 runs sequential backward substitution
+            if (tid == 0) {
+                solveUpperRM(U + off * ldu + off, int(ldu), int(sz), v + off);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            depth--;
+            if (depth >= 0) s_phase[depth]++;
+            continue;
+        }
+
+        int64_t mid = sz / 2;
+
+        if (phase == 0) {
+            // Descend right first: solve U22 * x2 = b2 (bottom-right block)
+            depth++;
+            s_off[depth] = off + mid;
+            s_size[depth] = sz - mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        if (phase == 1) {
+            // Right child done. GEMV: b1 -= U12 * x2
+            // U12 is at U[off*ldu + (off+mid)], size mid × (sz-mid)
+            int64_t cols = sz - mid;
+            for (int64_t i = int64_t(tid); i < mid; i += int64_t(nt)) {
+                T sum = T(0);
+                for (int64_t k = 0; k < cols; k++) {
+                    sum += U[(off + i) * ldu + off + mid + k] * v[off + mid + k];
+                }
+                v[off + i] -= sum;
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+
+            // Descend left: solve U11 * x1 = b1 (top-left block)
+            depth++;
+            s_off[depth] = off;
+            s_size[depth] = mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        // phase >= 2: left child done, pop this frame
+        depth--;
+        if (depth >= 0) s_phase[depth]++;
+    }
+}
+
+// ============================================================================
 // Direct-offset LU solve kernels (for per-lump calls with explicit offsets)
 // ============================================================================
 
 // Solve L * x = b where L is unit lower triangular (row-major at data+offM, n×n)
 // x is col-major at C+offC with stride ldc
+// Uses recursive TRSV→GEMV decomposition for threadgroup-parallel solve.
 kernel void lu_solveLUnit_direct_kernel_float(
     device float* data [[buffer(0)]],
     constant int64_t& offM [[buffer(1)]],
@@ -1454,18 +1616,18 @@ kernel void lu_solveLUnit_direct_kernel_float(
     constant int64_t& offC [[buffer(4)]],
     constant int64_t& ldc [[buffer(5)]],
     constant int64_t& nRHS [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    if (tid != 0) return;
-
     device float* L = data + offM;
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        solveLowerUnit_rm(L, int(n), int(n), C + offC + rhs * ldc);
+        iterativeSolveLowerUnit(L, n, n, C + offC + rhs * ldc, tid, nt);
     }
 }
 
 // Solve U * x = b where U is upper triangular (row-major at data+offM, n×n)
 // x is col-major at C+offC with stride ldc
+// Uses recursive TRSV→GEMV decomposition for threadgroup-parallel solve.
 kernel void lu_solveU_direct_kernel_float(
     device float* data [[buffer(0)]],
     constant int64_t& offM [[buffer(1)]],
@@ -1474,13 +1636,12 @@ kernel void lu_solveU_direct_kernel_float(
     constant int64_t& offC [[buffer(4)]],
     constant int64_t& ldc [[buffer(5)]],
     constant int64_t& nRHS [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    if (tid != 0) return;
-
     device float* U = data + offM;
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        solveUpperRM(U, int(n), int(n), C + offC + rhs * ldc);
+        iterativeSolveUpper(U, n, n, C + offC + rhs * ldc, tid, nt);
     }
 }
 
