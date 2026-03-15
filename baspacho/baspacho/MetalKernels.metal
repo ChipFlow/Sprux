@@ -1736,6 +1736,178 @@ kernel void lu_solveU_direct_kernel_float(
 }
 
 // ============================================================================
+// Device helper functions for fused dense solve kernels
+// ============================================================================
+// These are reusable inline functions for matvec, scatter, and gather operations.
+// Used by the fused per-lump kernels below.
+
+// Strided-loop GEMV: tempVec[row*nRHS+rhs] = alpha * sum(M[row,col] * x[col])
+// M is row-major nRows×nCols at data+offset. x is col-major at A+offA with stride lda.
+// Each thread handles rows in a strided pattern.
+template <typename T>
+inline void deviceGemv(device T* data, int64_t offset,
+                       int64_t nRows, int64_t nCols,
+                       device T* A, int64_t offA, int64_t lda,
+                       T alpha, int64_t nRHS,
+                       device T* tempVec,
+                       uint tid, uint nt)
+{
+    for (int64_t row = int64_t(tid); row < nRows; row += int64_t(nt)) {
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            T sum = T(0);
+            for (int64_t col = 0; col < nCols; col++) {
+                sum += data[offset + row * nCols + col] * A[offA + col + rhs * lda];
+            }
+            tempVec[row * nRHS + rhs] = alpha * sum;
+        }
+    }
+}
+
+// Strided-loop assembleVec: scatter tempVec → C using chain structure.
+// Each thread handles chain entries in a strided pattern.
+template <typename T>
+inline void deviceAssembleVec(constant int64_t* chainRowsTillEnd,
+                              constant int64_t* toSpan,
+                              constant int64_t* spanStarts,
+                              device T* tempVec,
+                              int64_t numColItems,
+                              device T* C, int64_t ldc, int64_t nRHS,
+                              int64_t startRow,
+                              uint tid, uint nt)
+{
+    for (int64_t item = int64_t(tid); item < numColItems; item += int64_t(nt)) {
+        int64_t rowsBefore = (item > 0) ? (chainRowsTillEnd[item - 1] - startRow) : 0;
+        int64_t rowsAfter = chainRowsTillEnd[item] - startRow;
+        int64_t blockRows = rowsAfter - rowsBefore;
+
+        int64_t span = toSpan[item];
+        int64_t spanStart = spanStarts[span];
+
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            for (int64_t i = 0; i < blockRows; i++) {
+                C[spanStart + i + rhs * ldc] += tempVec[(rowsBefore + i) * nRHS + rhs];
+            }
+        }
+    }
+}
+
+// Strided-loop gemvDirect: dst += alpha * M * src
+// M is row-major nRows×nCols at data+offset.
+// src is at vec+srcOff, dst is at vec+dstOff, stride ldVec.
+template <typename T>
+inline void deviceGemvDirect(device T* data, int64_t offset,
+                             int64_t nRows, int64_t nCols,
+                             device T* vec, int64_t srcOff, int64_t dstOff,
+                             int64_t ldVec, T alpha, int64_t nRHS,
+                             uint tid, uint nt)
+{
+    for (int64_t row = int64_t(tid); row < nRows; row += int64_t(nt)) {
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            T sum = T(0);
+            for (int64_t col = 0; col < nCols; col++) {
+                sum += data[offset + row * nCols + col] * vec[srcOff + col + rhs * ldVec];
+            }
+            vec[dstOff + row + rhs * ldVec] += alpha * sum;
+        }
+    }
+}
+
+// ============================================================================
+// Fused per-lump dense solve kernels
+// ============================================================================
+
+// Fused forward L solve: solveLUnit + gemv + assembleVec in a single dispatch.
+// Single threadgroup, power-of-2 threads. Phases separated by threadgroup barriers.
+kernel void lu_fusedForwardLUnit_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& diagOffset [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    constant int64_t& belowDiagOffset [[buffer(3)]],
+    constant int64_t& numRowsBelowDiag [[buffer(4)]],
+    constant int64_t* chainRowsTillEnd [[buffer(5)]],
+    constant int64_t* chainRowSpan [[buffer(6)]],
+    constant int64_t* spanStarts [[buffer(7)]],
+    constant int64_t& numColItems [[buffer(8)]],
+    constant int64_t& startRow [[buffer(9)]],
+    device float* vecData [[buffer(10)]],
+    constant int64_t& lumpStart [[buffer(11)]],
+    constant int64_t& stride [[buffer(12)]],
+    constant int64_t& nRHS [[buffer(13)]],
+    device float* tempVec [[buffer(14)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
+{
+    // Phase 1: solve L * x = b with unit diagonal (recursive TRSV→GEMV)
+    device float* L = data + diagOffset;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        iterativeSolveLowerUnit(L, n, n, vecData + lumpStart + rhs * stride, tid, nt);
+    }
+
+    if (numRowsBelowDiag <= 0) return;
+
+    // Phase 2: tempVec = -1.0 * M_below * x_diag
+    threadgroup_barrier(mem_flags::mem_device);
+    deviceGemv(
+        data, belowDiagOffset,
+        numRowsBelowDiag, n,
+        vecData, lumpStart, stride,
+        -1.0f, nRHS, tempVec, tid, nt);
+
+    // Phase 3: scatter tempVec → vecData using chain structure
+    threadgroup_barrier(mem_flags::mem_device);
+    deviceAssembleVec(
+        chainRowsTillEnd, chainRowSpan, spanStarts,
+        tempVec, numColItems,
+        vecData, stride, nRHS, startRow, tid, nt);
+}
+
+// Fused backward U solve: iterate upper chain gemvDirect + solveU in a single dispatch.
+// Single threadgroup, power-of-2 threads. Iterates upper chain entries on GPU.
+kernel void lu_fusedBackwardU_kernel_float(
+    device float* data [[buffer(0)]],
+    constant int64_t& diagOffset [[buffer(1)]],
+    constant int64_t& n [[buffer(2)]],
+    constant int64_t& upperDataBase [[buffer(3)]],
+    constant int64_t* upperChainRowPtr [[buffer(4)]],
+    constant int64_t* upperChainColSpan [[buffer(5)]],
+    constant int64_t* upperChainData [[buffer(6)]],
+    constant int64_t* spanStarts [[buffer(7)]],
+    constant int64_t& lump [[buffer(8)]],
+    device float* vecData [[buffer(9)]],
+    constant int64_t& lumpStart [[buffer(10)]],
+    constant int64_t& stride [[buffer(11)]],
+    constant int64_t& nRHS [[buffer(12)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
+{
+    // Phase 1: for each upper chain entry, accumulate y(lump) -= U_{lump,k} * x(k)
+    int64_t upperRowStart = upperChainRowPtr[lump];
+    int64_t upperRowEnd = upperChainRowPtr[lump + 1];
+
+    for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = upperChainColSpan[i];
+        int64_t colStart = spanStarts[colSpan];
+        int64_t colSize = spanStarts[colSpan + 1] - colStart;
+        int64_t upperDataOffset = upperDataBase + upperChainData[i];
+
+        deviceGemvDirect(
+            data, upperDataOffset,
+            n, colSize,
+            vecData, colStart, lumpStart,
+            stride, -1.0f, nRHS, tid, nt);
+
+        // Barrier between upper chain entries for correctness
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // Phase 2: solve U * x = y for diagonal block (recursive TRSV→GEMV)
+    device float* U = data + diagOffset;
+    for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        iterativeSolveUpper(U, n, n, vecData + lumpStart + rhs * stride, tid, nt);
+    }
+}
+
+// ============================================================================
 // Iterative refinement step kernel (fused unpermute + accumulate + SpMV + permute)
 // ============================================================================
 

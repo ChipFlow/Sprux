@@ -617,6 +617,39 @@ struct SolveCtx : SolveCtxBase {
     throw std::runtime_error("gemvDirect: LU not supported by this backend");
   }
 
+  // ============ Fused dense solve methods ============
+  // These fuse multiple per-lump dispatch operations into single GPU kernel launches.
+  // Default implementations call the separate methods (no behavior change for non-GPU backends).
+
+  // Fused forward L solve for LU: solveLUnit + gemv + assembleVec in one dispatch.
+  // Default: calls the 3 separate methods (identical behavior).
+  virtual void fusedForwardLUnit(const T* data, int64_t diagOffset, int64_t n,
+                                 int64_t belowDiagOffset, int64_t numRowsBelowDiag,
+                                 int64_t chainColPtr, int64_t numColItems, int64_t startRow,
+                                 T* vecData, int64_t lumpStart, int64_t stride) {
+    solveLUnit(data, diagOffset, n, vecData, lumpStart, stride);
+    if (numRowsBelowDiag > 0) {
+      gemv(data, belowDiagOffset, numRowsBelowDiag, n, vecData, lumpStart, stride, -1.0);
+      assembleVec(chainColPtr, numColItems, vecData, stride);
+    }
+  }
+
+  // Fused backward U solve for LU: iterates upper chain gemvDirect entries + solveU in one dispatch.
+  // Default: just calls solveU (caller handles gemvDirect loop separately).
+  // NOTE: Only called when hasFusedBackwardU() returns true. The default does NOT handle
+  // the gemvDirect loop — Solver.cpp runs that loop itself when hasFusedBackwardU() is false.
+  virtual void fusedBackwardU(const T* data, int64_t diagOffset, int64_t n,
+                              int64_t lump, int64_t upperDataBase,
+                              T* vecData, int64_t lumpStart, int64_t stride) {
+    (void)lump;
+    (void)upperDataBase;
+    solveU(data, diagOffset, n, vecData, lumpStart, stride);
+  }
+
+  // Whether this backend supports fused backward U (kernel iterates upper chain internally).
+  // When true, Solver.cpp skips the CPU gemvDirect loop and calls fusedBackwardU instead.
+  virtual bool hasFusedBackwardU() const { return false; }
+
   // ============ LDL^T solve methods ============
   // For symmetric indefinite factorization A = L * D * L^T
 

@@ -3194,6 +3194,128 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // ============ Fused dense solve methods ============
+
+  // Fused forward L: solveLUnit + gemv + assembleVec in one GPU dispatch.
+  virtual void fusedForwardLUnit(const float* data, int64_t diagOffset, int64_t n,
+                                 int64_t belowDiagOffset, int64_t numRowsBelowDiag,
+                                 int64_t chainColPtr, int64_t numColItems, int64_t startRow,
+                                 float* vecData, int64_t lumpStart, int64_t stride) override {
+    @autoreleasepool {
+      if (n <= 0 || nRHS <= 0) return;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::fusedForwardLUnit: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      tempVecBuffer.resizeToAtLeast(numRowsBelowDiag * nRHS);
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_fusedForwardLUnit_kernel_float");
+
+      // Power-of-2 threadgroup size, single threadgroup
+      int thr = std::max((int)n, (int)numRowsBelowDiag);
+      thr = std::min(thr, 256);
+      int numThreads = 1;
+      while (numThreads < thr) numThreads <<= 1;
+
+      int64_t nRHS64 = nRHS;
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&diagOffset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&belowDiagOffset length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:&numRowsBelowDiag length:sizeof(int64_t) atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                        offset:chainColPtr * sizeof(int64_t)
+                       atIndex:5];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:chainColPtr * sizeof(int64_t)
+                       atIndex:6];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0
+                       atIndex:7];
+            [encoder setBytes:&numColItems length:sizeof(int64_t) atIndex:8];
+            [encoder setBytes:&startRow length:sizeof(int64_t) atIndex:9];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:10];
+            [encoder setBytes:&lumpStart length:sizeof(int64_t) atIndex:11];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:12];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:13];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer()
+                        offset:0
+                       atIndex:14];
+          },
+          1,  // single threadgroup
+          (NSUInteger)numThreads);
+    }
+  }
+
+  // Fused backward U: iterate upper chain gemvDirect + solveU in one GPU dispatch.
+  virtual void fusedBackwardU(const float* data, int64_t diagOffset, int64_t n,
+                              int64_t lump, int64_t upperDataBase,
+                              float* vecData, int64_t lumpStart, int64_t stride) override {
+    @autoreleasepool {
+      if (n <= 0 || nRHS <= 0) return;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx<float>::fusedBackwardU: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_fusedBackwardU_kernel_float");
+
+      // Power-of-2 threadgroup size, single threadgroup
+      int thr = std::min((int)n, 256);
+      int numThreads = 1;
+      while (numThreads < thr) numThreads <<= 1;
+
+      int64_t nRHS64 = nRHS;
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBytes:&diagOffset length:sizeof(int64_t) atIndex:1];
+            [encoder setBytes:&n length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                        offset:0
+                       atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                        offset:0
+                       atIndex:5];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                        offset:0
+                       atIndex:6];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0
+                       atIndex:7];
+            [encoder setBytes:&lump length:sizeof(int64_t) atIndex:8];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:9];
+            [encoder setBytes:&lumpStart length:sizeof(int64_t) atIndex:10];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:11];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:12];
+          },
+          1,  // single threadgroup
+          (NSUInteger)numThreads);
+    }
+  }
+
+  virtual bool hasFusedBackwardU() const override { return true; }
+
   void flush() override { commitAndWait(); }
 
   // Reset per-solve mutable state without deallocating any buffers.

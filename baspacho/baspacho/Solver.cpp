@@ -1244,9 +1244,6 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
     int64_t chainColBegin = factorSkel.chainColPtr[l];
     int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
 
-    // Solve L * x_l = z_l with unit diagonal
-    slvCtx.solveLUnit(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
-
     int64_t boardColBegin = factorSkel.boardColPtr[l];
     int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
     int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
@@ -1254,15 +1251,15 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
     int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
     int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
                                factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
-    if (numRowsBelowDiag == 0) {
-      continue;
-    }
-
-    slvCtx.gemv(matData, belowDiagOffset, numRowsBelowDiag, lumpSize, vecData, lumpStart, stride,
-                -1.0);
 
     int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
-    slvCtx.assembleVec(chainColPtr, numColChains - belowDiagChainColOrd, vecData, stride);
+    int64_t numColItems = numColChains - belowDiagChainColOrd;
+    int64_t startRow =
+        (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
+
+    slvCtx.fusedForwardLUnit(matData, diagBlockOffset, lumpSize, belowDiagOffset,
+                             numRowsBelowDiag, chainColPtr, numColItems, startRow, vecData,
+                             lumpStart, stride);
   }
 }
 
@@ -1290,32 +1287,36 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   }
 
   // Dense backward substitution with U (from last lump down to denseOpsFromLump)
+  bool fusedBackward = slvCtx.hasFusedBackwardU() && factorSkel.isGeneral();
   for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
     int64_t lumpStart = factorSkel.lumpStart[l];
     int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
     int64_t chainColBegin = factorSkel.chainColPtr[l];
     int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
 
-    // For off-diagonal U entries, subtract contributions: y(l) -= U_{l,k} * x(k) for k > l
-    if (factorSkel.isGeneral()) {
-      int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
-      int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
+    if (fusedBackward) {
+      // Fused kernel handles upper chain iteration + solveU in one dispatch
+      slvCtx.fusedBackwardU(matData, diagBlockOffset, lumpSize, l, upperDataBase, vecData,
+                            lumpStart, stride);
+    } else {
+      // Non-fused path: CPU gemvDirect loop + separate solveU
+      if (factorSkel.isGeneral()) {
+        int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
+        int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
 
-      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
-        int64_t colSpan = factorSkel.upperChainColSpan[i];
-        int64_t colStart = factorSkel.spanStart[colSpan];
-        int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
-        int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+        for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+          int64_t colSpan = factorSkel.upperChainColSpan[i];
+          int64_t colStart = factorSkel.spanStart[colSpan];
+          int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
+          int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
 
-        // y(l) -= U_{l,k} * x(k)
-        // U block has shape (lumpSize x colSize), stored row-major
-        slvCtx.gemvDirect(matData, upperDataOffset, lumpSize, colSize, vecData, colStart, lumpStart,
-                          stride, -1.0);
+          slvCtx.gemvDirect(matData, upperDataOffset, lumpSize, colSize, vecData, colStart,
+                            lumpStart, stride, -1.0);
+        }
       }
-    }
 
-    // Solve U * x_l = y_l for diagonal block
-    slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+      slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+    }
   }
 
   // Sparse elimination backward U solve (reverse order, like Cholesky Lt)
