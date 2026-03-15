@@ -1822,8 +1822,9 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_trsmLowerUnit_kernel_float");
 
-      // Power-of-2 threadgroup size for parallel column processing
-      int thr = std::min((int)n, 256);
+      // Power-of-2 threadgroup size: use max(m, n) since recursive TRSM→GEMM
+      // distributes GEMM work across both rows and columns
+      int thr = std::min(std::max((int)m, (int)n), 256);
       int t = 1;
       while (t < thr) t <<= 1;
       NSUInteger numThreads = (NSUInteger)t;

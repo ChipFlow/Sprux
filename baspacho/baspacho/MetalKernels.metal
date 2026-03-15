@@ -1136,9 +1136,111 @@ kernel void lu_applyRowPerm_kernel_float(
     }
 }
 
+// ============================================================================
+// Recursive TRSM→GEMM for parallel triangular solve (multi-RHS)
+// ============================================================================
+//
+// Generalizes TRSV→GEMV to multiple right-hand sides (n > 1).
+// For L * X = B (unit lower triangular, splitting on m rows):
+//   TRSM(m) = TRSM(m/2) + GEMM + TRSM(m/2)
+//
+// Base case (m ≤ THRESHOLD): column-parallel sequential row solve (same as
+// original kernel, with THRESHOLD barriers).
+//
+// GEMM steps parallelize across rows × cols of the output block, giving
+// better thread utilization than the row-sequential approach for large m.
+// ============================================================================
+
+constant constexpr int TRSM_THRESHOLD = 16;
+constant constexpr int TRSM_MAX_DEPTH = 12;  // supports m up to 16 * 2^12 = 65536
+
+// Recursive TRSM: L * X = B, where L is m×m unit lower triangular (row-major,
+// stride ldl). B is m×n row-major with stride ldb. Solves in place.
+// L is in constant address space (read-only diagonal block from factored data).
+template <typename T>
+inline void iterativeTrsmLowerUnit(constant T* L, int64_t ldl,
+                                    device T* B, int64_t ldb,
+                                    int64_t m, int64_t n,
+                                    uint tid, uint nt)
+{
+    int depth = 0;
+    int64_t s_off[TRSM_MAX_DEPTH];   // row offset into L diagonal / B rows
+    int64_t s_size[TRSM_MAX_DEPTH];  // sub-problem row count
+    int8_t  s_phase[TRSM_MAX_DEPTH];
+
+    s_off[0] = 0;
+    s_size[0] = m;
+    s_phase[0] = 0;
+
+    while (depth >= 0) {
+        int64_t off = s_off[depth];
+        int64_t sz = s_size[depth];
+        int8_t phase = s_phase[depth];
+
+        if (sz <= TRSM_THRESHOLD) {
+            // Base case: parallel across columns, sequential across rows
+            for (int64_t i = 0; i < sz; i++) {
+                for (int64_t j = int64_t(tid); j < n; j += int64_t(nt)) {
+                    T val = B[(off + i) * ldb + j];
+                    for (int64_t k = 0; k < i; k++) {
+                        val -= L[(off + i) * ldl + off + k] * B[(off + k) * ldb + j];
+                    }
+                    B[(off + i) * ldb + j] = val;
+                }
+                threadgroup_barrier(mem_flags::mem_device);
+            }
+            depth--;
+            if (depth >= 0) s_phase[depth]++;
+            continue;
+        }
+
+        int64_t mid = sz / 2;
+
+        if (phase == 0) {
+            // Descend to top half: solve L11 * X1 = B1 (rows 0..mid-1)
+            depth++;
+            s_off[depth] = off;
+            s_size[depth] = mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        if (phase == 1) {
+            // GEMM: B_bottom -= L21 * B_top
+            // L21 at L[(off+mid)*ldl + off], size (sz-mid) × mid
+            // B_top at B[off*ldb], size mid × n
+            // B_bottom at B[(off+mid)*ldb], size (sz-mid) × n
+            // Distribute across all (rows × cols) output elements
+            int64_t rows = sz - mid;
+            int64_t total = rows * n;
+            for (int64_t idx = int64_t(tid); idx < total; idx += int64_t(nt)) {
+                int64_t i = idx / n;   // row in bottom block
+                int64_t j = idx % n;   // column
+                T sum = T(0);
+                for (int64_t k = 0; k < mid; k++) {
+                    sum += L[(off + mid + i) * ldl + off + k] * B[(off + k) * ldb + j];
+                }
+                B[(off + mid + i) * ldb + j] -= sum;
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+
+            // Descend to bottom half: solve L22 * X2 = B2
+            depth++;
+            s_off[depth] = off + mid;
+            s_size[depth] = sz - mid;
+            s_phase[depth] = 0;
+            continue;
+        }
+
+        // phase >= 2: pop
+        depth--;
+        if (depth >= 0) s_phase[depth]++;
+    }
+}
+
 // TRSM: Solve L * X = B where L is m×m unit lower triangular (row-major)
 // B is m×n row-major with stride ldb
-// Parallel across columns (threads divide j), barrier after each row
+// Uses recursive TRSM→GEMM decomposition for threadgroup-parallel solve.
 kernel void lu_trsmLowerUnit_kernel_float(
     constant float* L [[buffer(0)]],
     constant int64_t& offL [[buffer(1)]],
@@ -1150,19 +1252,7 @@ kernel void lu_trsmLowerUnit_kernel_float(
     uint tid [[thread_position_in_threadgroup]],
     uint nt [[threads_per_threadgroup]])
 {
-    device float* Bp = B + offB;
-    constant float* Lp = L + offL;
-
-    for (int64_t i = 0; i < m; i++) {
-        for (int64_t j = tid; j < n; j += nt) {
-            float val = Bp[i * ldb + j];
-            for (int64_t k = 0; k < i; k++) {
-                val -= Lp[i * m + k] * Bp[k * ldb + j];
-            }
-            Bp[i * ldb + j] = val;
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-    }
+    iterativeTrsmLowerUnit(L + offL, m, B + offB, ldb, m, n, tid, nt);
 }
 
 // TRSM: Solve X * U = B where U is n×n upper triangular (row-major)
