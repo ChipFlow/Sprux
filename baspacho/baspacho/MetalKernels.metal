@@ -2125,7 +2125,7 @@ kernel void sparseElim_upperGather_float(
 
 // Backward U solve: divide by U diagonal
 // For each lump, computes v[lump] /= U_diagonal
-// One thread per lump.
+// One threadgroup per lump — uses recursive TRSV→GEMV for parallelism.
 kernel void sparseElim_diagDivU_float(
     constant int64_t* lumpStarts [[buffer(0)]],
     constant int64_t* chainColPtr [[buffer(1)]],
@@ -2136,9 +2136,11 @@ kernel void sparseElim_diagDivU_float(
     constant int64_t& nRHS [[buffer(6)]],
     constant int64_t& lumpIndexStart [[buffer(7)]],
     constant int64_t& lumpIndexEnd [[buffer(8)]],
-    uint tid [[thread_position_in_grid]])
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
 {
-    int64_t lump = lumpIndexStart + tid;
+    int64_t lump = lumpIndexStart + int64_t(gid);
     if (lump >= lumpIndexEnd) {
         return;
     }
@@ -2151,9 +2153,10 @@ kernel void sparseElim_diagDivU_float(
     device float* diagBlock = data + diagDataPtr;
 
     // For LU, diagonal block has U in upper triangle (row-major, from getrf)
-    // Solve U * x = b: back-substitution with row-major U
+    // Solve U * x = b: recursive TRSV→GEMV with threadgroup parallelism
     for (int64_t rhs = 0; rhs < nRHS; rhs++) {
-        solveUpperRowMajor_dev(diagBlock, int(lumpSize), int(lumpSize), v + lumpStart + ldc * rhs);
+        iterativeSolveUpper(diagBlock, lumpSize, lumpSize,
+                            v + lumpStart + ldc * rhs, tid, nt);
     }
 }
 

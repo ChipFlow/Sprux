@@ -2313,6 +2313,41 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  // Encode a kernel dispatch with explicit threadgroup counts.
+  // Used when each threadgroup must cooperate internally (e.g., per-lump
+  // recursive TRSV with threadgroup_barrier).
+  void encodeKernelWithGroups(id<MTLComputePipelineState> pipeline,
+                              void (^encodeBlock)(id<MTLComputeCommandEncoder>),
+                              NSUInteger numGroupCount, NSUInteger threadsPerGroup) {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> encoder;
+      if (sym.usingExternalEncoder) {
+        encoder = sym.externalEncoder;
+      } else {
+        if (!pendingCmdBuf_) {
+          pendingCmdBuf_ = [sym.commandQueue commandBuffer];
+        }
+        if (!pendingEncoder_) {
+          pendingEncoder_ = [pendingCmdBuf_ computeCommandEncoder];
+          pendingDispatchCount_ = 0;
+        }
+        encoder = pendingEncoder_;
+      }
+
+      if (pendingDispatchCount_ > 0) {
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+      }
+
+      [encoder setComputePipelineState:pipeline];
+      encodeBlock(encoder);
+
+      MTLSize tpg = MTLSizeMake(threadsPerGroup, 1, 1);
+      MTLSize ng = MTLSizeMake(numGroupCount, 1, 1);
+      [encoder dispatchThreadgroups:ng threadsPerThreadgroup:tpg];
+      pendingDispatchCount_++;
+    }
+  }
+
   // Commit the pending command buffer WITHOUT waiting for GPU completion.
   // In external encoder mode, this is a no-op — the caller manages the command buffer.
   void commitPending() {
@@ -2587,10 +2622,14 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
           (NSUInteger)numLumps);
 
       // Then: diagonal U solve: v[lump] /= U_diagonal
+      // Dispatched as 1 threadgroup per lump for recursive TRSV→GEMV parallelism
       id<MTLComputePipelineState> diagPipeline =
           getPipeline("sparseElim_diagDivU_float");
 
-      encodeKernel(
+      // Power-of-2 threads per threadgroup, capped at 256
+      NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
+
+      encodeKernelWithGroups(
           diagPipeline,
           ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
@@ -2605,7 +2644,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
             [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
             [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
           },
-          (NSUInteger)numLumps);
+          (NSUInteger)numLumps, tgSize);
     }
   }
 
