@@ -2134,6 +2134,119 @@ kernel void refine_spmv_kernel_float(
     xGpu[perm[j]] = rowScale[j] * residual;
 }
 
+// SIMD-group reduction for double-float pairs.
+// Uses simd_shuffle_down with compensated addition to preserve ~float64 precision.
+// Result is in lane 0 after reduction.
+inline void dfSimdReduce(thread float& sum_hi, thread float& sum_lo) {
+    for (ushort offset = 16; offset >= 1; offset >>= 1) {
+        float other_hi = simd_shuffle_down(sum_hi, offset);
+        float other_lo = simd_shuffle_down(sum_lo, offset);
+        dfAdd2(sum_hi, sum_lo, other_hi, other_lo, sum_hi, sum_lo);
+    }
+}
+
+// Two-phase SpMV: short-row kernel (one thread per row).
+// Processes a subset of rows via index list. Includes fast path for nnz==1 rows.
+kernel void refine_spmv_short_kernel_float(
+    device const int64_t* csrRowPtr [[buffer(0)]],
+    device const int64_t* csrColInd [[buffer(1)]],
+    device const float* csrValues [[buffer(2)]],
+    device const int64_t* perm [[buffer(3)]],
+    device const int64_t* rowPerm [[buffer(4)]],
+    device const float* rowScale [[buffer(5)]],
+    device const float* b_hi [[buffer(6)]],
+    device const float* x_accum_hi [[buffer(7)]],
+    device const float* x_accum_lo [[buffer(8)]],
+    device float* xGpu [[buffer(9)]],
+    device const int32_t* rowIndices [[buffer(10)]],
+    constant int32_t& numRows [[buffer(11)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(numRows)) return;
+    int32_t j = rowIndices[tid];
+    int64_t srcRow = rowPerm[j];
+    int64_t start = csrRowPtr[srcRow];
+    int64_t end = csrRowPtr[srcRow + 1];
+
+    // Fast path for single-element rows (40% of c6288)
+    if (end - start == 1) {
+        int64_t col = csrColInd[start];
+        float val = csrValues[start];
+        float x_hi = x_accum_hi[col];
+        float x_lo = x_accum_lo[col];
+        float prod_hi, prod_err;
+        twoProd(val, x_hi, prod_hi, prod_err);
+        float residual = (b_hi[srcRow] - prod_hi) - (prod_err + val * x_lo);
+        xGpu[perm[j]] = rowScale[j] * residual;
+        return;
+    }
+
+    float sum_hi = 0.0f, sum_lo = 0.0f;
+    for (int64_t k = start; k < end; k++) {
+        int64_t col = csrColInd[k];
+        float val = csrValues[k];
+        float x_hi = x_accum_hi[col];
+        float x_lo = x_accum_lo[col];
+        float prod_hi, prod_err;
+        twoProd(val, x_hi, prod_hi, prod_err);
+        float prod_lo = prod_err + val * x_lo;
+        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+    }
+    float residual = (b_hi[srcRow] - sum_hi) - sum_lo;
+    xGpu[perm[j]] = rowScale[j] * residual;
+}
+
+// Two-phase SpMV: long-row kernel (one SIMD group per row).
+// 32 lanes stripe through nonzeros, then reduce with compensated SIMD shuffle.
+// Dispatch: numLongRows * 32 threads, threadgroup size 256 (= 8 SIMD groups per TG).
+kernel void refine_spmv_long_kernel_float(
+    device const int64_t* csrRowPtr [[buffer(0)]],
+    device const int64_t* csrColInd [[buffer(1)]],
+    device const float* csrValues [[buffer(2)]],
+    device const int64_t* perm [[buffer(3)]],
+    device const int64_t* rowPerm [[buffer(4)]],
+    device const float* rowScale [[buffer(5)]],
+    device const float* b_hi [[buffer(6)]],
+    device const float* x_accum_hi [[buffer(7)]],
+    device const float* x_accum_lo [[buffer(8)]],
+    device float* xGpu [[buffer(9)]],
+    device const int32_t* rowIndices [[buffer(10)]],
+    constant int32_t& numRows [[buffer(11)]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint tg_id [[threadgroup_position_in_grid]])
+{
+    // 256 threads / 32 per SIMD = 8 SIMD groups per threadgroup
+    uint rowIdx = tg_id * 8 + simd_group_id;
+    if (rowIdx >= uint(numRows)) return;
+
+    int32_t j = rowIndices[rowIdx];
+    int64_t srcRow = rowPerm[j];
+    int64_t start = csrRowPtr[srcRow];
+    int64_t end = csrRowPtr[srcRow + 1];
+
+    // Each lane processes elements at stride 32
+    float sum_hi = 0.0f, sum_lo = 0.0f;
+    for (int64_t k = start + int64_t(simd_lane_id); k < end; k += 32) {
+        int64_t col = csrColInd[k];
+        float val = csrValues[k];
+        float x_hi = x_accum_hi[col];
+        float x_lo = x_accum_lo[col];
+        float prod_hi, prod_err;
+        twoProd(val, x_hi, prod_hi, prod_err);
+        float prod_lo = prod_err + val * x_lo;
+        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+    }
+
+    // Compensated SIMD-group reduction (result in lane 0)
+    dfSimdReduce(sum_hi, sum_lo);
+
+    if (simd_lane_id == 0) {
+        float residual = (b_hi[srcRow] - sum_hi) - sum_lo;
+        xGpu[perm[j]] = rowScale[j] * residual;
+    }
+}
+
 // Legacy single-threaded version for small matrices (n <= ~100).
 // Uses simple float32 — sufficient for well-conditioned small systems.
 kernel void refine_step_kernel_float(

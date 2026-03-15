@@ -847,6 +847,10 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     ? metalCtx.getPipelineState("refine_accumulate_kernel_float") : nullptr;
   void* spmvPipeline = useParallelRefine
     ? metalCtx.getPipelineState("refine_spmv_kernel_float") : nullptr;
+  void* spmvShortPipeline = useParallelRefine
+    ? metalCtx.getPipelineState("refine_spmv_short_kernel_float") : nullptr;
+  void* spmvLongPipeline = useParallelRefine
+    ? metalCtx.getPipelineState("refine_spmv_long_kernel_float") : nullptr;
   void* refinePipeline = !useParallelRefine
     ? metalCtx.getPipelineState("refine_step_kernel_float") : nullptr;
 
@@ -861,6 +865,38 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   MetalMirror<int64_t> csrColInd(matrices[0].first.colInd);
   MetalMirror<int64_t> devPerm(vector<int64_t>(perm.begin(), perm.end()));
   MetalMirror<int64_t> devRowPerm(preproc.rowPerm);
+
+  // Pre-compute row bins for two-phase SpMV: short rows (thread-per-row)
+  // vs long rows (SIMD-group-per-row, 32 threads cooperate on one row).
+  // Two-phase SpMV: short rows (thread-per-row) + long rows (SIMD-group-per-row).
+  // Set BASPACHO_SPMV_LONG_THRESHOLD=N to enable (rows with >N nnz use SIMD).
+  // Default 0 (disabled): single-dispatch is equivalent for c6288 (dispatch overhead
+  // offsets load-balancing benefit). Enable for matrices with extreme row-length variance.
+  const char* threshEnv = getenv("BASPACHO_SPMV_LONG_THRESHOLD");
+  const int64_t spmvLongRowThreshold = threshEnv ? atoi(threshEnv) : 0;
+  bool useTwoPhaseSpMV = (spmvLongRowThreshold > 0);
+  vector<int32_t> shortRowIndices, longRowIndices;
+  if (useParallelRefine && useTwoPhaseSpMV) {
+    const auto& rowPtr = matrices[0].first.rowPtr;
+    for (int32_t j = 0; j < int32_t(n); j++) {
+      int64_t srcRow = preproc.rowPerm[j];
+      int64_t nnz = rowPtr[srcRow + 1] - rowPtr[srcRow];
+      if (nnz > spmvLongRowThreshold) {
+        longRowIndices.push_back(j);
+      } else {
+        shortRowIndices.push_back(j);
+      }
+    }
+    if (verbose) {
+      cout << "  [MetalFFI] SpMV row bins: " << shortRowIndices.size()
+           << " short (<=" << spmvLongRowThreshold << " nnz), "
+           << longRowIndices.size() << " long (SIMD-per-row)" << endl;
+    }
+  }
+  MetalMirror<int32_t> devShortRows(shortRowIndices);
+  MetalMirror<int32_t> devLongRows(longRowIndices);
+  int32_t numShortRows = int32_t(shortRowIndices.size());
+  int32_t numLongRows = int32_t(longRowIndices.size());
 
   // Per-matrix GPU buffers (each matrix needs its own data/RHS/accum)
   vector<MetalMirror<float>> matData(nMat);       // factorization data
@@ -956,20 +992,57 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
         // Barrier: accumulate must finish before SpMV reads x_accum
         metalCtx.memoryBarrier(enc);
 
-        // Kernel B: parallel SpMV with compensated dot product (one thread per row)
-        metalCtx.setPipelineState(enc, spmvPipeline);
-        metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
-        metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
-        metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
-        metalCtx.setBuffer(enc, devPerm.buffer(), 3);
-        metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
-        metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
-        metalCtx.setBuffer(enc, matB[mi].buffer(), 6);
-        metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 7);
-        metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 8);
-        metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
-        metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
-        metalCtx.dispatchThreads(enc, spmvPipeline, n);
+        if (useTwoPhaseSpMV) {
+          // Two-phase SpMV: short rows (thread-per-row) + long rows (SIMD-per-row)
+          metalCtx.setPipelineState(enc, spmvShortPipeline);
+          metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+          metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+          metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+          metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+          metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+          metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+          metalCtx.setBuffer(enc, matB[mi].buffer(), 6);
+          metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 7);
+          metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 8);
+          metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+          metalCtx.setBuffer(enc, devShortRows.buffer(), 10);
+          metalCtx.setBytes(enc, &numShortRows, sizeof(int32_t), 11);
+          metalCtx.dispatchThreads(enc, spmvShortPipeline, numShortRows);
+
+          // Long rows: SIMD-group-per-row (32 threads cooperate)
+          // No barrier needed — short and long rows write to disjoint xGpu locations
+          if (numLongRows > 0) {
+            metalCtx.setPipelineState(enc, spmvLongPipeline);
+            metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+            metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+            metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+            metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+            metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+            metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+            metalCtx.setBuffer(enc, matB[mi].buffer(), 6);
+            metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 7);
+            metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 8);
+            metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+            metalCtx.setBuffer(enc, devLongRows.buffer(), 10);
+            metalCtx.setBytes(enc, &numLongRows, sizeof(int32_t), 11);
+            metalCtx.dispatchThreads(enc, spmvLongPipeline, numLongRows * 32);
+          }
+        } else {
+          // Single-dispatch SpMV (original kernel, all rows)
+          metalCtx.setPipelineState(enc, spmvPipeline);
+          metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
+          metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
+          metalCtx.setBuffer(enc, matCsrVal[mi].buffer(), 2);
+          metalCtx.setBuffer(enc, devPerm.buffer(), 3);
+          metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
+          metalCtx.setBuffer(enc, matRowScale[mi].buffer(), 5);
+          metalCtx.setBuffer(enc, matB[mi].buffer(), 6);
+          metalCtx.setBuffer(enc, matXAccumHi[mi].buffer(), 7);
+          metalCtx.setBuffer(enc, matXAccumLo[mi].buffer(), 8);
+          metalCtx.setBuffer(enc, matXGpu[mi].buffer(), 9);
+          metalCtx.setBytes(enc, &n, sizeof(int64_t), 10);
+          metalCtx.dispatchThreads(enc, spmvPipeline, n);
+        }
       } else {
         // Small matrix: single-threaded kernel (simple float32)
         metalCtx.setPipelineState(enc, refinePipeline);
