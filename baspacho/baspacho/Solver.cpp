@@ -1137,11 +1137,24 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   BASPACHO_SIGNPOST_BEGIN("solvePerm");
   int64_t pivotStartLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
-  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
-    int64_t lumpStart = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t pivotOffset = factorSkel.lumpStart[l];  // Row-based pivot index
-    slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+  if (slvCtx->hasBatchedDenseSolve() && pivotStartLump < factorSkel.numLumps()) {
+    int64_t numDenseLumps = factorSkel.numLumps() - pivotStartLump;
+    std::vector<typename SolveCtx<T>::PermLumpInfo> permInfos(numDenseLumps);
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      auto& info = permInfos[l - pivotStartLump];
+      info.pivotByteOffset = factorSkel.lumpStart[l] * (int64_t)sizeof(int64_t);
+      info.lumpStart = factorSkel.lumpStart[l];
+      info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+      info.pad = 0;
+    }
+    slvCtx->batchedApplyRowPermVec(vecData, stride, numDenseLumps, permInfos.data());
+  } else {
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t pivotOffset = factorSkel.lumpStart[l];  // Row-based pivot index
+      slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+    }
   }
   BASPACHO_SIGNPOST_END("solvePerm");
 
@@ -1168,11 +1181,24 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
   // Step 1: Apply row permutation P
   int64_t pivotStartLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
-  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
-    int64_t lumpStart = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t pivotOffset = factorSkel.lumpStart[l];
-    slvCtx.applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+  if (slvCtx.hasBatchedDenseSolve() && pivotStartLump < factorSkel.numLumps()) {
+    int64_t numDenseLumps = factorSkel.numLumps() - pivotStartLump;
+    std::vector<typename SolveCtx<T>::PermLumpInfo> permInfos(numDenseLumps);
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      auto& info = permInfos[l - pivotStartLump];
+      info.pivotByteOffset = factorSkel.lumpStart[l] * (int64_t)sizeof(int64_t);
+      info.lumpStart = factorSkel.lumpStart[l];
+      info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+      info.pad = 0;
+    }
+    slvCtx.batchedApplyRowPermVec(vecData, stride, numDenseLumps, permInfos.data());
+  } else {
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t pivotOffset = factorSkel.lumpStart[l];
+      slvCtx.applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+    }
   }
 
   // Step 2: Solve L * z = y (forward substitution)
@@ -1201,13 +1227,26 @@ void Solver::solveLU(const T* matData, const int64_t* devPivots, T* vecData, int
   // Step 1: Apply row permutation P
   int64_t pivotStartLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
-  for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
-    int64_t lumpStart = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t pivotOffset = factorSkel.lumpStart[l];
-    // devPivots + pivotOffset: device pointer, never dereferenced on host.
-    // Used by CudaSolveCtx::applyRowPermVec for offset computation only.
-    slvCtx.applyRowPermVec(devPivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+  if (slvCtx.hasBatchedDenseSolve() && pivotStartLump < factorSkel.numLumps()) {
+    int64_t numDenseLumps = factorSkel.numLumps() - pivotStartLump;
+    std::vector<typename SolveCtx<T>::PermLumpInfo> permInfos(numDenseLumps);
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      auto& info = permInfos[l - pivotStartLump];
+      info.pivotByteOffset = factorSkel.lumpStart[l] * (int64_t)sizeof(int64_t);
+      info.lumpStart = factorSkel.lumpStart[l];
+      info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+      info.pad = 0;
+    }
+    slvCtx.batchedApplyRowPermVec(vecData, stride, numDenseLumps, permInfos.data());
+  } else {
+    for (int64_t l = pivotStartLump; l < factorSkel.numLumps(); l++) {
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t pivotOffset = factorSkel.lumpStart[l];
+      // devPivots + pivotOffset: device pointer, never dereferenced on host.
+      // Used by CudaSolveCtx::applyRowPermVec for offset computation only.
+      slvCtx.applyRowPermVec(devPivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
+    }
   }
 
   // Step 2: Solve L * z = y (forward substitution)
@@ -1253,28 +1292,62 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
     denseOpsFromLump = startLump;
   }
 
-  for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
-    int64_t lumpStart = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t chainColBegin = factorSkel.chainColPtr[l];
-    int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+  if (slvCtx.hasBatchedDenseSolve() && denseOpsFromLump < upToLump) {
+    // Batched path: collect all lump infos and dispatch in one call
+    int64_t numDenseLumps = upToLump - denseOpsFromLump;
+    std::vector<typename SolveCtx<T>::ForwardLLumpInfo> fwdInfos(numDenseLumps);
+    for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+      auto& info = fwdInfos[l - denseOpsFromLump];
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t chainColBegin = factorSkel.chainColPtr[l];
+      info.diagOffset = factorSkel.chainData[chainColBegin];
 
-    int64_t boardColBegin = factorSkel.boardColPtr[l];
-    int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
-    int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
-    int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
-    int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
-    int64_t numRowsBelowDiag = factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
-                               factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+      int64_t boardColBegin = factorSkel.boardColPtr[l];
+      int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+      int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+      int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+      info.belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+      int64_t numRowsBelowDiag =
+          factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+          factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
 
-    int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
-    int64_t numColItems = numColChains - belowDiagChainColOrd;
-    int64_t startRow =
-        (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
+      int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+      int64_t startRow = (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
 
-    slvCtx.fusedForwardLUnit(matData, diagBlockOffset, lumpSize, belowDiagOffset,
-                             numRowsBelowDiag, chainColPtr, numColItems, startRow, vecData,
-                             lumpStart, stride);
+      info.chainColPtr = chainColPtr;
+      info.lumpStart = lumpStart;
+      info.lumpSize = (int32_t)lumpSize;
+      info.numRowsBelowDiag = (int32_t)numRowsBelowDiag;
+      info.numColItems = (int32_t)(numColChains - belowDiagChainColOrd);
+      info.startRow = (int32_t)startRow;
+    }
+    slvCtx.batchedForwardLUnit(matData, vecData, stride, numDenseLumps, fwdInfos.data());
+  } else {
+    for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t chainColBegin = factorSkel.chainColPtr[l];
+      int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+
+      int64_t boardColBegin = factorSkel.boardColPtr[l];
+      int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+      int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+      int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+      int64_t belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+      int64_t numRowsBelowDiag =
+          factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+          factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+
+      int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+      int64_t numColItems = numColChains - belowDiagChainColOrd;
+      int64_t startRow =
+          (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
+
+      slvCtx.fusedForwardLUnit(matData, diagBlockOffset, lumpSize, belowDiagOffset,
+                               numRowsBelowDiag, chainColPtr, numColItems, startRow, vecData,
+                               lumpStart, stride);
+    }
   }
 }
 
@@ -1302,35 +1375,50 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   }
 
   // Dense backward substitution with U (from last lump down to denseOpsFromLump)
-  bool fusedBackward = slvCtx.hasFusedBackwardU() && factorSkel.isGeneral();
-  for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
-    int64_t lumpStart = factorSkel.lumpStart[l];
-    int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
-    int64_t chainColBegin = factorSkel.chainColPtr[l];
-    int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
+  if (slvCtx.hasBatchedDenseSolve() && factorSkel.isGeneral() && denseOpsFromLump < upToLump) {
+    // Batched path: collect all lump infos and dispatch in one call
+    int64_t numDenseLumps = upToLump - denseOpsFromLump;
+    std::vector<typename SolveCtx<T>::BackwardULumpInfo> bwdInfos(numDenseLumps);
+    for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+      auto& info = bwdInfos[l - denseOpsFromLump];
+      int64_t chainColBegin = factorSkel.chainColPtr[l];
+      info.diagOffset = factorSkel.chainData[chainColBegin];
+      info.lumpStart = factorSkel.lumpStart[l];
+      info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+      info.lumpIndex = (int32_t)l;
+    }
+    slvCtx.batchedBackwardU(matData, vecData, stride, numDenseLumps, bwdInfos.data());
+  } else {
+    bool fusedBackward = slvCtx.hasFusedBackwardU() && factorSkel.isGeneral();
+    for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
+      int64_t lumpStart = factorSkel.lumpStart[l];
+      int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+      int64_t chainColBegin = factorSkel.chainColPtr[l];
+      int64_t diagBlockOffset = factorSkel.chainData[chainColBegin];
 
-    if (fusedBackward) {
-      // Fused kernel handles upper chain iteration + solveU in one dispatch
-      slvCtx.fusedBackwardU(matData, diagBlockOffset, lumpSize, l, upperDataBase, vecData,
-                            lumpStart, stride);
-    } else {
-      // Non-fused path: CPU gemvDirect loop + separate solveU
-      if (factorSkel.isGeneral()) {
-        int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
-        int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
+      if (fusedBackward) {
+        // Fused kernel handles upper chain iteration + solveU in one dispatch
+        slvCtx.fusedBackwardU(matData, diagBlockOffset, lumpSize, l, upperDataBase, vecData,
+                              lumpStart, stride);
+      } else {
+        // Non-fused path: CPU gemvDirect loop + separate solveU
+        if (factorSkel.isGeneral()) {
+          int64_t upperRowStart = factorSkel.upperChainRowPtr[l];
+          int64_t upperRowEnd = factorSkel.upperChainRowPtr[l + 1];
 
-        for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
-          int64_t colSpan = factorSkel.upperChainColSpan[i];
-          int64_t colStart = factorSkel.spanStart[colSpan];
-          int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
-          int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
+          for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+            int64_t colSpan = factorSkel.upperChainColSpan[i];
+            int64_t colStart = factorSkel.spanStart[colSpan];
+            int64_t colSize = factorSkel.spanStart[colSpan + 1] - colStart;
+            int64_t upperDataOffset = upperDataBase + factorSkel.upperChainData[i];
 
-          slvCtx.gemvDirect(matData, upperDataOffset, lumpSize, colSize, vecData, colStart,
-                            lumpStart, stride, -1.0);
+            slvCtx.gemvDirect(matData, upperDataOffset, lumpSize, colSize, vecData, colStart,
+                              lumpStart, stride, -1.0);
+          }
         }
-      }
 
-      slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+        slvCtx.solveU(matData, diagBlockOffset, lumpSize, vecData, lumpStart, stride);
+      }
     }
   }
 

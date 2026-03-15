@@ -2022,6 +2022,171 @@ kernel void lu_fusedBackwardU_kernel_float(
 }
 
 // ============================================================================
+// Batched all-lumps dense solve kernels
+// ============================================================================
+// These batch all dense-lump operations per phase into single dispatches,
+// reducing dispatch overhead from O(numDenseLumps) to O(1) per phase.
+
+struct PermLumpInfo {
+    int64_t pivotByteOffset;  // byte offset into allPivots buffer
+    int64_t lumpStart;        // start row in vec
+    int32_t lumpSize;
+    int32_t pad;
+};
+
+struct ForwardLLumpInfo {
+    int64_t diagOffset;
+    int64_t belowDiagOffset;
+    int64_t chainColPtr;      // index into chainRowsTillEnd/chainRowSpan
+    int64_t lumpStart;
+    int32_t lumpSize;
+    int32_t numRowsBelowDiag;
+    int32_t numColItems;
+    int32_t startRow;
+};  // 48 bytes
+
+struct BackwardULumpInfo {
+    int64_t diagOffset;
+    int64_t lumpStart;
+    int32_t lumpSize;
+    int32_t lumpIndex;  // for upper chain lookup
+};  // 24 bytes
+
+// Batched row permutation: one thread per lump, all lumps in one dispatch.
+// Lumps touch disjoint vector portions so no inter-lump barriers needed.
+kernel void lu_batchedApplyRowPerm_kernel_float(
+    device int64_t* allPivots [[buffer(0)]],
+    device float* vec [[buffer(1)]],
+    constant int64_t& stride [[buffer(2)]],
+    constant int64_t& nRHS [[buffer(3)]],
+    constant PermLumpInfo* lumpInfos [[buffer(4)]],
+    constant int32_t& numLumps [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (int32_t(tid) >= numLumps) return;
+
+    PermLumpInfo info = lumpInfos[tid];
+    device int64_t* pivots = (device int64_t*)((device char*)allPivots + info.pivotByteOffset);
+    int64_t ls = info.lumpStart;
+    int32_t n = info.lumpSize;
+
+    for (int32_t i = 0; i < n; i++) {
+        int64_t swapRow = pivots[i];
+        if (swapRow != i) {
+            for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+                float tmp = vec[ls + i + rhs * stride];
+                vec[ls + i + rhs * stride] = vec[ls + swapRow + rhs * stride];
+                vec[ls + swapRow + rhs * stride] = tmp;
+            }
+        }
+    }
+}
+
+// Batched forward L solve: single threadgroup processes all dense lumps sequentially.
+// Each lump: solveLUnit → barrier → gemv → barrier → assembleVec → barrier.
+kernel void lu_allLumpsForwardL_kernel_float(
+    device float* data [[buffer(0)]],
+    device float* vecData [[buffer(1)]],
+    constant int64_t& stride [[buffer(2)]],
+    constant int64_t& nRHS [[buffer(3)]],
+    constant int64_t* chainRowsTillEnd [[buffer(4)]],
+    constant int64_t* chainRowSpan [[buffer(5)]],
+    constant int64_t* spanStarts [[buffer(6)]],
+    device float* tempVec [[buffer(7)]],
+    constant ForwardLLumpInfo* lumpInfos [[buffer(8)]],
+    constant int32_t& numLumps [[buffer(9)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
+{
+    for (int32_t li = 0; li < numLumps; li++) {
+        ForwardLLumpInfo info = lumpInfos[li];
+        int64_t n = info.lumpSize;
+
+        // Phase 1: solve L * x = b with unit diagonal
+        device float* L = data + info.diagOffset;
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            iterativeSolveLowerUnit(L, n, n, vecData + info.lumpStart + rhs * stride, tid, nt);
+        }
+
+        if (info.numRowsBelowDiag <= 0) {
+            threadgroup_barrier(mem_flags::mem_device);
+            continue;
+        }
+
+        // Phase 2: tempVec = -1.0 * M_below * x_diag
+        threadgroup_barrier(mem_flags::mem_device);
+        deviceGemv(
+            data, info.belowDiagOffset,
+            int64_t(info.numRowsBelowDiag), n,
+            vecData, info.lumpStart, stride,
+            -1.0f, nRHS, tempVec, tid, nt);
+
+        // Phase 3: scatter tempVec → vecData using chain structure
+        threadgroup_barrier(mem_flags::mem_device);
+        deviceAssembleVec(
+            chainRowsTillEnd + info.chainColPtr,
+            chainRowSpan + info.chainColPtr,
+            spanStarts,
+            tempVec, int64_t(info.numColItems),
+            vecData, stride, nRHS, int64_t(info.startRow), tid, nt);
+
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// Batched backward U solve: single threadgroup processes all dense lumps in reverse.
+// Each lump: iterate upper chain gemvDirect → barrier → solveU → barrier.
+kernel void lu_allLumpsBackwardU_kernel_float(
+    device float* data [[buffer(0)]],
+    device float* vecData [[buffer(1)]],
+    constant int64_t& stride [[buffer(2)]],
+    constant int64_t& nRHS [[buffer(3)]],
+    constant int64_t* upperChainRowPtr [[buffer(4)]],
+    constant int64_t* upperChainColSpan [[buffer(5)]],
+    constant int64_t* upperChainData [[buffer(6)]],
+    constant int64_t* spanStarts [[buffer(7)]],
+    constant int64_t& upperDataBase [[buffer(8)]],
+    constant BackwardULumpInfo* lumpInfos [[buffer(9)]],
+    constant int32_t& numLumps [[buffer(10)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
+{
+    // Process lumps in reverse order (backward substitution)
+    for (int32_t li = numLumps - 1; li >= 0; li--) {
+        BackwardULumpInfo info = lumpInfos[li];
+        int64_t n = info.lumpSize;
+        int32_t lump = info.lumpIndex;
+
+        // Phase 1: for each upper chain entry, accumulate y -= U * x
+        int64_t upperRowStart = upperChainRowPtr[lump];
+        int64_t upperRowEnd = upperChainRowPtr[lump + 1];
+
+        for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+            int64_t colSpan = upperChainColSpan[i];
+            int64_t colStart = spanStarts[colSpan];
+            int64_t colSize = spanStarts[colSpan + 1] - colStart;
+            int64_t upperDataOffset = upperDataBase + upperChainData[i];
+
+            deviceGemvDirect(
+                data, upperDataOffset,
+                n, colSize,
+                vecData, colStart, info.lumpStart,
+                stride, -1.0f, nRHS, tid, nt);
+
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+
+        // Phase 2: solve U * x = y for diagonal block
+        device float* U = data + info.diagOffset;
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            iterativeSolveUpper(U, n, n, vecData + info.lumpStart + rhs * stride, tid, nt);
+        }
+
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
+// ============================================================================
 // Iterative refinement step kernel (fused unpermute + accumulate + SpMV + permute)
 // ============================================================================
 

@@ -3469,6 +3469,171 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
   virtual bool hasFusedBackwardU() const override { return true; }
 
+  // ============ Batched all-lumps dense solve methods ============
+
+  virtual bool hasBatchedDenseSolve() const override { return true; }
+
+  virtual void batchedApplyRowPermVec(float* vecData, int64_t stride,
+      int64_t numLumps, const PermLumpInfo* lumpInfos) override {
+    @autoreleasepool {
+      if (numLumps <= 0) return;
+
+      // Resolve pivot buffer
+      id<MTLBuffer> pivotBuffer = nil;
+      if (externalDevPivots_) {
+        auto pivBufInfo = MetalBufferRegistry::instance().findBuffer(externalDevPivots_);
+        if (pivBufInfo.first) {
+          pivotBuffer = (__bridge id<MTLBuffer>)pivBufInfo.first;
+        }
+      }
+      if (!pivotBuffer) {
+        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+      }
+      if (!pivotBuffer) {
+        throw std::runtime_error("MetalSolveCtx::batchedApplyRowPermVec: no pivot buffer");
+      }
+
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx::batchedApplyRowPermVec: vec buffer not found");
+      }
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_batchedApplyRowPerm_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      int32_t numLumps32 = (int32_t)numLumps;
+      encodeKernel(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:pivotBuffer offset:0 atIndex:0];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
+            [encoder setBytes:lumpInfos length:numLumps * sizeof(PermLumpInfo) atIndex:4];
+            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:5];
+          },
+          (NSUInteger)numLumps);
+    }
+  }
+
+  virtual void batchedForwardLUnit(const float* data, float* vecData, int64_t stride,
+      int64_t numLumps, const ForwardLLumpInfo* lumpInfos) override {
+    @autoreleasepool {
+      if (numLumps <= 0) return;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx::batchedForwardLUnit: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      // Compute max numRowsBelowDiag for tempVec sizing
+      int32_t maxRows = 0;
+      for (int64_t i = 0; i < numLumps; i++) {
+        if (lumpInfos[i].numRowsBelowDiag > maxRows)
+          maxRows = lumpInfos[i].numRowsBelowDiag;
+      }
+      tempVecBuffer.resizeToAtLeast(maxRows * nRHS);
+
+      // Compute threadgroup size: max of all lump sizes and numRowsBelowDiag
+      int maxThr = 0;
+      for (int64_t i = 0; i < numLumps; i++) {
+        maxThr = std::max(maxThr, (int)lumpInfos[i].lumpSize);
+        maxThr = std::max(maxThr, (int)lumpInfos[i].numRowsBelowDiag);
+      }
+      maxThr = std::min(maxThr, 256);
+      int numThreads = 1;
+      while (numThreads < maxThr) numThreads <<= 1;
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_allLumpsForwardL_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      int32_t numLumps32 = (int32_t)numLumps;
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                        offset:0 atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:0 atIndex:5];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0 atIndex:6];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer()
+                        offset:0 atIndex:7];
+            [encoder setBytes:lumpInfos length:numLumps * sizeof(ForwardLLumpInfo) atIndex:8];
+            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:9];
+          },
+          1,  // single threadgroup
+          (NSUInteger)numThreads);
+    }
+  }
+
+  virtual void batchedBackwardU(const float* data, float* vecData, int64_t stride,
+      int64_t numLumps, const BackwardULumpInfo* lumpInfos) override {
+    @autoreleasepool {
+      if (numLumps <= 0) return;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx::batchedBackwardU: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      // Compute threadgroup size: max of all lump sizes
+      int maxThr = 0;
+      for (int64_t i = 0; i < numLumps; i++) {
+        maxThr = std::max(maxThr, (int)lumpInfos[i].lumpSize);
+      }
+      maxThr = std::min(maxThr, 256);
+      int numThreads = 1;
+      while (numThreads < maxThr) numThreads <<= 1;
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_allLumpsBackwardU_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      int64_t upperDataBase = sym.skel.dataSize();
+      int32_t numLumps32 = (int32_t)numLumps;
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                        offset:0 atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                        offset:0 atIndex:5];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                        offset:0 atIndex:6];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0 atIndex:7];
+            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:8];
+            [encoder setBytes:lumpInfos length:numLumps * sizeof(BackwardULumpInfo) atIndex:9];
+            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:10];
+          },
+          1,  // single threadgroup
+          (NSUInteger)numThreads);
+    }
+  }
+
   void flush() override { commitAndWait(); }
 
   // Reset per-solve mutable state without deallocating any buffers.

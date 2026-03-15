@@ -677,6 +677,62 @@ struct SolveCtx : SolveCtxBase {
   // When true, Solver.cpp skips the CPU gemvDirect loop and calls fusedBackwardU instead.
   virtual bool hasFusedBackwardU() const { return false; }
 
+  // ============ Batched all-lumps dense solve methods ============
+  // These batch all dense lump operations per phase into single GPU dispatches,
+  // reducing dispatch overhead from O(numDenseLumps) to O(1) per phase.
+
+  // Whether this backend supports batched dense solve (all lumps in one dispatch per phase).
+  virtual bool hasBatchedDenseSolve() const { return false; }
+
+  // Per-lump info for batched pivot permutation
+  struct PermLumpInfo {
+    int64_t pivotByteOffset;  // byte offset into pivot buffer
+    int64_t lumpStart;        // start row in vec
+    int32_t lumpSize;
+    int32_t pad;
+  };
+
+  // Per-lump info for batched forward L solve
+  struct ForwardLLumpInfo {
+    int64_t diagOffset;
+    int64_t belowDiagOffset;
+    int64_t chainColPtr;      // index into chainRowsTillEnd/chainRowSpan
+    int64_t lumpStart;
+    int32_t lumpSize;
+    int32_t numRowsBelowDiag;
+    int32_t numColItems;
+    int32_t startRow;
+  };  // 48 bytes
+
+  // Per-lump info for batched backward U solve
+  struct BackwardULumpInfo {
+    int64_t diagOffset;
+    int64_t lumpStart;
+    int32_t lumpSize;
+    int32_t lumpIndex;  // for upper chain lookup
+  };  // 24 bytes
+
+  // Batch all pivot permutations into one dispatch
+  virtual void batchedApplyRowPermVec(T* vecData, int64_t stride,
+      int64_t numLumps, const PermLumpInfo* lumpInfos) {
+    (void)vecData; (void)stride; (void)numLumps; (void)lumpInfos;
+    throw std::runtime_error("batchedApplyRowPermVec: not supported by this backend");
+  }
+
+  // Batch all forward L dense solves into one dispatch
+  virtual void batchedForwardLUnit(const T* data, T* vecData, int64_t stride,
+      int64_t numLumps, const ForwardLLumpInfo* lumpInfos) {
+    (void)data; (void)vecData; (void)stride; (void)numLumps; (void)lumpInfos;
+    throw std::runtime_error("batchedForwardLUnit: not supported by this backend");
+  }
+
+  // Batch all backward U dense solves into one dispatch
+  virtual void batchedBackwardU(const T* data, T* vecData, int64_t stride,
+      int64_t numLumps, const BackwardULumpInfo* lumpInfos) {
+    (void)data; (void)vecData; (void)stride; (void)numLumps; (void)lumpInfos;
+    throw std::runtime_error("batchedBackwardU: not supported by this backend");
+  }
+
   // ============ LDL^T solve methods ============
   // For symmetric indefinite factorization A = L * D * L^T
 
