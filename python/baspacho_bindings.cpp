@@ -1,4 +1,11 @@
-// BaSpaCho Python bindings using pybind11
+/*
+ * Copyright (c) Robert Taylor, 2026. All rights reserved.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+// Sprux Python bindings using pybind11
 // This provides a Python interface for sparse LU factorization
 // compatible with Spineax's solver interface.
 

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Robert Taylor, 2026. All rights reserved.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 // Profile Cholesky factor on GRID problem to understand dispatch overhead
 // Usage: build/baspacho/benchmarking/profile_chol_grid
 

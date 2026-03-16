@@ -1,7 +1,10 @@
-# BaSpaCho Python Bindings
+# Copyright (c) Robert Taylor, 2026. All rights reserved.
+# Licensed under the MIT license found in the LICENSE file.
+#
+# Sprux Python Bindings
 #
 # This builds a Python extension module using pybind11 that provides
-# access to BaSpaCho's sparse LU solver from Python.
+# access to Sprux's sparse LU solver from Python.
 
 cmake_minimum_required(VERSION 3.18)
 

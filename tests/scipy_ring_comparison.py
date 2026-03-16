@@ -5,7 +5,9 @@
 #     "numpy",
 # ]
 # ///
-"""Compare BaSpaCho ring oscillator solutions against scipy.sparse.linalg.spsolve.
+# Copyright (c) Robert Taylor, 2026. All rights reserved.
+# Licensed under the MIT license found in the LICENSE file.
+"""Compare Sprux ring oscillator solutions against scipy.sparse.linalg.spsolve.
 
 Loads the same MatrixMarket test data used by SequenceSolveTest::RingOscillator,
 solves with scipy, then runs a BaSpaCho test binary with BASPACHO_DUMP_SOLUTIONS=1

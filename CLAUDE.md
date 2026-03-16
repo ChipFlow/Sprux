@@ -4,7 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-BaSpaCho (Batched Sparse Cholesky) is a high-performance direct solver for symmetric positive-definite sparse matrices. It implements supernodal Cholesky decomposition with CUDA and Metal support for batched GPU solving.
+Sprux (formerly BaSpaCho — Batched Sparse Cholesky) is a high-performance sparse direct solver with GPU acceleration. It supports:
+
+- **Cholesky** (SPD), **LU with partial pivoting** (general), **LDL^T** (symmetric indefinite)
+- GPU backends: **CUDA** (NVIDIA), **Metal** (Apple Silicon), **OpenCL** (experimental)
+- Supernodal sparse elimination with level-set parallelism
+- Preprocessing: BTF max transversal, equilibration, static pivoting
+- External encoder API for GPU pipeline embedding (IREE, XLA custom-calls)
+- Mixed-precision iterative refinement (float factor + double accumulation)
+- Block-structured matrices with partial factor/solve for marginals
+
+Code namespace and CMake variables still use `BaSpaCho` — a rename is planned for a future PR.
 
 ## Build Commands
 
@@ -68,91 +78,122 @@ pixi run build_and_test # Full workflow
 
 ## Architecture
 
+See [docs/architecture.md](docs/architecture.md) for full details.
+
+### Solver Pipeline
+
+```
+Input (CSR + param sizes) → Symbolic Analysis → Numeric Factorization → Solve
+```
+
+1. **Symbolic analysis** (`createSolver()`): AMD ordering, supernode detection, level-set scheduling, factor storage allocation
+2. **Numeric factorization** (`factor()` / `factorLU()` / `factorLDLT()`): sparse elimination on GPU (level-set parallel kernels), then dense loop (BLAS)
+3. **Solve** (`solve()` / `solveLU()` / `solveLDLT()`): forward/backward substitution with optional pivot application
+
 ### Core Data Structures
 
 **SparseStructure** (`baspacho/baspacho/SparseStructure.h`): CSR-format sparse structure storing `ptrs` and `inds` vectors representing block indices (not individual elements).
 
 **CoalescedBlockMatrixSkel** (`baspacho/baspacho/CoalescedBlockMatrix.h`): Block matrix skeleton with coalesced columns. Key terminology:
 - **span**: basic parameter block grouping
-- **lump**: aggregation of consecutive spans
+- **lump**: aggregation of consecutive spans (supernode)
 - **chain**: span rows × lump cols
 - **board**: all spans in a lump of rows × lump cols
 
 **Solver** (`baspacho/baspacho/Solver.h`): Main interface created via `createSolver()`. Provides:
-- `factor()`: Cholesky factorization
-- `solve()`, `solveL()`, `solveLt()`: triangular solves
-- `factorUpTo()`, `solveLUpTo()`: partial factorization for marginals
-- Backends: `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`
+- `factor()` / `factorLU()` / `factorLDLT()`: factorization
+- `solve()` / `solveLU()` / `solveLDLT()`: triangular solves
+- `factorUpTo()` / `solveLUpTo()`: partial factorization for marginals
+- `beginFactorLU()` / `finishFactorLU()`: split factorization for GPU overlap
+- Backends: `BackendFast`, `BackendCuda`, `BackendMetal`, `BackendOpenCL`, `BackendAuto`
+
+### Backend Context Hierarchy
+
+Each backend implements three context types:
+- **SymbolicCtx**: created once during `createSolver()`, holds GPU structure buffers
+- **NumericCtx<T>**: created per factorization (or reused via persistent API), holds work buffers
+- **SolveCtx<T>**: created per solve (or reused via persistent API), holds solve work buffers
+
+### Preprocessing Pipeline (LU)
+
+For general matrices, preprocessing improves numerical stability:
+1. **BTF max transversal** (`Preprocessing.h`): structural row permutation
+2. **Row/column equilibration**: scales entries to O(1)
+3. **Static pivoting**: perturbs small/non-finite pivots (`Settings.staticPivotThreshold`)
+4. **Iterative refinement**: float factor + double residual for mixed-precision accuracy
+
+### External Encoder API (Metal)
+
+The Metal backend supports embedding into external GPU pipelines:
+- `setExternalEncoder()` / `clearExternalEncoder()`: encode Sprux ops into caller's encoder
+- **Encoder cycling**: transparent CPU↔GPU interleaving when CPU BLAS fallback needed
+- Enables fusion with IREE custom-calls, XLA operations, etc.
 
 ### Directory Structure
 
 ```
 baspacho/
   baspacho/       # Core library sources
-  testing/        # Test utilities (TestingMatGen, TestingUtils)
+  testing/        # Test utilities (TestingMatGen, TestingUtils, MatrixMarketReader)
   tests/          # Unit tests (gtest)
-  benchmarking/   # Performance benchmarks (bench, BAL_bench)
+  benchmarking/   # Performance benchmarks (bench, BAL_bench, lu_bench)
   examples/       # Example applications (Optimizer, PCG)
+python/           # Python bindings (pybind11)
+docs/             # Architecture, API guide, benchmarks documentation
+test_data/        # Test matrices (c6288_sequence, mul64, tb_dp)
 ```
 
 ### Key CMake Options
 
-- `BASPACHO_USE_CUBLAS`: Enable CUDA support (default: ON)
-- `BASPACHO_USE_METAL`: Enable Apple Metal support (default: OFF, macOS only, float only)
-- `BASPACHO_USE_OPENCL`: Enable OpenCL support with CLBlast (default: OFF, experimental)
-- `BASPACHO_USE_BLAS`: Enable BLAS support (default: ON)
-- `BASPACHO_CUDA_ARCHS`: CUDA architectures ("detect", "torch", or explicit list like "60;70;75")
-- `BASPACHO_USE_SUITESPARSE_AMD`: Use SuiteSparse AMD instead of Eigen's implementation
-- `BASPACHO_BUILD_TESTS`: Build tests (default: ON)
-- `BASPACHO_BUILD_EXAMPLES`: Build examples/benchmarks (default: ON)
-- `BLA_VENDOR`: BLAS implementation (ATLAS, OpenBLAS, Intel10_64lp_seq, Apple, etc.)
+| Option | Default | Description |
+|--------|---------|-------------|
+| `BASPACHO_USE_CUBLAS` | ON | Enable CUDA support |
+| `BASPACHO_USE_METAL` | OFF | Enable Apple Metal support (macOS only, float only) |
+| `BASPACHO_USE_OPENCL` | OFF | Enable OpenCL support with CLBlast (experimental) |
+| `BASPACHO_USE_BLAS` | ON | Enable BLAS support |
+| `BASPACHO_CUDA_ARCHS` | "detect" | CUDA architectures ("detect", "torch", or "60;70;75") |
+| `BASPACHO_USE_SUITESPARSE_AMD` | OFF | Use SuiteSparse AMD instead of Eigen's |
+| `BASPACHO_BUILD_TESTS` | ON | Build tests |
+| `BASPACHO_BUILD_EXAMPLES` | ON | Build examples/benchmarks |
+| `BLA_VENDOR` | (auto) | BLAS implementation (ATLAS, OpenBLAS, Intel10_64lp_seq, Apple) |
 
 ## GPU Backend Notes
 
-**Pure GPU Architecture:** Metal and CUDA backends are fully GPU-resident. All factor and solve operations (including Cholesky and LU) execute entirely on GPU with no CPU BLAS fallbacks. The only CPU round-trip is the final result readback. This enables fusion with upstream GPU pipelines (e.g., IREE custom-calls).
-
 ### Metal Backend (Apple Silicon)
 
-The Metal backend provides GPU acceleration on Apple Silicon Macs (M1, M2, M3, etc.).
+The Metal backend provides GPU acceleration on Apple Silicon Macs (M1, M2, M3, M4).
 
-**Important: Float-only precision.** Apple Silicon GPUs lack native double-precision FP64 support. The Metal backend only supports `float` operations. Attempting to use `double` will result in a clear runtime error.
+**Float-only precision.** Apple Silicon GPUs lack native double-precision FP64 support. The Metal backend only supports `float` operations. For double precision, use `BackendFast` (CPU) or `BackendCuda`.
+
+**Hybrid execution strategy:**
+- Sparse elimination: GPU compute kernels (thousands of parallel 1×1 lumps)
+- Dense factorization (n ≤ 256): CPU Accelerate BLAS on unified memory (zero-copy)
+- Dense factorization (n > 256): MPS (Metal Performance Shaders)
+- Dense solve: CPU Eigen on unified memory
+
+**Key pattern**: Apple Silicon unified memory allows CPU BLAS to operate directly on Metal shared buffers with no data transfer overhead.
 
 ```cpp
 // Metal backend usage (float only)
 Settings settings;
 settings.backend = BackendMetal;
-auto solver = createSolver<float>(paramSize, structure, settings);
+settings.matrixType = MTYPE_GENERAL;
+auto solver = createSolver(settings, paramSize, structure);
 
-// Use MetalMirror for GPU memory management
 MetalMirror<float> dataGpu(hostData);
-solver.factor(dataGpu.ptr());
-dataGpu.get(hostData);  // Copy back to CPU
+solver->factorLU(dataGpu.ptr(), pivots.data());
+dataGpu.get(hostData);
 ```
-
-For double precision, use `BackendFast` (CPU with BLAS) or `BackendCuda` (NVIDIA GPU).
 
 ### CUDA Backend (NVIDIA)
 
 The CUDA backend supports both float and double precision on NVIDIA GPUs with compute capability >= 6.0.
 
+**Hybrid execution**: sparse elimination on GPU, small dense lumps via CPU BLAS (D→H + BLAS + H→D), large dense lumps via cuSolver/cuBLAS.
+
 ### OpenCL Backend (Experimental)
 
-The OpenCL backend provides portable GPU acceleration using CLBlast for BLAS operations.
-
-**Status:** Experimental. Currently uses CPU fallbacks for most operations. The infrastructure is in place but full GPU kernel execution is not yet implemented.
-
-**Requirements:**
-- OpenCL 1.2+ runtime
-- CLBlast library
-
-```cpp
-// OpenCL backend usage
-Settings settings;
-settings.backend = BackendOpenCL;
-auto solver = createSolver<float>(paramSize, structure, settings);
-```
-
-For production use, prefer CUDA (NVIDIA) or Metal (Apple Silicon) backends.
+Portable GPU acceleration using CLBlast for BLAS operations. Infrastructure in place but most operations use CPU fallbacks. For production use, prefer CUDA or Metal.
 
 ## Dependencies
 
@@ -160,21 +201,27 @@ Fetched automatically by CMake:
 - Eigen 3.4.0
 - GoogleTest
 - dispenso (multithreading)
+- SuiteSparse (BTF for LU preprocessing, optionally AMD for reordering)
 - Sophus (for BA examples only)
 
 Optional external:
 - CUDA Toolkit (10.2+, architecture >=60 for double atomics)
 - CHOLMOD (SuiteSparse) - for benchmarking comparisons
-- AMD (SuiteSparse) - alternative reordering algorithm
+- OpenCL 1.2+ + CLBlast - for OpenCL backend
 
 ## Running Benchmarks
 
+See [docs/benchmarks.md](docs/benchmarks.md) for full details.
+
 ```bash
-# Compare with CHOLMOD baseline
+# Cholesky benchmarks with CHOLMOD baseline
 build/baspacho/benchmarking/bench -B 1_CHOLMOD
 
 # Bundle Adjustment problem
 build/baspacho/benchmarking/BAL_bench -i ~/BAL/problem-871-527480-pre.txt
+
+# LU benchmarks on circuit Jacobians
+build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
 
 # Collect timing statistics for computation model fitting
 build/baspacho/benchmarking/bench -B 1_CHOLMOD -Z
