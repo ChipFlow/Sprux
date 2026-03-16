@@ -996,10 +996,10 @@ void Solver::factorLU(T* data, int64_t* pivots, NumericCtx<T>& numCtx, bool verb
 
   numCtx.beginDenseOps(data, factorSkel.totalDataSize());
 
+  // NOTE: prepareAssemble is NOT needed for LU — eliminateBoardLU uses saveGemm directly.
+  // Cholesky uses assemble() which requires prepareAssemble(), but LU does not.
   for (int64_t l = std::max(startLump, denseOpsFromLump);
        l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
-    numCtx.prepareAssemble(l);
-
     int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
                                                 : factorSkel.boardRowPtr[l];
     for (int64_t rPtr = rPtrStart,
@@ -1075,10 +1075,9 @@ void Solver::factorLU(T* data, int64_t* devPivots, NumericCtx<T>& numCtx, PivotL
 
   numCtx.beginDenseOps(data, factorSkel.totalDataSize());
 
+  // NOTE: prepareAssemble is NOT needed for LU — eliminateBoardLU uses saveGemm directly.
   for (int64_t l = std::max(startLump, denseOpsFromLump);
        l < (int64_t)factorSkel.chainColPtr.size() - 1; l++) {
-    numCtx.prepareAssemble(l);
-
     int64_t rPtrStart = (denseOpsFromLump > 0) ? startElimRowPtr[l - denseOpsFromLump]
                                                 : factorSkel.boardRowPtr[l];
     for (int64_t rPtr = rPtrStart,
