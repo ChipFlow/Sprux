@@ -83,6 +83,33 @@ int sprux_load_from_csr_f32(sprux_solver_t h, const int64_t* ptrs, const int64_t
   }
 }
 
+int sprux_load_from_csr_f64_to_f32(sprux_solver_t h, const int64_t* ptrs, const int64_t* inds,
+                                   const int64_t* blockSizes, const double* values, float* data) {
+  try {
+    // Compute total scalar values from CSR block structure
+    int64_t numBlocks = static_cast<int64_t>(h->solver->paramToSpan().size());
+    int64_t totalValues = 0;
+    for (int64_t row = 0; row < numBlocks; row++) {
+      for (int64_t p = ptrs[row]; p < ptrs[row + 1]; p++) {
+        int64_t col = inds[p];
+        totalValues += blockSizes[row] * blockSizes[col];
+      }
+    }
+
+    // Convert f64 → f32
+    std::vector<float> fvalues(totalValues);
+    for (int64_t i = 0; i < totalValues; i++) {
+      fvalues[i] = static_cast<float>(values[i]);
+    }
+
+    std::memset(data, 0, h->solver->totalDataSize() * sizeof(float));
+    h->solver->loadFromCsr(ptrs, inds, blockSizes, fvalues.data(), data);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
 int sprux_factor_lu_f32(sprux_solver_t h, float* data, int64_t* pivots) {
   try {
     h->solver->factorLU(data, pivots);

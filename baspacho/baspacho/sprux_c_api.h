@@ -76,6 +76,16 @@ int sprux_load_from_csr_f32(sprux_solver_t h, const int64_t* ptrs, const int64_t
                             const int64_t* blockSizes, const float* values, float* data);
 
 /**
+ * Load double-precision CSR values, converting to float during load.
+ * Useful when the simulator works in f64 but the GPU factors in f32.
+ * Same parameters as sprux_load_from_csr_f32 but values are double*.
+ *
+ * @return 0 on success, -1 on error
+ */
+int sprux_load_from_csr_f64_to_f32(sprux_solver_t h, const int64_t* ptrs, const int64_t* inds,
+                                   const int64_t* blockSizes, const double* values, float* data);
+
+/**
  * Full LU factorization (blocking).
  *
  * @param h       Solver handle
