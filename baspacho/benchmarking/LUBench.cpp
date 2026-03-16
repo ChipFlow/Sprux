@@ -724,7 +724,8 @@ static vector<LUTimingResult> benchmarkLUMetalPipelined(
 //   Both are fine because Metal uses unified memory (MTLStorageModeShared)
 //   and these operations are O(n²)/O(n) — trivial for circuit sizes.
 static vector<LUTimingResult> benchmarkLUMetalFFI(
-    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, bool verbose) {
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine,
+    bool verbose) {
   if (matrices.empty()) return {};
 
   bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_ffi.gputrace");
@@ -863,7 +864,6 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   // ==== Phase 1: CPU preprocessing — prepare ALL matrices upfront ====
   // All CPU work happens here. GPU encoding follows in one shot.
 
-  const int maxRefine = 15;  // test convergence with GPU refinement
   size_t nMat = matrices.size();
 
   // Shared buffers (same sparsity structure for all matrices)
@@ -1622,6 +1622,7 @@ void help() {
        << "  -m MAX         Max matrices from sequence (default: all)\n"
        << "  -n REPS        Repetitions for single-matrix mode (default: 5)\n"
        << "  -S REGEX       Select solvers (default: all available)\n"
+       << "  -M ITERS       Max refinement iterations for MetalFFI (default: 7)\n"
        << "  -J             JSON output (same format as bench)\n"
        << "  -v             Verbose per-matrix output\n"
        << "  -h             Show this help\n"
@@ -1647,6 +1648,7 @@ int main(int argc, char* argv[]) {
   string rhsFile;
   string seqDir;
   int maxMatrices = -1;
+  int maxRefineIters = 7;
   int numReps = 5;
   int outerReps = 1;
   regex selectSolvers(".");
@@ -1667,6 +1669,8 @@ int main(int argc, char* argv[]) {
       maxMatrices = stoi(argv[++i]);
     } else if (!strcmp(argv[i], "-n") && i < argc - 1) {
       numReps = stoi(argv[++i]);
+    } else if (!strcmp(argv[i], "-M") && i < argc - 1) {
+      maxRefineIters = stoi(argv[++i]);
     } else if (!strcmp(argv[i], "-R") && i < argc - 1) {
       outerReps = stoi(argv[++i]);
     } else if (!strcmp(argv[i], "-S") && i < argc - 1) {
@@ -1872,7 +1876,7 @@ int main(int argc, char* argv[]) {
 
   if (regex_search(string("BaSpaCho_LU_MetalFFI"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_MetalFFI (FFI-style)..." << endl;
-    auto timings = benchmarkLUMetalFFI(matrices, verbose);
+    auto timings = benchmarkLUMetalFFI(matrices, maxRefineIters, verbose);
 
     if (isWarmup && timings.size() > 1) {
       timings.erase(timings.begin());
