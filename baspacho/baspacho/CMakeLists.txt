@@ -10,7 +10,8 @@ set(Sprux_sources
     Solver.cpp
     SparseStructure.cpp
     SupernodeMerger.cpp
-    Utils.cpp)
+    Utils.cpp
+    sprux_c_api.cpp)
 
 if(SPRUX_USE_CUBLAS)
     # separate recent and legacy cuda archs (which need atomicAdd's workaround)
