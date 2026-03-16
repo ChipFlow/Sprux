@@ -1797,8 +1797,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       }
       pivotsOnGpu_ = true;
     } else {
-      // Non-general matrix — should not happen in our FFI path
-      throw std::runtime_error("getrfCustom: no device pivot buffer");
+      // No pre-allocated pivot buffer (e.g. simple factorLU without
+      // preAllocateForLU). Use devPivots as a temporary pivot buffer —
+      // kernel writes pivots there, then we copy back to CPU after dispatch.
+      devPivots.resizeToAtLeast(minMN);
+      pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
+      pivotByteOffset = 0;
+      pivotsOnGpu_ = false;  // Will copy back to CPU below
     }
 
     // Absolute element offset into the data buffer
@@ -1815,6 +1820,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     NSUInteger numThreads = (NSUInteger)t;
 
     // Dispatch via encodeKernel (stays in same encoder)
+    bool needCopyBack = !pivotsOnGpu_;
     encodeKernel(
         pipeline,
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -1824,6 +1830,13 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           [encoder setBytes:&n length:sizeof(int64_t) atIndex:3];
           [encoder setBuffer:pivotBuffer offset:pivotByteOffset atIndex:4];
         }, numThreads);
+
+    // Non-pre-allocated path: commit GPU work and copy pivots back to CPU
+    if (needCopyBack) {
+      commitPending();
+      waitForGpu();
+      memcpy(pivots, devPivots.ptr(), minMN * sizeof(int64_t));
+    }
 
     return 0;
   }
