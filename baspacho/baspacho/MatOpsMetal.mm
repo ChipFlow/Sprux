@@ -21,6 +21,9 @@
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Utils.h"
+#ifdef BASPACHO_USE_BLAS
+#include "baspacho/baspacho/BlasDefs.h"
+#endif
 
 namespace BaSpaCho {
 
@@ -1694,7 +1697,60 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       int64_t minMN = std::min(m, n);
 
-      // Find the MTLBuffer for data
+      // Flush pending saveGemm work items first — ensures all Schur
+      // complement updates are dispatched before factorization of this lump.
+      flushPendingGemms();
+
+#ifdef BASPACHO_USE_BLAS
+      // CPU BLAS path for larger lumps: multi-threaded LAPACK sgetrf (~10-50μs)
+      // is much faster than single-threadgroup GPU kernel (~1ms for n≥64).
+      // The commit+wait sync cost (~100-200μs) is recovered by the speedup.
+      if (!sym.usingExternalEncoder && minMN >= 64) {
+        commitPending();
+        waitForGpu();
+        float* A = data + offA;
+
+        // BaSpaCho stores row-major; LAPACK expects col-major.
+        // Transpose before + after gives correct row-major L*U result.
+        if (m == n) {
+          for (int64_t i = 0; i < n; i++)
+            for (int64_t j = i + 1; j < n; j++)
+              std::swap(A[i * n + j], A[j * n + i]);
+        }
+
+        std::vector<BLAS_INT> ipiv(minMN);
+        int info = LAPACKE_sgetrf(0 /*col-major*/, (BLAS_INT)m, (BLAS_INT)n, A,
+                                  (BLAS_INT)m, ipiv.data());
+
+        if (m == n) {
+          for (int64_t i = 0; i < n; i++)
+            for (int64_t j = i + 1; j < n; j++)
+              std::swap(A[i * n + j], A[j * n + i]);
+        }
+
+        // Write pivots to devAllPivots (shared memory, GPU-accessible) so that
+        // downstream GPU kernels (applyRowPerm) can read them.
+        if (devAllPivots.buffer()) {
+          if (!allPivotsCpuBase_) allPivotsCpuBase_ = pivots;
+          int64_t pivotOffset = pivots - allPivotsCpuBase_;
+          allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
+          int64_t* gpuPivots = devAllPivots.ptr() + pivotOffset;
+          for (int64_t i = 0; i < minMN; i++) {
+            gpuPivots[i] = ipiv[i] - 1;  // LAPACK is 1-based
+          }
+          pivotsOnGpu_ = true;
+        }
+
+        // Also write to host pivots array
+        for (int64_t i = 0; i < minMN; i++) {
+          pivots[i] = ipiv[i] - 1;
+        }
+
+        return info;
+      }
+#endif
+
+      // GPU path: single-threadgroup Metal kernel (efficient for small lumps)
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
         throw std::runtime_error("MetalNumericCtx<float>::getrf: data buffer not found");
@@ -1702,13 +1758,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t dataBaseOffset = bufferInfo.second;
 
-      // Flush pending saveGemm work items first — ensures all Schur
-      // complement updates are dispatched before factorization of this lump.
-      flushPendingGemms();
-
-      // Custom Metal kernel for LU factorization — dispatched via encodeKernel()
-      // so it stays within the same compute encoder. No encoder transitions.
-      // Outputs int64_t pivots directly (no uint32 conversion needed).
       return getrfCustom(m, n, minMN, dataBuffer, dataBaseOffset, offA, pivots);
     }
   }
