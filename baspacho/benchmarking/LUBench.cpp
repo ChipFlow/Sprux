@@ -40,6 +40,10 @@
 #include "baspacho/baspacho/MetalDefs.h"
 #endif
 
+#ifdef BASPACHO_USE_BLAS
+#include "baspacho/baspacho/BlasDefs.h"
+#endif
+
 using namespace BaSpaCho;
 using namespace BaSpaCho::testing_utils;
 using namespace std;
@@ -248,15 +252,11 @@ static vector<LUTimingResult> benchmarkLUCpu(
 // ============================================================================
 
 #ifdef BASPACHO_USE_METAL
-// Metal LU benchmark: GPU sparse elimination + CPU BLAS dense + CPU SpMV refinement.
+// Metal LU benchmark (Metal_Sparse): GPU sparse elimination + CPU BLAS dense + CPU SpMV refinement.
 // Mirrors the spineax BaspachoGpuInstantiate/Execute FFI code path.
 // Uses persistent contexts, device-resident pivots, recording pass, and external encoder.
-//
-// useSparseElim=true (Metal_Sparse): GPU sparse elim for scalar lumps, CPU dense for rest.
-// useSparseElim=false (Metal_Dense): all-dense LU on GPU (no sparse elimination).
 static vector<LUTimingResult> benchmarkLUMetalFFI(
-    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine,
-    bool verbose, bool useSparseElim = true) {
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine, bool verbose) {
   if (matrices.empty()) return {};
 
   bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_ffi.gputrace");
@@ -313,7 +313,7 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   settings.matrixType = MTYPE_GENERAL;
   settings.numThreads = 1;
   settings.staticPivotThreshold = pivotThreshold;
-  settings.findSparseEliminationRanges = useSparseElim;
+  settings.findSparseEliminationRanges = true;
 
   vector<int64_t> paramSizes(n, 1);
   vector<int64_t> blockSizes(n, 1);
@@ -533,6 +533,132 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
   return results;
 }
 #endif  // BASPACHO_USE_METAL
+
+// ============================================================================
+// Dense BLAS LU baseline (Accelerate sgetrf/sgetrs, no sparsity exploitation)
+// ============================================================================
+
+#ifdef BASPACHO_USE_BLAS
+static vector<LUTimingResult> benchmarkLUDenseBLAS(
+    const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine, bool verbose) {
+  if (matrices.empty()) return {};
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+
+  // Size guard: dense n×n float = n² × 4 bytes. n=50000 → ~10GB.
+  if (n > 50000) {
+    if (verbose)
+      cout << "  [DenseBLAS] Skipping: n=" << n << " too large for dense (" << (n * n * 4.0 / 1e9)
+           << " GB)" << endl;
+    return {};
+  }
+
+  // Preprocessing: BTF max transversal (once per pattern)
+  auto preproc = computeMaxTransversal(n, A0.rowPtr.data(), A0.colInd.data());
+
+  vector<LUTimingResult> results;
+  vector<int64_t> pRowPtr, pColInd;
+  vector<double> pValues;
+
+  // Dense matrix (column-major for LAPACK) + pivot array
+  vector<float> dense(n * n, 0.0f);
+  vector<BLAS_INT> ipiv(n);
+
+  for (size_t mi = 0; mi < matrices.size(); mi++) {
+    const CsrMatrix& A = matrices[mi].first;
+    const Eigen::VectorXd& b = matrices[mi].second;
+    LUTimingResult res;
+
+    // Equilibration (same as Metal_Sparse)
+    applyRowPermToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                              preproc.rowPerm.data(), pRowPtr, pColInd, pValues);
+    vector<double> rowScale, colScale;
+    computeEquilibration(n, pRowPtr.data(), pColInd.data(), pValues.data(), rowScale, colScale);
+
+    applyRowPermAndScaleToCsr<double>(n, A.rowPtr.data(), A.colInd.data(), A.values.data(),
+                                     preproc.rowPerm.data(), rowScale.data(), colScale.data(),
+                                     pRowPtr, pColInd, pValues);
+
+    // Scatter equilibrated sparse CSR → dense column-major: dense[col * n + row] = value
+    fill(dense.begin(), dense.end(), 0.0f);
+    for (int64_t i = 0; i < n; i++) {
+      for (int64_t k = pRowPtr[i]; k < pRowPtr[i + 1]; k++) {
+        dense[pColInd[k] * n + i] = float(pValues[k]);
+      }
+    }
+
+    // Factor: sgetrf
+    auto tFactor = Clock::now();
+    BLAS_INT N = static_cast<BLAS_INT>(n);
+    BLAS_INT info = LAPACKE_sgetrf(LAPACK_COL_MAJOR, N, N, dense.data(), N, ipiv.data());
+    res.factorTime = tdelta(Clock::now() - tFactor).count();
+
+    if (info != 0 && verbose) {
+      cout << "  [DenseBLAS] Matrix #" << mi << ": sgetrf info=" << info << endl;
+    }
+
+    // Solve + iterative refinement
+    auto tSolve = Clock::now();
+
+    // Initial solve: permute RHS, sgetrs, unscale
+    vector<float> rhsF(n);
+    for (int64_t j = 0; j < n; j++)
+      rhsF[j] = float(rowScale[j] * b(preproc.rowPerm[j]));
+
+    char trans = 'N';
+    BLAS_INT nrhs = 1;
+    LAPACKE_sgetrs(trans, N, nrhs, dense.data(), N, ipiv.data(), rhsF.data(), N);
+
+    // Accumulate solution in double precision
+    Eigen::VectorXd x(n);
+    for (int64_t j = 0; j < n; j++)
+      x(j) = colScale[j] * double(rhsF[j]);
+
+    double residual = computeResidualDouble(A, x, b);
+    res.refineSteps = 0;
+
+    // Iterative refinement: CPU SpMV (double) → sgetrs (float) → accumulate (double)
+    for (int iter = 0; iter < maxRefine && residual > 1e-10; iter++) {
+      // SpMV residual in double precision
+      Eigen::VectorXd r = Eigen::VectorXd::Zero(n);
+      for (int64_t i = 0; i < n; i++) {
+        for (int64_t k = A.rowPtr[i]; k < A.rowPtr[i + 1]; k++)
+          r(i) += A.values[k] * x(A.colInd[k]);
+      }
+      r = b - r;
+
+      // Permute + scale residual → float RHS
+      for (int64_t j = 0; j < n; j++)
+        rhsF[j] = float(rowScale[j] * r(preproc.rowPerm[j]));
+
+      // Solve correction
+      LAPACKE_sgetrs(trans, N, nrhs, dense.data(), N, ipiv.data(), rhsF.data(), N);
+
+      // Accumulate correction in double
+      for (int64_t j = 0; j < n; j++)
+        x(j) += colScale[j] * double(rhsF[j]);
+
+      residual = computeResidualDouble(A, x, b);
+      res.refineSteps++;
+    }
+
+    res.solveTime = tdelta(Clock::now() - tSolve).count();
+    res.residual = residual;
+    res.perturbCount = 0;
+
+    if (verbose) {
+      cout << "  [DenseBLAS] Matrix #" << mi << ": factor=" << fixed << setprecision(4)
+           << res.factorTime << "s, solve=" << res.solveTime << "s, residual=" << scientific
+           << setprecision(2) << res.residual << ", refine=" << res.refineSteps << endl;
+    }
+
+    results.push_back(res);
+  }
+
+  return results;
+}
+#endif  // BASPACHO_USE_BLAS
 
 // ============================================================================
 // CUDA (double) benchmark
@@ -936,7 +1062,7 @@ void help() {
        << "  BaSpaCho_LU_CPU\n"
 #ifdef BASPACHO_USE_METAL
        << "  Metal_Sparse     (GPU sparse elim + CPU BLAS dense + CPU SpMV refinement)\n"
-       << "  Metal_Dense      (all-dense GPU LU, no sparse elimination)\n"
+       << "  Metal_Dense      (Accelerate dense LU baseline, no sparsity exploitation)\n"
 #endif
 #ifdef BASPACHO_USE_CUBLAS
        << "  BaSpaCho_LU_CUDA\n"
@@ -1144,7 +1270,7 @@ int main(int argc, char* argv[]) {
 #ifdef BASPACHO_USE_METAL
   if (regex_search(string("Metal_Sparse"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning Metal_Sparse..." << endl;
-    auto timings = benchmarkLUMetalFFI(matrices, maxRefineIters, verbose, true);
+    auto timings = benchmarkLUMetalFFI(matrices, maxRefineIters, verbose);
     if (isWarmup && timings.size() > 1) timings.erase(timings.begin());
     resultToRecords(problemName, "Metal_Sparse", timings, allRecords);
     if (!jsonOutput) printResults("Metal_Sparse", timings);
@@ -1152,7 +1278,12 @@ int main(int argc, char* argv[]) {
 
   if (regex_search(string("Metal_Dense"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning Metal_Dense..." << endl;
-    auto timings = benchmarkLUMetalFFI(matrices, maxRefineIters, verbose, false);
+#ifdef BASPACHO_USE_BLAS
+    auto timings = benchmarkLUDenseBLAS(matrices, maxRefineIters, verbose);
+#else
+    vector<LUTimingResult> timings;
+    if (!jsonOutput) cout << "  [Metal_Dense] Skipping: BLAS not available" << endl;
+#endif
     if (isWarmup && timings.size() > 1) timings.erase(timings.begin());
     resultToRecords(problemName, "Metal_Dense", timings, allRecords);
     if (!jsonOutput) printResults("Metal_Dense", timings);

@@ -59,6 +59,14 @@ void dgetrf_(const BLAS_INT* m, const BLAS_INT* n, double* A, const BLAS_INT* ld
              BLAS_INT* info);
 void sgetrf_(const BLAS_INT* m, const BLAS_INT* n, float* A, const BLAS_INT* lda, BLAS_INT* ipiv,
              BLAS_INT* info);
+
+// LU solve (getrs) — solve A*X = B given LU factorization from getrf
+void dgetrs_(const char* trans, const BLAS_INT* n, const BLAS_INT* nrhs, const double* A,
+             const BLAS_INT* lda, const BLAS_INT* ipiv, double* B, const BLAS_INT* ldb,
+             BLAS_INT* info);
+void sgetrs_(const char* trans, const BLAS_INT* n, const BLAS_INT* nrhs, const float* A,
+             const BLAS_INT* lda, const BLAS_INT* ipiv, float* B, const BLAS_INT* ldb,
+             BLAS_INT* info);
 }
 
 #define CBLAS_LAYOUT int
@@ -166,6 +174,21 @@ inline BLAS_INT LAPACKE_sgetrf(int /* matrix_layout */, BLAS_INT m, BLAS_INT n, 
                                BLAS_INT lda, BLAS_INT* ipiv) {
   BLAS_INT info;
   sgetrf_(&m, &n, a, &lda, ipiv, &info);
+  return info;
+}
+
+// LU solve wrappers
+inline BLAS_INT LAPACKE_dgetrs(char trans, BLAS_INT n, BLAS_INT nrhs, const double* a,
+                               BLAS_INT lda, const BLAS_INT* ipiv, double* b, BLAS_INT ldb) {
+  BLAS_INT info;
+  dgetrs_(&trans, &n, &nrhs, a, &lda, ipiv, b, &ldb, &info);
+  return info;
+}
+
+inline BLAS_INT LAPACKE_sgetrs(char trans, BLAS_INT n, BLAS_INT nrhs, const float* a,
+                               BLAS_INT lda, const BLAS_INT* ipiv, float* b, BLAS_INT ldb) {
+  BLAS_INT info;
+  sgetrs_(&trans, &n, &nrhs, a, &lda, ipiv, b, &ldb, &info);
   return info;
 }
 
