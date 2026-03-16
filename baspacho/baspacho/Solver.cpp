@@ -1201,11 +1201,78 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
     }
   }
 
-  // Step 2: Solve L * z = y (forward substitution)
-  internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  // Steps 2+3: Fused forward L + backward U when supported (saves 1 dispatch + 2 barriers)
+  if (slvCtx.hasBatchedDenseSolve()) {
+    int64_t upToLump = factorSkel.numLumps();
 
-  // Step 3: Solve U * x = z (backward substitution)
-  internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+    // Sparse elim forward L: skip barrier since perm and sparse elim touch disjoint vec ranges
+    int64_t denseOpsFromLump = 0;
+    if (SparseElimSolve && !luElimCtxs.empty()) {
+      slvCtx.skipNextBarrier();
+      for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+        slvCtx.sparseElimSolveLUnit(*elimCtxs[l], matData, sparseElimRanges[l],
+                                    sparseElimRanges[l + 1], vecData, stride);
+      }
+      denseOpsFromLump = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
+    }
+
+    // Fused dense forward L + backward U in one dispatch
+    if (denseOpsFromLump < upToLump) {
+      int64_t numDenseLumps = upToLump - denseOpsFromLump;
+
+      std::vector<typename SolveCtx<T>::ForwardLLumpInfo> fwdInfos(numDenseLumps);
+      for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+        auto& info = fwdInfos[l - denseOpsFromLump];
+        int64_t lumpStart = factorSkel.lumpStart[l];
+        int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+        int64_t chainColBegin = factorSkel.chainColPtr[l];
+        info.diagOffset = factorSkel.chainData[chainColBegin];
+
+        int64_t boardColBegin = factorSkel.boardColPtr[l];
+        int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+        int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+        int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+        info.belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+        int64_t numRowsBelowDiag =
+            factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+            factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+
+        int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+        int64_t startRow = (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
+
+        info.chainColPtr = chainColPtr;
+        info.lumpStart = lumpStart;
+        info.lumpSize = (int32_t)lumpSize;
+        info.numRowsBelowDiag = (int32_t)numRowsBelowDiag;
+        info.numColItems = (int32_t)(numColChains - belowDiagChainColOrd);
+        info.startRow = (int32_t)startRow;
+      }
+
+      std::vector<typename SolveCtx<T>::BackwardULumpInfo> bwdInfos(numDenseLumps);
+      for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+        auto& info = bwdInfos[l - denseOpsFromLump];
+        int64_t chainColBegin = factorSkel.chainColPtr[l];
+        info.diagOffset = factorSkel.chainData[chainColBegin];
+        info.lumpStart = factorSkel.lumpStart[l];
+        info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+        info.lumpIndex = (int32_t)l;
+      }
+
+      slvCtx.fusedDenseSolveLU(matData, vecData, stride, numDenseLumps,
+                               fwdInfos.data(), bwdInfos.data());
+    }
+
+    // Sparse elim backward U (reverse order)
+    if (SparseElimSolve && !luElimCtxs.empty()) {
+      for (int64_t l = (int64_t)sparseElimRanges.size() - 2; l >= 0; l--) {
+        slvCtx.sparseElimSolveU(*elimCtxs[l], matData, sparseElimRanges[l],
+                                sparseElimRanges[l + 1], vecData, stride);
+      }
+    }
+  } else {
+    internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+    internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  }
   slvCtx.flush();
   // Context is NOT destroyed — caller owns it.
 }
@@ -1249,11 +1316,81 @@ void Solver::solveLU(const T* matData, const int64_t* devPivots, T* vecData, int
     }
   }
 
-  // Step 2: Solve L * z = y (forward substitution)
-  internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  // Steps 2+3: Fused forward L + backward U when supported (saves 1 dispatch + 2 barriers)
+  if (slvCtx.hasBatchedDenseSolve()) {
+    int64_t upToLump = factorSkel.numLumps();
 
-  // Step 3: Solve U * x = z (backward substitution)
-  internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+    // Sparse elim forward L: skip barrier since perm and sparse elim touch disjoint vec ranges
+    int64_t denseOpsFromLump = 0;
+    if (SparseElimSolve && !luElimCtxs.empty()) {
+      slvCtx.skipNextBarrier();
+      for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
+        slvCtx.sparseElimSolveLUnit(*elimCtxs[l], matData, sparseElimRanges[l],
+                                    sparseElimRanges[l + 1], vecData, stride);
+      }
+      denseOpsFromLump = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
+    }
+
+    // Fused dense forward L + backward U in one dispatch
+    if (denseOpsFromLump < upToLump) {
+      int64_t numDenseLumps = upToLump - denseOpsFromLump;
+
+      // Build forward L lump infos
+      std::vector<typename SolveCtx<T>::ForwardLLumpInfo> fwdInfos(numDenseLumps);
+      for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+        auto& info = fwdInfos[l - denseOpsFromLump];
+        int64_t lumpStart = factorSkel.lumpStart[l];
+        int64_t lumpSize = factorSkel.lumpStart[l + 1] - lumpStart;
+        int64_t chainColBegin = factorSkel.chainColPtr[l];
+        info.diagOffset = factorSkel.chainData[chainColBegin];
+
+        int64_t boardColBegin = factorSkel.boardColPtr[l];
+        int64_t boardColEnd = factorSkel.boardColPtr[l + 1];
+        int64_t belowDiagChainColOrd = factorSkel.boardChainColOrd[boardColBegin + 1];
+        int64_t numColChains = factorSkel.boardChainColOrd[boardColEnd - 1];
+        info.belowDiagOffset = factorSkel.chainData[chainColBegin + belowDiagChainColOrd];
+        int64_t numRowsBelowDiag =
+            factorSkel.chainRowsTillEnd[chainColBegin + numColChains - 1] -
+            factorSkel.chainRowsTillEnd[chainColBegin + belowDiagChainColOrd - 1];
+
+        int64_t chainColPtr = chainColBegin + belowDiagChainColOrd;
+        int64_t startRow = (chainColPtr > 0) ? factorSkel.chainRowsTillEnd[chainColPtr - 1] : 0;
+
+        info.chainColPtr = chainColPtr;
+        info.lumpStart = lumpStart;
+        info.lumpSize = (int32_t)lumpSize;
+        info.numRowsBelowDiag = (int32_t)numRowsBelowDiag;
+        info.numColItems = (int32_t)(numColChains - belowDiagChainColOrd);
+        info.startRow = (int32_t)startRow;
+      }
+
+      // Build backward U lump infos
+      std::vector<typename SolveCtx<T>::BackwardULumpInfo> bwdInfos(numDenseLumps);
+      for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
+        auto& info = bwdInfos[l - denseOpsFromLump];
+        int64_t chainColBegin = factorSkel.chainColPtr[l];
+        info.diagOffset = factorSkel.chainData[chainColBegin];
+        info.lumpStart = factorSkel.lumpStart[l];
+        info.lumpSize = (int32_t)(factorSkel.lumpStart[l + 1] - factorSkel.lumpStart[l]);
+        info.lumpIndex = (int32_t)l;
+      }
+
+      slvCtx.fusedDenseSolveLU(matData, vecData, stride, numDenseLumps,
+                               fwdInfos.data(), bwdInfos.data());
+    }
+
+    // Sparse elim backward U (reverse order)
+    if (SparseElimSolve && !luElimCtxs.empty()) {
+      for (int64_t l = (int64_t)sparseElimRanges.size() - 2; l >= 0; l--) {
+        slvCtx.sparseElimSolveU(*elimCtxs[l], matData, sparseElimRanges[l],
+                                sparseElimRanges[l + 1], vecData, stride);
+      }
+    }
+  } else {
+    // Standard path: separate forward L and backward U
+    internalSolveLRangeUnit(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+    internalSolveURange(slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
+  }
   slvCtx.flush();
 }
 

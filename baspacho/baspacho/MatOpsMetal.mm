@@ -2423,10 +2423,13 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         encoder = pendingEncoder_;
       }
 
-      // Insert memory barrier so previous dispatches' buffer writes are visible
-      if (pendingDispatchCount_ > 0) {
+      // Insert memory barrier so previous dispatches' buffer writes are visible.
+      // skipNextBarrier_ allows skipping when consecutive dispatches operate on
+      // disjoint memory ranges (e.g., perm on dense lumps, sparse elim on sparse lumps).
+      if (pendingDispatchCount_ > 0 && !skipNextBarrier_) {
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
       }
+      skipNextBarrier_ = false;
 
       [encoder setComputePipelineState:pipeline];
       encodeBlock(encoder);
@@ -2464,9 +2467,10 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         encoder = pendingEncoder_;
       }
 
-      if (pendingDispatchCount_ > 0) {
+      if (pendingDispatchCount_ > 0 && !skipNextBarrier_) {
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
       }
+      skipNextBarrier_ = false;
 
       [encoder setComputePipelineState:pipeline];
       encodeBlock(encoder);
@@ -3634,6 +3638,82 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     }
   }
 
+  void skipNextBarrier() override { skipNextBarrier_ = true; }
+
+  virtual void fusedDenseSolveLU(const float* data, float* vecData, int64_t stride,
+      int64_t numLumps, const ForwardLLumpInfo* fwdInfos,
+      const BackwardULumpInfo* bwdInfos) override {
+    @autoreleasepool {
+      if (numLumps <= 0) return;
+
+      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
+      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
+      if (!dataBufferInfo.first || !vecBufferInfo.first) {
+        throw std::runtime_error("MetalSolveCtx::fusedDenseSolveLU: buffer not found");
+      }
+      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
+      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
+      size_t dataBaseOffset = dataBufferInfo.second;
+      size_t vecBaseOffset = vecBufferInfo.second;
+
+      // Compute max numRowsBelowDiag for tempVec sizing
+      int32_t maxRows = 0;
+      for (int64_t i = 0; i < numLumps; i++) {
+        if (fwdInfos[i].numRowsBelowDiag > maxRows)
+          maxRows = fwdInfos[i].numRowsBelowDiag;
+      }
+      tempVecBuffer.resizeToAtLeast(maxRows * nRHS);
+
+      // Threadgroup size: max of all lump sizes and numRowsBelowDiag (from forward L)
+      int maxThr = 0;
+      for (int64_t i = 0; i < numLumps; i++) {
+        maxThr = std::max(maxThr, (int)fwdInfos[i].lumpSize);
+        maxThr = std::max(maxThr, (int)fwdInfos[i].numRowsBelowDiag);
+      }
+      maxThr = std::min(maxThr, 256);
+      int numThreads = 1;
+      while (numThreads < maxThr) numThreads <<= 1;
+
+      id<MTLComputePipelineState> pipeline = getPipeline(
+              "lu_fusedDenseSolve_kernel_float");
+
+      int64_t nRHS64 = nRHS;
+      int64_t upperDataBase = sym.skel.dataSize();
+      int32_t numLumps32 = (int32_t)numLumps;
+      encodeKernelWithGroups(
+          pipeline,
+          ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
+            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
+            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
+            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
+            // Forward L buffers
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
+                        offset:0 atIndex:4];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
+                        offset:0 atIndex:5];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
+                        offset:0 atIndex:6];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer()
+                        offset:0 atIndex:7];
+            [encoder setBytes:fwdInfos length:numLumps * sizeof(ForwardLLumpInfo) atIndex:8];
+            // Backward U buffers
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
+                        offset:0 atIndex:9];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
+                        offset:0 atIndex:10];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
+                        offset:0 atIndex:11];
+            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:12];
+            [encoder setBytes:bwdInfos length:numLumps * sizeof(BackwardULumpInfo) atIndex:13];
+            // Shared
+            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:14];
+          },
+          1,  // single threadgroup
+          (NSUInteger)numThreads);
+    }
+  }
+
   void flush() override { commitAndWait(); }
 
   // Reset per-solve mutable state without deallocating any buffers.
@@ -3669,6 +3749,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   id<MTLCommandBuffer> pendingCmdBuf_ = nil;
   id<MTLComputeCommandEncoder> pendingEncoder_ = nil;
   int pendingDispatchCount_ = 0;
+  bool skipNextBarrier_ = false;
   id<MTLCommandBuffer> lastCommittedCmdBuf_ = nil;
 };
 

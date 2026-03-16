@@ -733,6 +733,21 @@ struct SolveCtx : SolveCtxBase {
     throw std::runtime_error("batchedBackwardU: not supported by this backend");
   }
 
+  // Fused forward L + backward U dense solve in one dispatch.
+  // Eliminates one GPU dispatch + one memory barrier vs separate calls.
+  // Default: calls batchedForwardLUnit + batchedBackwardU separately.
+  virtual void fusedDenseSolveLU(const T* data, T* vecData, int64_t stride,
+      int64_t numLumps, const ForwardLLumpInfo* fwdInfos,
+      const BackwardULumpInfo* bwdInfos) {
+    batchedForwardLUnit(data, vecData, stride, numLumps, fwdInfos);
+    batchedBackwardU(data, vecData, stride, numLumps, bwdInfos);
+  }
+
+  // Skip the memory barrier before the next GPU dispatch.
+  // Used when consecutive dispatches operate on disjoint memory ranges
+  // (e.g., perm on dense lumps followed by sparse elim on sparse lumps).
+  virtual void skipNextBarrier() {}
+
   // ============ LDL^T solve methods ============
   // For symmetric indefinite factorization A = L * D * L^T
 

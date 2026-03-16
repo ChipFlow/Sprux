@@ -2186,6 +2186,105 @@ kernel void lu_allLumpsBackwardU_kernel_float(
     }
 }
 
+// Fused forward L + backward U dense solve: single threadgroup processes all dense lumps.
+// Forward L phase processes lumps 0..numLumps-1, then backward U phase in reverse.
+// Eliminates one dispatch + one GPU memory barrier vs separate kernels.
+kernel void lu_fusedDenseSolve_kernel_float(
+    device float* data [[buffer(0)]],
+    device float* vecData [[buffer(1)]],
+    constant int64_t& stride [[buffer(2)]],
+    constant int64_t& nRHS [[buffer(3)]],
+    // Forward L buffers
+    constant int64_t* chainRowsTillEnd [[buffer(4)]],
+    constant int64_t* chainRowSpan [[buffer(5)]],
+    constant int64_t* spanStarts [[buffer(6)]],
+    device float* tempVec [[buffer(7)]],
+    constant ForwardLLumpInfo* fwdInfos [[buffer(8)]],
+    // Backward U buffers
+    constant int64_t* upperChainRowPtr [[buffer(9)]],
+    constant int64_t* upperChainColSpan [[buffer(10)]],
+    constant int64_t* upperChainData [[buffer(11)]],
+    constant int64_t& upperDataBase [[buffer(12)]],
+    constant BackwardULumpInfo* bwdInfos [[buffer(13)]],
+    // Shared
+    constant int32_t& numLumps [[buffer(14)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]])
+{
+    // === Forward L phase ===
+    for (int32_t li = 0; li < numLumps; li++) {
+        ForwardLLumpInfo info = fwdInfos[li];
+        int64_t n = info.lumpSize;
+
+        // Phase 1: solve L * x = b with unit diagonal
+        device float* L = data + info.diagOffset;
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            iterativeSolveLowerUnit(L, n, n, vecData + info.lumpStart + rhs * stride, tid, nt);
+        }
+
+        if (info.numRowsBelowDiag <= 0) {
+            threadgroup_barrier(mem_flags::mem_device);
+            continue;
+        }
+
+        // Phase 2: tempVec = -1.0 * M_below * x_diag
+        threadgroup_barrier(mem_flags::mem_device);
+        deviceGemv(
+            data, info.belowDiagOffset,
+            int64_t(info.numRowsBelowDiag), n,
+            vecData, info.lumpStart, stride,
+            -1.0f, nRHS, tempVec, tid, nt);
+
+        // Phase 3: scatter tempVec → vecData using chain structure
+        threadgroup_barrier(mem_flags::mem_device);
+        deviceAssembleVec(
+            chainRowsTillEnd + info.chainColPtr,
+            chainRowSpan + info.chainColPtr,
+            spanStarts,
+            tempVec, int64_t(info.numColItems),
+            vecData, stride, nRHS, int64_t(info.startRow), tid, nt);
+
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    // === Transition barrier: forward L results must be visible to backward U ===
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // === Backward U phase ===
+    for (int32_t li = numLumps - 1; li >= 0; li--) {
+        BackwardULumpInfo bInfo = bwdInfos[li];
+        int64_t n = bInfo.lumpSize;
+        int32_t lump = bInfo.lumpIndex;
+
+        // Phase 1: for each upper chain entry, accumulate y -= U * x
+        int64_t upperRowStart = upperChainRowPtr[lump];
+        int64_t upperRowEnd = upperChainRowPtr[lump + 1];
+
+        for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+            int64_t colSpan = upperChainColSpan[i];
+            int64_t colStart = spanStarts[colSpan];
+            int64_t colSize = spanStarts[colSpan + 1] - colStart;
+            int64_t upperDataOffset = upperDataBase + upperChainData[i];
+
+            deviceGemvDirect(
+                data, upperDataOffset,
+                n, colSize,
+                vecData, colStart, bInfo.lumpStart,
+                stride, -1.0f, nRHS, tid, nt);
+
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+
+        // Phase 2: solve U * x = y for diagonal block
+        device float* U = data + bInfo.diagOffset;
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            iterativeSolveUpper(U, n, n, vecData + bInfo.lumpStart + rhs * stride, tid, nt);
+        }
+
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+
 // ============================================================================
 // Iterative refinement step kernel (fused unpermute + accumulate + SpMV + permute)
 // ============================================================================
