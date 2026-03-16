@@ -43,7 +43,7 @@ CudssBenchResults benchmarkCudssSolve(const vector<int64_t>& paramSize,
     ss = ssOrig;
   }
 
-  BASPACHO_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
+  SPRUX_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
   vector<int64_t> rowPtr, colInd;
   vector<double> val;
   vector<int64_t> spanStart = paramSize;

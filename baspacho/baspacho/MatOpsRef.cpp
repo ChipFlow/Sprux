@@ -64,7 +64,7 @@ struct SimpleNumericCtx : CpuBaseNumericCtx<T> {
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
     const CpuBaseSymElimCtx* pElim = dynamic_cast<const CpuBaseSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CpuBaseSymElimCtx& elim = *pElim;
     auto timer = elim.elimStat.instance();
     const CoalescedBlockMatrixSkel& skel = sym.skel;
@@ -87,7 +87,7 @@ struct SimpleNumericCtx : CpuBaseNumericCtx<T> {
   void doEliminationMockSparse(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                                int64_t lumpsEnd) {
     const CpuBaseSymElimCtx* pElim = dynamic_cast<const CpuBaseSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CpuBaseSymElimCtx& elim = *pElim;
     auto timer = elim.elimStat.instance();
     const CoalescedBlockMatrixSkel& skel = sym.skel;
@@ -122,7 +122,7 @@ struct SimpleNumericCtx : CpuBaseNumericCtx<T> {
 
           uint64_t pos =
               bisect(skel.chainRowSpan.data() + targetStartPtr, targetEndPtr - targetStartPtr, sj);
-          BASPACHO_CHECK_EQ(skel.chainRowSpan[targetStartPtr + pos], sj);
+          SPRUX_CHECK_EQ(skel.chainRowSpan[targetStartPtr + pos], sj);
           int64_t jiDataPtr = skel.chainData[targetStartPtr + pos];
           OuterStridedMatM<T> jiBlock(data + jiDataPtr + targetSpanOffsetInLump, sjSize, siSize,
                                       OuterStride(targetLumpSize));
@@ -195,7 +195,7 @@ struct SimpleSolveCtx : CpuBaseSolveCtx<T> {
                                 int64_t lumpsEnd, T* C, int64_t ldc) override {
     auto timer = sym.solveSparseLStat.instance();
     const CpuBaseSymElimCtx* pElim = dynamic_cast<const CpuBaseSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CpuBaseSymElimCtx& elim = *pElim;
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -242,11 +242,11 @@ struct SimpleSolveCtx : CpuBaseSolveCtx<T> {
         int64_t lumpStart = skel.lumpStart[lump];
         int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
         int64_t chainColOrd = elim.chainColOrd[i];
-        BASPACHO_CHECK_GE(chainColOrd,
+        SPRUX_CHECK_GE(chainColOrd,
                           1);  // there must be a diagonal block
 
         int64_t ptr = skel.chainColPtr[lump] + chainColOrd;
-        BASPACHO_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
+        SPRUX_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
         int64_t blockPtr = skel.chainData[ptr];
 
         Eigen::Map<const MatRMaj<T>> block(data + blockPtr, rowSpanSize, lumpSize);
@@ -332,7 +332,7 @@ struct SimpleSolveCtx : CpuBaseSolveCtx<T> {
 
 NumericCtxBase* SimpleSymbolicCtx::createNumericCtxForType(std::type_index tIdx,
                                                            int64_t tempBufSize, int batchSize) {
-  BASPACHO_CHECK_EQ(batchSize, 1);
+  SPRUX_CHECK_EQ(batchSize, 1);
   if (tIdx == std::type_index(typeid(double))) {
     return new SimpleNumericCtx<double>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else if (tIdx == std::type_index(typeid(float))) {
@@ -344,7 +344,7 @@ NumericCtxBase* SimpleSymbolicCtx::createNumericCtxForType(std::type_index tIdx,
 
 SolveCtxBase* SimpleSymbolicCtx::createSolveCtxForType(std::type_index tIdx, int nRHS,
                                                        int batchSize) {
-  BASPACHO_CHECK_EQ(batchSize, 1);
+  SPRUX_CHECK_EQ(batchSize, 1);
   if (tIdx == std::type_index(typeid(double))) {
     return new SimpleSolveCtx<double>(*this, nRHS);
   } else if (tIdx == std::type_index(typeid(float))) {

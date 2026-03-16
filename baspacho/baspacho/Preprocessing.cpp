@@ -22,9 +22,9 @@ namespace BaSpaCho {
 
 LUPreprocessing computeMaxTransversal(int64_t n, const int64_t* csrRowPtr,
                                       const int64_t* csrColInd) {
-  BASPACHO_CHECK_GT(n, 0);
-  BASPACHO_CHECK(csrRowPtr != nullptr);
-  BASPACHO_CHECK(csrColInd != nullptr);
+  SPRUX_CHECK_GT(n, 0);
+  SPRUX_CHECK(csrRowPtr != nullptr);
+  SPRUX_CHECK(csrColInd != nullptr);
 
   LUPreprocessing result;
   result.rowPerm.resize(n);
@@ -69,7 +69,7 @@ LUPreprocessing computeMaxTransversal(int64_t n, const int64_t* csrRowPtr,
       if (!filledPos[i]) freePositions.push_back(i);
     }
 
-    BASPACHO_CHECK_EQ((int64_t)freeRows.size(), (int64_t)freePositions.size());
+    SPRUX_CHECK_EQ((int64_t)freeRows.size(), (int64_t)freePositions.size());
 
     for (size_t k = 0; k < freeRows.size(); k++) {
       result.rowPerm[freePositions[k]] = freeRows[k];
@@ -83,7 +83,7 @@ template <typename T>
 void applyRowPermToCsr(int64_t n, const int64_t* rowPtr, const int64_t* colInd, const T* values,
                        const int64_t* rowPerm, std::vector<int64_t>& outRowPtr,
                        std::vector<int64_t>& outColInd, std::vector<T>& outValues) {
-  BASPACHO_CHECK_GT(n, 0);
+  SPRUX_CHECK_GT(n, 0);
 
   // Count total nnz
   int64_t totalNnz = 0;
@@ -122,7 +122,7 @@ template void applyRowPermToCsr<float>(int64_t, const int64_t*, const int64_t*, 
 void computeEquilibration(int64_t n, const int64_t* rowPtr, const int64_t* colInd,
                           const double* values, std::vector<double>& rowScale,
                           std::vector<double>& colScale) {
-  BASPACHO_CHECK_GT(n, 0);
+  SPRUX_CHECK_GT(n, 0);
 
   // Row scaling: Dr[i] = 1 / max_j |A[i,j]|
   rowScale.resize(n);
@@ -153,7 +153,7 @@ void applyRowPermAndScaleToCsr(int64_t n, const int64_t* rowPtr, const int64_t* 
                                const T* values, const int64_t* rowPerm, const T* rowScale,
                                const T* colScale, std::vector<int64_t>& outRowPtr,
                                std::vector<int64_t>& outColInd, std::vector<T>& outValues) {
-  BASPACHO_CHECK_GT(n, 0);
+  SPRUX_CHECK_GT(n, 0);
 
   // Count total nnz
   int64_t totalNnz = 0;
@@ -195,7 +195,7 @@ template void applyRowPermAndScaleToCsr<float>(int64_t, const int64_t*, const in
 
 SparseStructure csrToSymmetricSparseStructure(int64_t n, const int64_t* rowPtr,
                                               const int64_t* colInd) {
-  BASPACHO_CHECK_GT(n, 0);
+  SPRUX_CHECK_GT(n, 0);
 
   // Build lower-triangle column sets (CSC lower triangle = CSR upper triangle).
   // For each (i,j) entry, add max(i,j) to column min(i,j).

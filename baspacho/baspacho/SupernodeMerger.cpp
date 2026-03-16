@@ -38,7 +38,7 @@ LevelSetSchedule LevelSetSchedule::build(const vector<int64_t>& lumpParent) {
   vector<int64_t> childCount(numLumps, 0);
   for (int64_t l = 0; l < numLumps; l++) {
     if (lumpParent[l] != -1) {
-      BASPACHO_CHECK_LT(lumpParent[l], numLumps);
+      SPRUX_CHECK_LT(lumpParent[l], numLumps);
       childCount[lumpParent[l]]++;
     }
   }
@@ -91,7 +91,7 @@ vector<int64_t> computeLumpParent(const EliminationTree& et) {
     }
     rootToLump[k] = lumpIndex++;
   }
-  BASPACHO_CHECK_EQ(lumpIndex, numLumps);
+  SPRUX_CHECK_EQ(lumpIndex, numLumps);
 
   // For each lump (represented by its root node k), find the parent lump.
   // parent[k] is k's tree parent. Follow merge chain to find parent's root.
@@ -112,7 +112,7 @@ vector<int64_t> computeLumpParent(const EliminationTree& et) {
       p = et.mergeWith[p];
     }
 
-    BASPACHO_CHECK(rootToLump[p] != -1);
+    SPRUX_CHECK(rootToLump[p] != -1);
     lumpPar[rootToLump[k]] = rootToLump[p];
   }
 

@@ -29,7 +29,7 @@ UmfpackBenchResults benchmarkUmfpackSolve(const vector<int64_t>& paramSize,
   vector<int64_t> invPerm = inversePermutation(permutation);
   ss = ssOrig.symmetricPermutation(invPerm, false);
 
-  BASPACHO_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
+  SPRUX_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
 
   // Compute span starts (cumulative sum of param sizes)
   vector<int64_t> spanStart = paramSize;

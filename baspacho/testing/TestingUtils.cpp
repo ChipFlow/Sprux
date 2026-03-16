@@ -111,7 +111,7 @@ string printPattern(const SparseStructure& mat, bool sym) {
 // print sparse structure after collapsing columns according to lumpStart
 string printAggreg(vector<int64_t> ptrs,  // csc
                    vector<int64_t> inds, vector<int64_t> lumpStart) {
-  BASPACHO_CHECK_EQ(ptrs.size(), lumpStart.size());
+  SPRUX_CHECK_EQ(ptrs.size(), lumpStart.size());
   int64_t ord = lumpStart[lumpStart.size() - 1];
   vector<bool> isSet(ord * ord, false);
   for (int64_t i = 0; i < ptrs.size() - 1; i++) {
@@ -153,7 +153,7 @@ vector<set<int64_t>> randomCols(int64_t size, double fill, int64_t seed) {
 
 std::vector<std::set<int64_t>> joinColums(const std::vector<std::set<int64_t>>& columns,
                                           std::vector<int64_t> lumpStart) {
-  BASPACHO_CHECK_EQ(lumpStart[lumpStart.size() - 1], columns.size());
+  SPRUX_CHECK_EQ(lumpStart[lumpStart.size() - 1], columns.size());
   std::vector<std::set<int64_t>> retv;
   for (int64_t a = 0; a < lumpStart.size() - 1; a++) {
     int64_t start = lumpStart[a];
@@ -195,12 +195,12 @@ SparseStructure columnsToCscStruct(const vector<set<int64_t>>& columns) {
 
 // naive implementation
 void naiveAddEliminationEntries(vector<set<int64_t>>& columns, int64_t start, int64_t end) {
-  BASPACHO_CHECK_LE(end, columns.size());
+  SPRUX_CHECK_LE(end, columns.size());
   for (int i = start; i < end; i++) {
     set<int64_t>& cBlocks = columns[i];
     auto it = cBlocks.begin();
-    BASPACHO_CHECK(it != cBlocks.end());
-    BASPACHO_CHECK_EQ(i, *it);  // Expecting diagonal block!;
+    SPRUX_CHECK(it != cBlocks.end());
+    SPRUX_CHECK_EQ(i, *it);  // Expecting diagonal block!;
     while (++it != cBlocks.end()) {
       auto it2 = it;
       set<int64_t>& cAltBlocks = columns[*it];

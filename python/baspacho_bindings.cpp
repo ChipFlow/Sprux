@@ -17,10 +17,10 @@
 
 namespace py = pybind11;
 
-// Wrapper class that manages BaSpaCho solver state
-class PyBaspachoSolver {
+// Wrapper class that manages Sprux solver state
+class PySpruxSolver {
 public:
-    PyBaspachoSolver(
+    PySpruxSolver(
         py::array_t<int64_t> indptr,
         py::array_t<int64_t> indices,
         int64_t n,
@@ -35,22 +35,22 @@ public:
         // Create solver based on backend selection
         BaSpaCho::OpsPtr ops;
         if (backend == "metal") {
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
             ops = BaSpaCho::createMetalOps();
 #else
-            throw std::runtime_error("BaSpaCho was not built with Metal support");
+            throw std::runtime_error("Sprux was not built with Metal support");
 #endif
         } else if (backend == "cuda") {
-#ifdef BASPACHO_USE_CUDA
+#ifdef SPRUX_USE_CUDA
             ops = BaSpaCho::createCudaOps();
 #else
-            throw std::runtime_error("BaSpaCho was not built with CUDA support");
+            throw std::runtime_error("Sprux was not built with CUDA support");
 #endif
         } else if (backend == "opencl") {
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
             ops = BaSpaCho::createOpenCLOps();
 #else
-            throw std::runtime_error("BaSpaCho was not built with OpenCL support");
+            throw std::runtime_error("Sprux was not built with OpenCL support");
 #endif
         } else {
             // CPU/auto - use Eigen backend
@@ -140,10 +140,10 @@ private:
 };
 
 
-PYBIND11_MODULE(baspacho_py, m) {
-    m.doc() = "BaSpaCho sparse LU solver Python bindings";
+PYBIND11_MODULE(sprux_py, m) {
+    m.doc() = "Sprux sparse LU solver Python bindings";
 
-    py::class_<PyBaspachoSolver>(m, "BaspachoSolver")
+    py::class_<PySpruxSolver>(m, "SpruxSolver")
         .def(py::init<py::array_t<int64_t>, py::array_t<int64_t>, int64_t,
                       const std::string&, const std::string&>(),
              py::arg("indptr"),
@@ -151,17 +151,17 @@ PYBIND11_MODULE(baspacho_py, m) {
              py::arg("n"),
              py::arg("backend") = "auto",
              py::arg("matrix_type") = "general",
-             "Create a BaSpaCho solver for a CSR sparsity pattern")
-        .def("solve", &PyBaspachoSolver::solve,
+             "Create a Sprux solver for a CSR sparsity pattern")
+        .def("solve", &PySpruxSolver::solve,
              py::arg("b"),
              py::arg("data"),
              "Solve Ax = b, returns (x, inertia)")
-        .def_property_readonly("n", &PyBaspachoSolver::n)
-        .def_property_readonly("factor_nnz", &PyBaspachoSolver::factor_nnz);
+        .def_property_readonly("n", &PySpruxSolver::n)
+        .def_property_readonly("factor_nnz", &PySpruxSolver::factor_nnz);
 
     // Expose backend availability
     m.def("is_metal_available", []() {
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
         return true;
 #else
         return false;
@@ -169,7 +169,7 @@ PYBIND11_MODULE(baspacho_py, m) {
     });
 
     m.def("is_cuda_available", []() {
-#ifdef BASPACHO_USE_CUDA
+#ifdef SPRUX_USE_CUDA
         return true;
 #else
         return false;
@@ -177,7 +177,7 @@ PYBIND11_MODULE(baspacho_py, m) {
     });
 
     m.def("is_opencl_available", []() {
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
         return true;
 #else
         return false;

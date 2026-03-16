@@ -180,7 +180,7 @@ The project includes GitHub Actions workflows for performance tracking:
 ```bash
 # Build with Metal
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_METAL=1 -DBLA_VENDOR=Apple
+  -DSPRUX_USE_CUBLAS=0 -DSPRUX_USE_METAL=1 -DBLA_VENDOR=Apple
 cmake --build build -j16
 
 # Run benchmark and save baseline

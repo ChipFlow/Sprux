@@ -802,7 +802,7 @@ NumericCtxPtr<T> SymbolicCtx::createNumericCtx(int64_t tempBufSize, const T* dat
   int batchSize = Batch<T>::getSize(data);
   NumericCtxBase* ctx = createNumericCtxForType(T_tIdx, tempBufSize, batchSize);
   NumericCtx<T>* typedCtx = dynamic_cast<NumericCtx<T>*>(ctx);
-  BASPACHO_CHECK_NOTNULL(typedCtx);
+  SPRUX_CHECK_NOTNULL(typedCtx);
   return NumericCtxPtr<T>(typedCtx);
 }
 
@@ -812,7 +812,7 @@ SolveCtxPtr<T> SymbolicCtx::createSolveCtx(int nRHS, const T* data) {
   int batchSize = Batch<T>::getSize(data);
   SolveCtxBase* ctx = createSolveCtxForType(T_tIdx, nRHS, batchSize);
   SolveCtx<T>* typedCtx = dynamic_cast<SolveCtx<T>*>(ctx);
-  BASPACHO_CHECK_NOTNULL(typedCtx);
+  SPRUX_CHECK_NOTNULL(typedCtx);
   return SolveCtxPtr<T>(typedCtx);
 }
 
@@ -820,15 +820,15 @@ OpsPtr simpleOps();
 
 OpsPtr fastOps(int numThreads = 16);
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 OpsPtr cudaOps();
 #endif
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 OpsPtr metalOps();
 #endif
 
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
 OpsPtr openclOps();
 #endif
 

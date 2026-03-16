@@ -34,11 +34,11 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=OFF \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
@@ -77,11 +77,11 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=OFF \
-          -DBASPACHO_USE_OPENCL=ON \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=OFF
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=ON \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=OFF
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
@@ -117,11 +117,11 @@ jobs:
         export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=ON \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
           -DBLA_VENDOR=OpenBLAS \
           -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
 
@@ -177,11 +177,11 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=ON \
-          -DBASPACHO_USE_METAL=OFF \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"

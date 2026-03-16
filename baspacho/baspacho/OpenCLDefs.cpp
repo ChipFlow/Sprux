@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
 
 #include "baspacho/baspacho/OpenCLDefs.h"
 #include <algorithm>
@@ -86,8 +86,8 @@ OpenCLContext::OpenCLContext() {
 }
 
 void OpenCLContext::buildProgram() {
-#ifdef BASPACHO_OPENCL_KERNEL_PATH
-  std::string source = readKernelSource(BASPACHO_OPENCL_KERNEL_PATH);
+#ifdef SPRUX_OPENCL_KERNEL_PATH
+  std::string source = readKernelSource(SPRUX_OPENCL_KERNEL_PATH);
 #else
   std::cerr << "OpenCL: Kernel path not defined" << std::endl;
   abort();
@@ -318,4 +318,4 @@ template class OpenCLPtrMirror<double>;
 
 }  // end namespace BaSpaCho
 
-#endif  // BASPACHO_USE_OPENCL
+#endif  // SPRUX_USE_OPENCL

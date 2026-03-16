@@ -20,19 +20,19 @@
 #include "baspacho/testing/TestingMatGen.h"
 #include "baspacho/testing/TestingUtils.h"
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 #include "baspacho/baspacho/CudaDefs.h"
 #endif
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 #include "baspacho/baspacho/MetalDefs.h"
 #endif
 
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
 #include "BenchCholmod.h"
 #endif
 
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
 #include "BenchCudss.h"
 #endif
 
@@ -135,7 +135,7 @@ SparseProblem loadMtxAsSymmetric(const string& path) {
 }
 
 // first access to Cuda/Cublas takes a long time
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 void bangGpu() {
   static bool doneBang = false;
   if (!doneBang) {
@@ -218,7 +218,7 @@ void saveAllStats() {
 BenchResults benchmarkSolver(const SparseProblem& prob, const Settings& settings,
                              const vector<int64_t> nRHSs = {}, bool verbose = true,
                              bool collectStats = false) {
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   if (settings.backend == BackendCuda) {
     bangGpu();
   }
@@ -244,7 +244,7 @@ BenchResults benchmarkSolver(const SparseProblem& prob, const Settings& settings
 
   double factorTime;
   map<int64_t, double> solveTimes;
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   if (settings.backend == BackendCuda) {
     DevMirror dataGpu(data);
     auto startFactor = hrc::now();
@@ -264,7 +264,7 @@ BenchResults benchmarkSolver(const SparseProblem& prob, const Settings& settings
       solveTimes[nRHS] = tdelta(hrc::now() - startSolve).count();
     }
   } else
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
   {
     auto startFactor = hrc::now();
     solver->factor(data.data(), verbose);
@@ -295,7 +295,7 @@ BenchResults benchmarkSolver(const SparseProblem& prob, const Settings& settings
   return retv;
 }
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 BenchResults benchmarkSolverBatched(const SparseProblem& prob, const Settings& settings,
                                     int batchSize, const vector<int64_t> nRHSs = {},
                                     bool verbose = true, bool collectStats = false) {
@@ -366,9 +366,9 @@ BenchResults benchmarkSolverBatched(const SparseProblem& prob, const Settings& s
   retv.solveTimes = solveTimes;
   return retv;
 }
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 BenchResults benchmarkSolverBatchedMetal(const SparseProblem& prob, int batchSize,
                                          const vector<int64_t> nRHSs = {}, bool verbose = true,
                                          bool collectStats = false) {
@@ -436,7 +436,7 @@ BenchResults benchmarkSolverBatchedMetal(const SparseProblem& prob, int batchSiz
   retv.solveTimes = solveTimes;
   return retv;
 }
-#endif  // BASPACHO_USE_METAL
+#endif  // SPRUX_USE_METAL
 
 SparseProblem matGenToSparseProblem(SparseMatGenerator& gen, int64_t pSizeMin, int64_t pSizeMax) {
   SparseProblem retv;
@@ -521,7 +521,7 @@ map<string, function<SparseProblem(int64_t)>> problemGenerators = {
 
 map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& nRHSs, bool, bool)>>
     solvers = {
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
         {"1_CHOLMOD",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool /* collectStats */) -> BenchResults {
@@ -532,13 +532,13 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            retv.solveTimes = result.solveTimes;
            return retv;
          }},
-#endif  // BASPACHO_HAVE_CHOLMOD
+#endif  // SPRUX_HAVE_CHOLMOD
         {"2_BaSpaCho_BLAS_numthreads=16",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolver(prob, {.numThreads = 16}, nRHSs, verbose, collectStats);
          }},  //
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
         {"3_BaSpaCho_CUDA",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
@@ -567,7 +567,7 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
                prob, {.findSparseEliminationRanges = true, .backend = BackendCuda},
                /* batchsize = */ 16, nRHSs, verbose, collectStats);
          }},
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
         {"7_cuDSS_Cholesky",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool /* collectStats */) -> BenchResults {
@@ -579,9 +579,9 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            retv.solveTimes = result.solveTimes;
            return retv;
          }},
-#endif  // BASPACHO_HAVE_CUDSS
-#endif  // BASPACHO_USE_CUBLAS
-#ifdef BASPACHO_USE_METAL
+#endif  // SPRUX_HAVE_CUDSS
+#endif  // SPRUX_USE_CUBLAS
+#ifdef SPRUX_USE_METAL
         {"3_BaSpaCho_Metal",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
@@ -647,7 +647,7 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 16, nRHSs, verbose,
                                               collectStats);
          }},
-#endif  // BASPACHO_USE_METAL
+#endif  // SPRUX_USE_METAL
 };
 
 struct BenchmarkSettings {

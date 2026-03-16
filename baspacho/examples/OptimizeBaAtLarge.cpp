@@ -80,7 +80,7 @@ void solveCameraPosesAndCalibrations(Data& data, bool directSolver, int numThrea
   Optimizer opt;
 
   CameraParam c;
-  BASPACHO_CHECK_EQ(c.calib.data() + 3, c.pose.data());
+  SPRUX_CHECK_EQ(c.calib.data() + 3, c.pose.data());
 
   // register points first, and hint them as elimination set
   vector<Variable<Eigen::Vector3d>> pointVars(data.points.size());

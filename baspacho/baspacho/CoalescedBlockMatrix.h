@@ -76,7 +76,7 @@ struct CoalescedBlockMatrixSkel {
   // matrix storage start for given parameter
   int64_t spanMatrixOffset(int64_t span) const {
     int64_t lump = spanToLump[span];
-    BASPACHO_CHECK_EQ(spanOffsetInLump[span], 0);
+    SPRUX_CHECK_EQ(spanOffsetInLump[span], 0);
     return chainData[chainColPtr[lump]];
   }
 

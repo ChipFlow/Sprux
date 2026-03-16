@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifdef BASPACHO_HAVE_UMFPACK
+#ifdef SPRUX_HAVE_UMFPACK
 
 #include <gtest/gtest.h>
 #include <umfpack.h>
@@ -1342,7 +1342,7 @@ TEST(LUComparison, VsUmfpack_MeridianTopology) {
 // GPU Backend vs UMFPACK comparison tests
 // ============================================================================
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 #include "baspacho/baspacho/MetalDefs.h"
 
 // Build float test data from the same sparsity structure (Metal only supports float)
@@ -1770,9 +1770,9 @@ TEST(LUComparison, MetalVsUmfpack_BlockSizeScaling) {
     EXPECT_LT(metalResidual, 5e-3) << tc.name << ": Metal residual too large";
   }
 }
-#endif  // BASPACHO_USE_METAL
+#endif  // SPRUX_USE_METAL
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 // CUDA GPU vs UMFPACK comparison
 // CUDA supports both float and double; we test double for direct comparison with UMFPACK
 
@@ -1938,6 +1938,6 @@ TEST(LUComparison, CudaVsUmfpack_Performance) {
     EXPECT_LT(cudaResidual, 1e-8) << tc.name << ": CUDA residual too large";
   }
 }
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
 
-#endif  // BASPACHO_HAVE_UMFPACK
+#endif  // SPRUX_HAVE_UMFPACK

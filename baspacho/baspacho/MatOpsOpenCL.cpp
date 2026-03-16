@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
 
 #include <chrono>
 #include <iostream>
@@ -196,13 +196,13 @@ struct OpenCLNumericCtx : NumericCtx<T> {
 
   virtual void pseudoFactorSpans(T* data, int64_t spanBegin, int64_t spanEnd) override {
     // TODO: Implement using OpenCL kernel
-    BASPACHO_CHECK(false && "pseudoFactorSpans not yet implemented for OpenCL");
+    SPRUX_CHECK(false && "pseudoFactorSpans not yet implemented for OpenCL");
   }
 
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
     const OpenCLSymElimCtx* pElim = dynamic_cast<const OpenCLSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const OpenCLSymElimCtx& elim = *pElim;
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -568,7 +568,7 @@ template <>
 void OpenCLNumericCtx<double>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const double* data,
                                              int64_t offset) {
   auto timer = sym.sygeStat.instance<OpenCLSyncOps>(sizeof(double), m, n, k);
-  BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+  SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
   // Download source data from GPU if needed (read-only)
   // matA is (m, k) and matB is (n, k), both at same offset, so need max(m, n) * k elements
@@ -587,7 +587,7 @@ template <>
 void OpenCLNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                                             int64_t offset) {
   auto timer = sym.sygeStat.instance<OpenCLSyncOps>(sizeof(float), m, n, k);
-  BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+  SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
   // Download source data from GPU if needed (read-only)
   // matA is (m, k) and matB is (n, k), both at same offset, so need max(m, n) * k elements
@@ -755,10 +755,10 @@ struct OpenCLSolveCtx : SolveCtx<T> {
 NumericCtxBase* OpenCLSymbolicCtx::createNumericCtxForType(type_index tIdx, int64_t tempBufSize,
                                                             int batchSize) {
   if (tIdx == type_index(typeid(double))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new OpenCLNumericCtx<double>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else if (tIdx == type_index(typeid(float))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new OpenCLNumericCtx<float>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else {
     // Batched operations not yet supported for OpenCL
@@ -768,10 +768,10 @@ NumericCtxBase* OpenCLSymbolicCtx::createNumericCtxForType(type_index tIdx, int6
 
 SolveCtxBase* OpenCLSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS, int batchSize) {
   if (tIdx == type_index(typeid(double))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new OpenCLSolveCtx<double>(*this, nRHS);
   } else if (tIdx == type_index(typeid(float))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new OpenCLSolveCtx<float>(*this, nRHS);
   } else {
     return nullptr;
@@ -782,4 +782,4 @@ OpsPtr openclOps() { return OpsPtr(new OpenCLOps); }
 
 }  // end namespace BaSpaCho
 
-#endif  // BASPACHO_USE_OPENCL
+#endif  // SPRUX_USE_OPENCL

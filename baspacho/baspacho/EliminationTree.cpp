@@ -23,7 +23,7 @@ EliminationTree::EliminationTree(const vector<int64_t>& paramSize, const SparseS
     : paramSize(paramSize),
       ss(ss),
       compMod(compMod ? *compMod : ComputationModel::model_OpenBlas_i7_1185g7) {
-  BASPACHO_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
+  SPRUX_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
 }
 
 void EliminationTree::buildTree() {
@@ -210,10 +210,10 @@ void EliminationTree::computeMerges() {
     mergeCandidates.pop();
 
     auto oldP = p;
-    BASPACHO_CHECK_LT(p, (int64_t)mergeWith.size());
+    SPRUX_CHECK_LT(p, (int64_t)mergeWith.size());
     while (mergeWith[p] != -1) {
       p = mergeWith[p];
-      BASPACHO_CHECK_LT(p, (int64_t)mergeWith.size());
+      SPRUX_CHECK_LT(p, (int64_t)mergeWith.size());
     }
 
     // parent was merged? value changed, re-prioritize
@@ -353,7 +353,7 @@ void EliminationTree::processTree(bool detectSparseElimRanges, const vector<int6
     lumpToSpan[lumpIndex] = numMergedNodes[k];
     lumpIndex++;
   }
-  BASPACHO_CHECK_EQ(lumpIndex, numLumps);
+  SPRUX_CHECK_EQ(lumpIndex, numLumps);
 
   cumSumVec(lumpStart);
   cumSumVec(lumpToSpan);
@@ -383,7 +383,7 @@ void EliminationTree::computeAggregateStruct(bool fillOnlyForElims) {
       tperm = tperm.addIndependentEliminationFill(sparseElimRanges[e], sparseElimRanges[e + 1]);
     }
   } else {
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
     tperm = tperm.addFullEliminationFillCholmod();
 #else
     tperm = tperm.addFullEliminationFill();

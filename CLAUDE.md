@@ -14,13 +14,13 @@ Sprux (formerly BaSpaCho — Batched Sparse Cholesky) is a high-performance spar
 - Mixed-precision iterative refinement (float factor + double accumulation)
 - Block-structured matrices with partial factor/solve for marginals
 
-Code namespace and CMake variables still use `BaSpaCho` — a rename is planned for a future PR.
+The C++ namespace remains `BaSpaCho` for backward compatibility.
 
 ## Build Commands
 
 **Configure (CPU-only, using OpenBLAS):**
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPRUX_USE_CUBLAS=0
 ```
 
 **Configure (with CUDA):**
@@ -36,7 +36,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBLA_VENDOR=Intel10_64lp
 
 **Configure (with Apple Metal, macOS only):**
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_METAL=1 -DBLA_VENDOR=Apple
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPRUX_USE_CUBLAS=0 -DSPRUX_USE_METAL=1 -DBLA_VENDOR=Apple
 ```
 
 **Build:**
@@ -147,14 +147,14 @@ test_data/        # Test matrices (c6288_sequence, mul64, tb_dp)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `BASPACHO_USE_CUBLAS` | ON | Enable CUDA support |
-| `BASPACHO_USE_METAL` | OFF | Enable Apple Metal support (macOS only, float only) |
-| `BASPACHO_USE_OPENCL` | OFF | Enable OpenCL support with CLBlast (experimental) |
-| `BASPACHO_USE_BLAS` | ON | Enable BLAS support |
-| `BASPACHO_CUDA_ARCHS` | "detect" | CUDA architectures ("detect", "torch", or "60;70;75") |
-| `BASPACHO_USE_SUITESPARSE_AMD` | OFF | Use SuiteSparse AMD instead of Eigen's |
-| `BASPACHO_BUILD_TESTS` | ON | Build tests |
-| `BASPACHO_BUILD_EXAMPLES` | ON | Build examples/benchmarks |
+| `SPRUX_USE_CUBLAS` | ON | Enable CUDA support |
+| `SPRUX_USE_METAL` | OFF | Enable Apple Metal support (macOS only, float only) |
+| `SPRUX_USE_OPENCL` | OFF | Enable OpenCL support with CLBlast (experimental) |
+| `SPRUX_USE_BLAS` | ON | Enable BLAS support |
+| `SPRUX_CUDA_ARCHS` | "detect" | CUDA architectures ("detect", "torch", or "60;70;75") |
+| `SPRUX_USE_SUITESPARSE_AMD` | OFF | Use SuiteSparse AMD instead of Eigen's |
+| `SPRUX_BUILD_TESTS` | ON | Build tests |
+| `SPRUX_BUILD_EXAMPLES` | ON | Build examples/benchmarks |
 | `BLA_VENDOR` | (auto) | BLAS implementation (ATLAS, OpenBLAS, Intel10_64lp_seq, Apple) |
 
 ## GPU Backend Notes

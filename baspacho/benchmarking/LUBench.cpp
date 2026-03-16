@@ -29,20 +29,20 @@
 #include "baspacho/testing/MatrixMarketReader.h"
 #include "baspacho/testing/TestingUtils.h"
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 #include "baspacho/baspacho/CudaDefs.h"
 #endif
 
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
 #include <cuda_runtime.h>
 #include <cudss.h>
 #endif
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 #include "baspacho/baspacho/MetalDefs.h"
 #endif
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
 #include "baspacho/baspacho/BlasDefs.h"
 #endif
 
@@ -253,7 +253,7 @@ static vector<LUTimingResult> benchmarkLUCpu(
 // Metal (float + mixed-precision iterative refinement) benchmark
 // ============================================================================
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
 // Metal LU benchmark (Metal_Sparse): GPU sparse elimination + CPU BLAS dense + CPU SpMV refinement.
 // Mirrors the spineax BaspachoGpuInstantiate/Execute FFI code path.
 // Uses persistent contexts, device-resident pivots, recording pass, and external encoder.
@@ -534,13 +534,13 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
 
   return results;
 }
-#endif  // BASPACHO_USE_METAL
+#endif  // SPRUX_USE_METAL
 
 // ============================================================================
 // Dense BLAS LU baseline (Accelerate sgetrf/sgetrs, no sparsity exploitation)
 // ============================================================================
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
 static vector<LUTimingResult> benchmarkLUDenseBLAS(
     const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine, bool verbose) {
   if (matrices.empty()) return {};
@@ -660,13 +660,13 @@ static vector<LUTimingResult> benchmarkLUDenseBLAS(
 
   return results;
 }
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
 // ============================================================================
 // CUDA (double) benchmark
 // ============================================================================
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 static void bangGpu() {
   static bool doneBang = false;
   if (!doneBang) {
@@ -809,13 +809,13 @@ static vector<LUTimingResult> benchmarkLUCuda(
 
   return results;
 }
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
 
 // ============================================================================
 // cuDSS LU benchmark (NVIDIA's native sparse solver)
 // ============================================================================
 
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
 
 #define cudssCHECK(call)                                                              \
   do {                                                                                \
@@ -936,7 +936,7 @@ static vector<LUTimingResult> benchmarkLUCudss(
 
   return results;
 }
-#endif  // BASPACHO_HAVE_CUDSS
+#endif  // SPRUX_HAVE_CUDSS
 
 // ============================================================================
 // Convert timing results to BenchRecords
@@ -1062,14 +1062,14 @@ void help() {
        << "  -h             Show this help\n"
        << "\nAvailable solvers:\n"
        << "  BaSpaCho_LU_CPU\n"
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
        << "  Metal_Sparse     (GPU sparse elim + CPU BLAS dense + CPU SpMV refinement)\n"
        << "  Metal_Dense      (Accelerate dense LU baseline, no sparsity exploitation)\n"
 #endif
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
        << "  BaSpaCho_LU_CUDA\n"
 #endif
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
        << "  cuDSS_LU\n"
 #endif
        << endl;
@@ -1269,7 +1269,7 @@ int main(int argc, char* argv[]) {
     if (!jsonOutput) printResults("BaSpaCho_LU_CPU", timings);
   }
 
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
   if (regex_search(string("Metal_Sparse"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning Metal_Sparse..." << endl;
     auto timings = benchmarkLUMetalFFI(matrices, maxRefineIters, verbose);
@@ -1280,7 +1280,7 @@ int main(int argc, char* argv[]) {
 
   if (regex_search(string("Metal_Dense"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning Metal_Dense..." << endl;
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
     auto timings = benchmarkLUDenseBLAS(matrices, maxRefineIters, verbose);
 #else
     vector<LUTimingResult> timings;
@@ -1292,7 +1292,7 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   if (regex_search(string("BaSpaCho_LU_CUDA"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_CUDA..." << endl;
     auto timings = benchmarkLUCuda(matrices, verbose);
@@ -1306,7 +1306,7 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
   if (regex_search(string("cuDSS_LU"), selectSolvers)) {
     if (!jsonOutput) cout << "\nRunning cuDSS_LU..." << endl;
     auto timings = benchmarkLUCudss(matrices, verbose);

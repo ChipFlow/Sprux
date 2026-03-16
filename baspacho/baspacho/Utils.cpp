@@ -69,7 +69,7 @@ std::string secondsToString(double secs, int precision) {
 
 std::vector<int64_t> composePermutations(const std::vector<int64_t>& v,
                                          const std::vector<int64_t>& w) {
-  BASPACHO_CHECK_EQ(v.size(), w.size());
+  SPRUX_CHECK_EQ(v.size(), w.size());
   std::vector<int64_t> retv(v.size());
   for (size_t i = 0; i < v.size(); i++) {
     retv[i] = v[w[i]];

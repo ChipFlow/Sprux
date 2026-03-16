@@ -1,7 +1,7 @@
 [project]
-name = "baspacho"
-description = "Direct solver for sparse SPD matrices for nonlinear optimization. Implements supernodal Cholesky decomposition algorithm, and supports GPU (CUDA)."
-homepage = "https://github.com/facebookresearch/baspacho"
+name = "sprux"
+description = "High-performance sparse direct solver with GPU acceleration. Supports Cholesky, LU, and LDL^T factorization on CUDA, Metal, and OpenCL backends."
+homepage = "https://github.com/ChipFlow/sprux"
 license = "MIT"
 channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64", "win-64"]
@@ -9,7 +9,7 @@ version = "1.0"
 
 [tasks]
 clean = "rm -rf ./build"
-prepare = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0"
+prepare = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPRUX_USE_CUBLAS=0"
 build = "cmake --build build -- -j16"
 test = "ctest --test-dir build"
 

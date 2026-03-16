@@ -30,19 +30,19 @@ struct CoalescedAccessor {
   }
 
   // returns size of i-th parameter
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   int64_t paramSize(int64_t blockIndex) const {
     return spanStart[blockIndex + 1] - spanStart[blockIndex];
   }
 
   // returns start of i-th parameter
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   int64_t paramStart(int64_t blockIndex) const { return spanStart[blockIndex]; }
 
   // return: pair (offset, stride) to identify block in numeric factor data
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   std::pair<int64_t, int64_t> blockOffset(int64_t rowBlockIndex, int64_t colBlockIndex) const {
-    BASPACHO_CHECK_GE(rowBlockIndex, colBlockIndex);
+    SPRUX_CHECK_GE(rowBlockIndex, colBlockIndex);
     int64_t lump = spanToLump[colBlockIndex];
     int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
     int64_t offsetInLump = spanOffsetInLump[colBlockIndex];
@@ -50,12 +50,12 @@ struct CoalescedAccessor {
     int64_t end = chainColPtr[lump + 1];
     // bisect to find `rowBlockIndex` in chainRowSpan[start:end]
     int64_t pos = bisect(chainRowSpan + start, end - start, rowBlockIndex);
-    BASPACHO_CHECK_EQ(chainRowSpan[start + pos], rowBlockIndex);
+    SPRUX_CHECK_EQ(chainRowSpan[start + pos], rowBlockIndex);
     return std::make_pair(chainData[start + pos] + offsetInLump, lumpSize);
   }
 
   // return: pair (offset, stride) to identify diagonal block in numeric factor data
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   std::pair<int64_t, int64_t> diagBlockOffset(int64_t blockIndex) const {
     int64_t lump = spanToLump[blockIndex];
     int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
@@ -66,16 +66,16 @@ struct CoalescedAccessor {
 
   // return: block reference, from factor data pointer
   template <int rowSize = Eigen::Dynamic, int64_t colSize = Eigen::Dynamic, typename T>
-  __BASPACHO_HOST_DEVICE__ auto block(T* data, int64_t rowBlockIndex, int64_t colBlockIndex) const {
+  __SPRUX_HOST_DEVICE__ auto block(T* data, int64_t rowBlockIndex, int64_t colBlockIndex) const {
     using namespace Eigen;
     auto offsetStride = blockOffset(rowBlockIndex, colBlockIndex);
     auto offset = std::get<0>(offsetStride);
     auto stride = std::get<1>(offsetStride);
     if (rowSize != Dynamic) {
-      BASPACHO_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
+      SPRUX_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
     }
     if (colSize != Dynamic) {
-      BASPACHO_CHECK_EQ(colSize, paramSize(colBlockIndex));
+      SPRUX_CHECK_EQ(colSize, paramSize(colBlockIndex));
     }
     return Map<Matrix<T, rowSize, colSize, RowMajor>, 0, OuterStride<>>(
         data + offset, rowSize != Dynamic ? rowSize : paramSize(rowBlockIndex),
@@ -84,13 +84,13 @@ struct CoalescedAccessor {
 
   // return: diagonal block reference, from factor data pointer
   template <int size = Eigen::Dynamic, typename T>
-  __BASPACHO_HOST_DEVICE__ auto diagBlock(T* data, int64_t blockIndex) const {
+  __SPRUX_HOST_DEVICE__ auto diagBlock(T* data, int64_t blockIndex) const {
     using namespace Eigen;
     auto offsetStride = diagBlockOffset(blockIndex);
     auto offset = std::get<0>(offsetStride);
     auto stride = std::get<1>(offsetStride);
     if (size != Dynamic) {
-      BASPACHO_CHECK_EQ(size, paramSize(blockIndex));
+      SPRUX_CHECK_EQ(size, paramSize(blockIndex));
     }
     int pSize = size != Dynamic ? size : paramSize(blockIndex);
     return Map<Matrix<T, size, size, RowMajor>, 0, OuterStride<>>(data + offset, pSize, pSize,
@@ -120,15 +120,15 @@ struct CoalescedAccessor {
   }
 
   // Check if upper triangle is available
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   bool hasUpper() const { return upperChainRowPtr != nullptr; }
 
   // return: pair (offset, stride) to identify UPPER block in numeric factor data
   // For upper triangle: rowBlockIndex < colBlockIndex
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   std::pair<int64_t, int64_t> upperBlockOffset(int64_t rowBlockIndex, int64_t colBlockIndex) const {
-    BASPACHO_CHECK_LT(rowBlockIndex, colBlockIndex);
-    BASPACHO_CHECK(hasUpper());
+    SPRUX_CHECK_LT(rowBlockIndex, colBlockIndex);
+    SPRUX_CHECK(hasUpper());
     int64_t lump = spanToLump[rowBlockIndex];
     int64_t lumpSize = lumpStart[lump + 1] - lumpStart[lump];
     int64_t offsetInLump = spanOffsetInLump[rowBlockIndex];
@@ -136,23 +136,23 @@ struct CoalescedAccessor {
     int64_t end = upperChainRowPtr[lump + 1];
     // bisect to find `colBlockIndex` in upperChainColSpan[start:end]
     int64_t pos = bisect(upperChainColSpan + start, end - start, colBlockIndex);
-    BASPACHO_CHECK_EQ(upperChainColSpan[start + pos], colBlockIndex);
+    SPRUX_CHECK_EQ(upperChainColSpan[start + pos], colBlockIndex);
     return std::make_pair(upperChainData[start + pos] + offsetInLump, lumpSize);
   }
 
   // return: upper block reference, from factor data pointer
   template <int rowSize = Eigen::Dynamic, int64_t colSize = Eigen::Dynamic, typename T>
-  __BASPACHO_HOST_DEVICE__ auto upperBlock(T* data, int64_t rowBlockIndex,
+  __SPRUX_HOST_DEVICE__ auto upperBlock(T* data, int64_t rowBlockIndex,
                                             int64_t colBlockIndex) const {
     using namespace Eigen;
     auto offsetStride = upperBlockOffset(rowBlockIndex, colBlockIndex);
     auto offset = std::get<0>(offsetStride);
     auto stride = std::get<1>(offsetStride);
     if (rowSize != Dynamic) {
-      BASPACHO_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
+      SPRUX_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
     }
     if (colSize != Dynamic) {
-      BASPACHO_CHECK_EQ(colSize, paramSize(colBlockIndex));
+      SPRUX_CHECK_EQ(colSize, paramSize(colBlockIndex));
     }
     return Map<Matrix<T, rowSize, colSize, RowMajor>, 0, OuterStride<>>(
         data + offset, rowSize != Dynamic ? rowSize : paramSize(rowBlockIndex),
@@ -183,19 +183,19 @@ struct PermutedCoalescedAccessor {
   }
 
   // returns size of i-th parameter
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   int64_t paramSize(int64_t blockIndex) const {
     return plainAcc.paramSize(permutation[blockIndex]);
   }
 
   // returns start of i-th parameter
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   int64_t paramStart(int64_t blockIndex) const {
     return plainAcc.paramStart(permutation[blockIndex]);
   }
 
   // return: pair (offset, stride) to identify block in numeric factor data
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   std::tuple<int64_t, int64_t, bool> blockOffset(int64_t rowBlockIndex,
                                                  int64_t colBlockIndex) const {
     int64_t permRowBlockIndex = permutation[rowBlockIndex];
@@ -209,20 +209,20 @@ struct PermutedCoalescedAccessor {
   }
 
   // return: pair (offset, stride) to identify diagonal block in numeric factor data
-  __BASPACHO_HOST_DEVICE__
+  __SPRUX_HOST_DEVICE__
   std::pair<int64_t, int64_t> diagBlockOffset(int64_t blockIndex) const {
     return plainAcc.diagBlockOffset(permutation[blockIndex]);
   }
 
   // return: block reference, from factor data pointer
   template <int rowSize = Eigen::Dynamic, int64_t colSize = Eigen::Dynamic, typename T>
-  __BASPACHO_HOST_DEVICE__ auto block(T* data, int64_t rowBlockIndex, int64_t colBlockIndex) const {
+  __SPRUX_HOST_DEVICE__ auto block(T* data, int64_t rowBlockIndex, int64_t colBlockIndex) const {
     using namespace Eigen;
     if (rowSize != Dynamic) {
-      BASPACHO_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
+      SPRUX_CHECK_EQ(rowSize, paramSize(rowBlockIndex));
     }
     if (colSize != Dynamic) {
-      BASPACHO_CHECK_EQ(colSize, paramSize(colBlockIndex));
+      SPRUX_CHECK_EQ(colSize, paramSize(colBlockIndex));
     }
     auto offsetStrideFlip = blockOffset(rowBlockIndex, colBlockIndex);
     auto offset = std::get<0>(offsetStrideFlip);
@@ -236,13 +236,13 @@ struct PermutedCoalescedAccessor {
 
   // return: diagonal block reference, from factor data pointer
   template <int size = Eigen::Dynamic, typename T>
-  __BASPACHO_HOST_DEVICE__ auto diagBlock(T* data, int64_t blockIndex) const {
+  __SPRUX_HOST_DEVICE__ auto diagBlock(T* data, int64_t blockIndex) const {
     using namespace Eigen;
     auto offsetStride = diagBlockOffset(blockIndex);
     auto offset = std::get<0>(offsetStride);
     auto stride = std::get<1>(offsetStride);
     if (size != Dynamic) {
-      BASPACHO_CHECK_EQ(size, paramSize(blockIndex));
+      SPRUX_CHECK_EQ(size, paramSize(blockIndex));
     }
     int pSize = size != Dynamic ? size : paramSize(blockIndex);
     return Map<Matrix<T, size, size, RowMajor>, 0, OuterStride<>>(data + offset, pSize, pSize,

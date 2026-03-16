@@ -112,7 +112,7 @@ class MetalContext {
   bool beginCapture(const char* outputPath = "/tmp/baspacho.gputrace");
   void endCapture();
 
-  // Convenience: begins capture only if BASPACHO_GPU_CAPTURE=1 env var is set.
+  // Convenience: begins capture only if SPRUX_GPU_CAPTURE=1 env var is set.
   // Returns true if capture was started. Call endCaptureIfActive() to stop.
   bool beginCaptureIfRequested(const char* outputPath = "/tmp/baspacho.gputrace");
   void endCaptureIfActive();

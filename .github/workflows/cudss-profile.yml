@@ -1,4 +1,4 @@
-name: cuDSS vs BaSpaCho Profiling
+name: cuDSS vs Sprux Profiling
 
 on:
   workflow_dispatch:
@@ -49,57 +49,57 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=ON \
-          -DBASPACHO_USE_METAL=OFF \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
 
     - name: Build CudssBenchmarkTest
       run: cmake --build build --config ${{ env.BUILD_TYPE }} --target CudssBenchmarkTest -j"$(nproc)"
 
     - name: Run nsys profile
       run: |
-        export BASPACHO_MTX_DIR=test_data/c6288_jacobian
+        export SPRUX_MTX_DIR=test_data/c6288_jacobian
 
         nsys profile \
           --trace=cuda,nvtx,osrt \
           --stats=true \
-          --output /tmp/cudss_vs_baspacho \
+          --output /tmp/cudss_vs_sprux \
           ${{ inputs.nsys_args }} \
           ./build/baspacho/tests/CudssBenchmarkTest
 
     - name: Generate stats summary
       run: |
-        echo "## cuDSS vs BaSpaCho Profiling Results" >> "$GITHUB_STEP_SUMMARY"
+        echo "## cuDSS vs Sprux Profiling Results" >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         echo "### NVTX Range Summary" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        nsys stats --report nvtxsum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        nsys stats --report nvtxsum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         echo "### CUDA Kernel Summary" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        nsys stats --report cudakernsum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+        nsys stats --report cudakernsum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -80 >> "$GITHUB_STEP_SUMMARY" || true
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         echo "### CUDA API Summary" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        nsys stats --report cudaapisum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        nsys stats --report cudaapisum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
         echo '```' >> "$GITHUB_STEP_SUMMARY"
         echo "" >> "$GITHUB_STEP_SUMMARY"
 
         echo "### Memory Transfer Summary" >> "$GITHUB_STEP_SUMMARY"
         echo '```' >> "$GITHUB_STEP_SUMMARY"
-        nsys stats --report cudamemcpysum /tmp/cudss_vs_baspacho.nsys-rep 2>&1 | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+        nsys stats --report cudamemcpysum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -40 >> "$GITHUB_STEP_SUMMARY" || true
         echo '```' >> "$GITHUB_STEP_SUMMARY"
 
     - name: Upload nsys report
       uses: actions/upload-artifact@v4
       with:
-        name: nsys-profile-cudss-vs-baspacho
-        path: /tmp/cudss_vs_baspacho.nsys-rep
+        name: nsys-profile-cudss-vs-sprux
+        path: /tmp/cudss_vs_sprux.nsys-rep
         retention-days: 30

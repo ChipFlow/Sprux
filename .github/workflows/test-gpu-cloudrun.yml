@@ -48,11 +48,11 @@ jobs:
         export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=ON \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
           -DBLA_VENDOR=OpenBLAS \
           -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
 

@@ -9,7 +9,7 @@
 // Loads c6288 Jacobian (Matrix Market) and solves with both solvers.
 // Run under `nsys profile` to compare GPU execution patterns.
 
-#ifdef BASPACHO_HAVE_CUDSS
+#ifdef SPRUX_HAVE_CUDSS
 
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
@@ -54,7 +54,7 @@ using Vector = Eigen::Vector<T, Eigen::Dynamic>;
 
 static string getMtxDir() {
   // Check --mtx command-line arg (gtest doesn't parse custom args, use env)
-  const char* envDir = getenv("BASPACHO_MTX_DIR");
+  const char* envDir = getenv("SPRUX_MTX_DIR");
   if (envDir) return string(envDir);
 
   // Default: test_data/c6288_jacobian relative to repo root
@@ -332,4 +332,4 @@ TEST(CudssBenchmark, CuDSS_LU) {
   cudaFree(d_x);
 }
 
-#endif  // BASPACHO_HAVE_CUDSS
+#endif  // SPRUX_HAVE_CUDSS

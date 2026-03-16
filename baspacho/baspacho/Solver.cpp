@@ -29,13 +29,13 @@ static os_log_t baspachoSignpostLog() {
       os_log_create("com.baspacho.solver", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
   return log;
 }
-#define BASPACHO_SIGNPOST_BEGIN(name) \
+#define SPRUX_SIGNPOST_BEGIN(name) \
   os_signpost_interval_begin(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
-#define BASPACHO_SIGNPOST_END(name) \
+#define SPRUX_SIGNPOST_END(name) \
   os_signpost_interval_end(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
 #else
-#define BASPACHO_SIGNPOST_BEGIN(name) ((void)0)
-#define BASPACHO_SIGNPOST_END(name) ((void)0)
+#define SPRUX_SIGNPOST_BEGIN(name) ((void)0)
+#define SPRUX_SIGNPOST_END(name) ((void)0)
 #endif
 
 namespace BaSpaCho {
@@ -163,11 +163,11 @@ void Solver::initElimination() {
     //  iterate over columns having a non-trivial a-block
     int64_t rPtr0 = factorSkel.boardRowPtr[l];
     int64_t rEnd0 = factorSkel.boardRowPtr[l + 1];
-    BASPACHO_CHECK_EQ(factorSkel.boardColLump[rEnd0 - 1], l);
+    SPRUX_CHECK_EQ(factorSkel.boardColLump[rEnd0 - 1], l);
     while (factorSkel.boardColLump[rPtr0] < denseOpsFromLump) {
       rPtr0++;
     }
-    BASPACHO_CHECK_LT(rPtr0,
+    SPRUX_CHECK_LT(rPtr0,
                       rEnd0);  // will stop before end as l > denseOpsFromLump
     startElimRowPtr[l - denseOpsFromLump] = rPtr0;
 
@@ -179,8 +179,8 @@ void Solver::initElimination() {
       int64_t boardIndexInCol = factorSkel.boardColOrd[rPtr];
       int64_t boardSNDataStart = factorSkel.boardColPtr[origLump];
       int64_t boardSNDataEnd = factorSkel.boardColPtr[origLump + 1];
-      BASPACHO_CHECK_LT(boardIndexInCol, boardSNDataEnd - boardSNDataStart);
-      BASPACHO_CHECK_EQ(l, factorSkel.boardRowLump[boardSNDataStart + boardIndexInCol]);
+      SPRUX_CHECK_LT(boardIndexInCol, boardSNDataEnd - boardSNDataStart);
+      SPRUX_CHECK_EQ(l, factorSkel.boardRowLump[boardSNDataStart + boardIndexInCol]);
       maxElimTempSize = max(maxElimTempSize, boardElimTempSize(origLump, boardIndexInCol));
     }
   }
@@ -204,12 +204,12 @@ void Solver::factorFrom(T* data, int64_t spanIndex, bool verbose) const {
 template <typename T>
 void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpanIndex,
                                  bool verbose) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
-  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_LE(endSpanIndex, canFactorUpTo);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -227,10 +227,10 @@ void Solver::internalFactorRange(T* data, int64_t startSpanIndex, int64_t endSpa
   } else {
     for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
       if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        SPRUX_CHECK_EQ(sparseElimRanges[l], upToLump);
         return;
       } else if (startLump > sparseElimRanges[l]) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
         continue;
       }
       if (verbose) {
@@ -320,11 +320,11 @@ static constexpr bool SparseElimSolve = true;
 template <typename T>
 void Solver::internalSolveLRange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                  int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -332,10 +332,10 @@ void Solver::internalSolveLRange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   if (SparseElimSolve) {
     for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
       if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        SPRUX_CHECK_EQ(sparseElimRanges[l], upToLump);
         return;
       } else if (startLump > sparseElimRanges[l]) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
         continue;
       }
       slvCtx.sparseElimSolveL(*elimCtxs[l], matData, sparseElimRanges[l], sparseElimRanges[l + 1],
@@ -349,7 +349,7 @@ void Solver::internalSolveLRange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   }
 
   if (factorSkel.numSpans() == factorSkel.numLumps() && slvCtx.hasFragmentedOps() && nRHS == 1) {
-    BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
+    SPRUX_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx.fragmentedSolveL(matData, denseOpsFromLump, upToLump, vecData);
   } else {
     for (int64_t l = denseOpsFromLump; l < upToLump; l++) {
@@ -385,11 +385,11 @@ template <typename T>
 void Solver::internalSolveLtRange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                   int64_t endSpanIndex, T* vecData, int64_t stride,
                                   int nRHS) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -403,7 +403,7 @@ void Solver::internalSolveLtRange(SolveCtx<T>& slvCtx, const T* matData, int64_t
 
   int64_t numSpans = factorSkel.lumpToSpan[upToLump] - factorSkel.lumpToSpan[denseOpsFromLump];
   if (numSpans == upToLump - denseOpsFromLump && slvCtx.hasFragmentedOps() && nRHS == 1) {
-    BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
+    SPRUX_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx.fragmentedSolveLt(matData, denseOpsFromLump, upToLump, vecData);
   } else {
     for (int64_t l = upToLump - 1; l >= denseOpsFromLump; l--) {
@@ -436,10 +436,10 @@ void Solver::internalSolveLtRange(SolveCtx<T>& slvCtx, const T* matData, int64_t
   if (SparseElimSolve) {
     for (int64_t l = (int64_t)sparseElimRanges.size() - 2; l >= 0; l--) {
       if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_LE(sparseElimRanges[l], upToLump);
+        SPRUX_CHECK_LE(sparseElimRanges[l], upToLump);
         continue;
       } else if (sparseElimRanges[l] < startLump) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
         return;
       }
       slvCtx.sparseElimSolveLt(*elimCtxs[l], matData, sparseElimRanges[l], sparseElimRanges[l + 1],
@@ -453,9 +453,9 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
                        T* outVecData, int64_t outStride, int nRHS, BaseType<T> alpha) const {
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
-  BASPACHO_CHECK_GE(spanIndex, 0);
-  BASPACHO_CHECK_LT(spanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[spanIndex], 0);
+  SPRUX_CHECK_GE(spanIndex, 0);
+  SPRUX_CHECK_LT(spanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[spanIndex], 0);
   int64_t startFromLump = factorSkel.spanToLump[spanIndex];
   int64_t denseOpsFromLump = startFromLump;  // sparse ops not supported yet
 
@@ -463,7 +463,7 @@ void Solver::addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, 
 
   int64_t numSpans = factorSkel.lumpToSpan[upToLump] - factorSkel.lumpToSpan[denseOpsFromLump];
   if (numSpans == upToLump - denseOpsFromLump && slvCtx->hasFragmentedOps() && nRHS == 1) {
-    BASPACHO_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
+    SPRUX_CHECK_EQ(factorSkel.lumpToSpan[denseOpsFromLump], denseOpsFromLump);
     slvCtx->fragmentedMV(matData, inVecData, denseOpsFromLump, upToLump, outVecData, alpha);
     return;
   }
@@ -763,21 +763,21 @@ void Solver::internalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIn
 template <typename T>
 void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
                                         int64_t endSpanIndex, bool verbose) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
-  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_LE(endSpanIndex, canFactorUpTo);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
-  BASPACHO_SIGNPOST_BEGIN("createNumericCtx");
+  SPRUX_SIGNPOST_BEGIN("createNumericCtx");
   NumericCtxPtr<T> numCtx = symCtx->createNumericCtx<T>(maxElimTempSize, data);
-  BASPACHO_SIGNPOST_END("createNumericCtx");
+  SPRUX_SIGNPOST_END("createNumericCtx");
 
   // Compute effective static pivot threshold scaled by matrix diagonal magnitude.
-  BASPACHO_SIGNPOST_BEGIN("maxDiag");
+  SPRUX_SIGNPOST_BEGIN("maxDiag");
   if (staticPivotThreshold_ >= 0) {
     using ValT = typename std::remove_pointer<decltype(data)>::type;
     ValT epsScale = std::cbrt(std::numeric_limits<ValT>::epsilon());
@@ -790,14 +790,14 @@ void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startS
       effectiveStaticPivotThreshold_ = staticPivotThreshold_;
     }
   }
-  BASPACHO_SIGNPOST_END("maxDiag");
+  SPRUX_SIGNPOST_END("maxDiag");
 
   // LU sparse elimination: submit to GPU (deferred commit, not waited).
   using ValT = typename std::remove_pointer<decltype(data)>::type;
   ValT effectiveThreshold =
       (staticPivotThreshold_ >= 0) ? static_cast<ValT>(effectiveStaticPivotThreshold_) : ValT(-1);
 
-  BASPACHO_SIGNPOST_BEGIN("sparseElim");
+  SPRUX_SIGNPOST_BEGIN("sparseElim");
   if (!luElimCtxs.empty()) {
     if (startLump == 0 && upToLump >= sparseElimRanges.back()) {
       if (verbose) {
@@ -813,10 +813,10 @@ void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startS
     } else {
       for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
         if (sparseElimRanges[l + 1] > upToLump) {
-          BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+          SPRUX_CHECK_EQ(sparseElimRanges[l], upToLump);
           break;
         } else if (startLump > sparseElimRanges[l]) {
-          BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+          SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
           continue;
         }
         if (luElimCtxs[l]) {
@@ -832,7 +832,7 @@ void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startS
       }
     }
   }
-  BASPACHO_SIGNPOST_END("sparseElim");
+  SPRUX_SIGNPOST_END("sparseElim");
 
   // Store the numeric context for finishInternalFactorRangeLU to pick up.
   // Transfer ownership: NumericCtxPtr<T> (unique_ptr<NumericCtx<T>>) → unique_ptr<NumericCtxBase>.
@@ -842,10 +842,10 @@ void Solver::beginInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startS
 template <typename T>
 void Solver::finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t startSpanIndex,
                                          int64_t endSpanIndex, bool verbose) const {
-  BASPACHO_CHECK(pendingNumCtx_ != nullptr);
+  SPRUX_CHECK(pendingNumCtx_ != nullptr);
   // Recover the typed NumericCtx from the type-erased base pointer.
   NumericCtx<T>* numCtxRaw = dynamic_cast<NumericCtx<T>*>(pendingNumCtx_.get());
-  BASPACHO_CHECK(numCtxRaw != nullptr);
+  SPRUX_CHECK(numCtxRaw != nullptr);
 
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
@@ -857,14 +857,14 @@ void Solver::finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t start
   }
 
   // Wait for GPU sparse elimination to complete, enter CPU BLAS mode.
-  BASPACHO_SIGNPOST_BEGIN("beginDenseOps");
+  SPRUX_SIGNPOST_BEGIN("beginDenseOps");
   numCtxRaw->beginDenseOps(data, factorSkel.totalDataSize());
-  BASPACHO_SIGNPOST_END("beginDenseOps");
+  SPRUX_SIGNPOST_END("beginDenseOps");
 
-  BASPACHO_SIGNPOST_BEGIN("denseLoop");
+  SPRUX_SIGNPOST_BEGIN("denseLoop");
   using ClockT = std::chrono::high_resolution_clock;
   double totalBoardMs = 0, totalFactorMs = 0;
-  static const bool profileLU = std::getenv("BASPACHO_PROFILE_LU") != nullptr;
+  static const bool profileLU = std::getenv("SPRUX_PROFILE_LU") != nullptr;
   if (profileLU) verbose = true;
 
   for (int64_t l = std::max(startLump, denseOpsFromLump);
@@ -916,12 +916,12 @@ void Solver::finishInternalFactorRangeLU(T* data, int64_t* pivots, int64_t start
               << " factorMs=" << totalFactorMs << std::endl;
   }
 
-  BASPACHO_SIGNPOST_END("denseLoop");
+  SPRUX_SIGNPOST_END("denseLoop");
 
-  BASPACHO_SIGNPOST_BEGIN("flush");
+  SPRUX_SIGNPOST_BEGIN("flush");
   numCtxRaw->flush();
   staticPivotPerturbCount_ += numCtxRaw->deferredPerturbCount();
-  BASPACHO_SIGNPOST_END("flush");
+  SPRUX_SIGNPOST_END("flush");
 
   // Release the pending context.
   pendingNumCtx_.reset();
@@ -943,12 +943,12 @@ void Solver::factorLU(T* data, int64_t* pivots, NumericCtx<T>& numCtx, bool verb
 
   int64_t startSpanIndex = 0;
   int64_t endSpanIndex = factorSkel.numSpans();
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
-  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_LE(endSpanIndex, canFactorUpTo);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1064,8 +1064,8 @@ void Solver::factorLU(T* data, int64_t* devPivots, NumericCtx<T>& numCtx, PivotL
 
   if (!luElimCtxs.empty()) {
     // This overload always factorizes the full range (startLump==0, upToLump==numLumps).
-    BASPACHO_CHECK(startLump == 0);
-    BASPACHO_CHECK(upToLump >= sparseElimRanges.back());
+    SPRUX_CHECK(startLump == 0);
+    SPRUX_CHECK(upToLump >= sparseElimRanges.back());
     numCtx.doAllEliminationsLU(luElimCtxs, sparseElimRanges, data, effectiveThreshold,
                                staticPivotPerturbCount_);
   }
@@ -1119,7 +1119,7 @@ void Solver::finishFactorLU(T* data, int64_t* pivots, bool verbose) const {
 template <typename T>
 void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride,
                      int nRHS) const {
-  BASPACHO_SIGNPOST_BEGIN("solveSetup");
+  SPRUX_SIGNPOST_BEGIN("solveSetup");
   SolveCtxPtr<T> slvCtx = symCtx->createSolveCtx<T>(nRHS, matData);
 
   // After getrf, we have P * A = L * U (standard form).
@@ -1130,12 +1130,12 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
 
   // Pre-upload all pivots to GPU (avoids per-lump sync on GPU backends)
   slvCtx->uploadPivots(pivots, factorSkel.lumpStart[factorSkel.numLumps()]);
-  BASPACHO_SIGNPOST_END("solveSetup");
+  SPRUX_SIGNPOST_END("solveSetup");
 
   // Step 1: Apply row permutation P: y = P * b
   // Skip sparse-elim lumps when LU sparse elimination is active —
   // their pivots are identity (1x1 scalar blocks, no pivoting needed)
-  BASPACHO_SIGNPOST_BEGIN("solvePerm");
+  SPRUX_SIGNPOST_BEGIN("solvePerm");
   int64_t pivotStartLump =
       (!luElimCtxs.empty() && !sparseElimRanges.empty()) ? sparseElimRanges.back() : 0;
   if (slvCtx->hasBatchedDenseSolve() && pivotStartLump < factorSkel.numLumps()) {
@@ -1157,18 +1157,18 @@ void Solver::solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_
       slvCtx->applyRowPermVec(pivots + pivotOffset, lumpSize, vecData + lumpStart, stride);
     }
   }
-  BASPACHO_SIGNPOST_END("solvePerm");
+  SPRUX_SIGNPOST_END("solvePerm");
 
   // Step 2: Solve L * z = y (forward substitution with unit lower triangular L)
-  BASPACHO_SIGNPOST_BEGIN("solveL");
+  SPRUX_SIGNPOST_BEGIN("solveL");
   internalSolveLRangeUnit(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
-  BASPACHO_SIGNPOST_END("solveL");
+  SPRUX_SIGNPOST_END("solveL");
 
   // Step 3: Solve U * x = z (backward substitution with U factor)
-  BASPACHO_SIGNPOST_BEGIN("solveU");
+  SPRUX_SIGNPOST_BEGIN("solveU");
   internalSolveURange(*slvCtx, matData, 0, factorSkel.numSpans(), vecData, stride, nRHS);
   slvCtx->flush();  // Final flush: ensure all GPU solve work is complete
-  BASPACHO_SIGNPOST_END("solveU");
+  SPRUX_SIGNPOST_END("solveU");
 }
 
 // Persistent-context overload: reuses caller-provided SolveCtx across calls.
@@ -1402,11 +1402,11 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
                                      int64_t endSpanIndex, T* vecData, int64_t stride,
                                      int nRHS) const {
   (void)nRHS;
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1415,10 +1415,10 @@ void Solver::internalSolveLRangeUnit(SolveCtx<T>& slvCtx, const T* matData, int6
     // Use LU sparse elimination solve for the sparse-elim ranges (Metal backend)
     for (int64_t l = 0; l + 1 < (int64_t)sparseElimRanges.size(); l++) {
       if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_EQ(sparseElimRanges[l], upToLump);
+        SPRUX_CHECK_EQ(sparseElimRanges[l], upToLump);
         return;
       } else if (startLump > sparseElimRanges[l]) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
         continue;
       }
       slvCtx.sparseElimSolveLUnit(*elimCtxs[l], matData, sparseElimRanges[l],
@@ -1493,11 +1493,11 @@ template <typename T>
 void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                  int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const {
   (void)nRHS;  // Used implicitly in slvCtx
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1564,10 +1564,10 @@ void Solver::internalSolveURange(SolveCtx<T>& slvCtx, const T* matData, int64_t 
   if (SparseElimSolve && !luElimCtxs.empty()) {
     for (int64_t l = (int64_t)sparseElimRanges.size() - 2; l >= 0; l--) {
       if (sparseElimRanges[l + 1] > upToLump) {
-        BASPACHO_CHECK_LE(sparseElimRanges[l], upToLump);
+        SPRUX_CHECK_LE(sparseElimRanges[l], upToLump);
         continue;
       } else if (sparseElimRanges[l] < startLump) {
-        BASPACHO_CHECK_GE(startLump, sparseElimRanges[l + 1]);
+        SPRUX_CHECK_GE(startLump, sparseElimRanges[l + 1]);
         return;
       }
       slvCtx.sparseElimSolveU(*elimCtxs[l], matData, sparseElimRanges[l],
@@ -1695,12 +1695,12 @@ void Solver::eliminateBoardLDLT(NumericCtx<T>& numCtx, T* data, int64_t ptr) con
 template <typename T>
 void Solver::internalFactorRangeLDLT(T* data, int64_t startSpanIndex, int64_t endSpanIndex,
                                      bool verbose) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
-  BASPACHO_CHECK_LE(endSpanIndex, canFactorUpTo);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_LE(endSpanIndex, canFactorUpTo);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1765,11 +1765,11 @@ void Solver::internalSolveLRangeLDLT(SolveCtx<T>& slvCtx, const T* matData, int6
                                      int64_t endSpanIndex, T* vecData, int64_t stride,
                                      int nRHS) const {
   (void)nRHS;
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1805,9 +1805,9 @@ template <typename T>
 void Solver::internalSolveDRange(SolveCtx<T>& slvCtx, const T* matData, int64_t startSpanIndex,
                                  int64_t endSpanIndex, T* vecData, int64_t stride, int nRHS) const {
   (void)nRHS;
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -1827,11 +1827,11 @@ void Solver::internalSolveLtRangeLDLT(SolveCtx<T>& slvCtx, const T* matData, int
                                       int64_t endSpanIndex, T* vecData, int64_t stride,
                                       int nRHS) const {
   (void)nRHS;
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LE(startSpanIndex, endSpanIndex);
-  BASPACHO_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
-  BASPACHO_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LE(startSpanIndex, endSpanIndex);
+  SPRUX_CHECK_LT(endSpanIndex, (int64_t)factorSkel.spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_EQ(factorSkel.spanOffsetInLump[endSpanIndex], 0);
   int64_t startLump = factorSkel.spanToLump[startSpanIndex];
   int64_t upToLump = factorSkel.spanToLump[endSpanIndex];
 
@@ -2011,13 +2011,13 @@ void Solver::resetStats() {
 
 BackendType detectBestBackend() {
   // Priority: CUDA > Metal > OpenCL > Fast (CPU)
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   // TODO: Could add runtime CUDA device detection here
   return BackendCuda;
-#elif defined(BASPACHO_USE_METAL)
+#elif defined(SPRUX_USE_METAL)
   // Metal is available on macOS with Apple Silicon
   return BackendMetal;
-#elif defined(BASPACHO_USE_OPENCL)
+#elif defined(SPRUX_USE_OPENCL)
   // OpenCL is a portable fallback
   return BackendOpenCL;
 #else
@@ -2036,21 +2036,21 @@ OpsPtr getBackend(const Settings& settings) {
   if (backend == BackendFast) {
     return fastOps(settings.numThreads);
   } else if (backend == BackendCuda) {
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
     return cudaOps();
 #else
     std::cerr << "Baspacho: CUDA not enabled at compile time" << std::endl;
     abort();
 #endif
   } else if (backend == BackendMetal) {
-#ifdef BASPACHO_USE_METAL
+#ifdef SPRUX_USE_METAL
     return metalOps();
 #else
     std::cerr << "Baspacho: Metal not enabled at compile time" << std::endl;
     abort();
 #endif
   } else if (backend == BackendOpenCL) {
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
     return openclOps();
 #else
     std::cerr << "Baspacho: OpenCL not enabled at compile time" << std::endl;
@@ -2065,22 +2065,22 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
                        const SparseStructure& ss_, const std::vector<int64_t>& sparseElimRanges,
                        const unordered_set<int64_t>& elimLastIds) {
   // no point in providing "elim last" ids if not allowing solve up to such set
-  BASPACHO_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
+  SPRUX_CHECK(settings.addFillPolicy == AddFillComplete || elimLastIds.empty());
 
   // validate supernode merging settings
-  BASPACHO_CHECK_GE(settings.supernodeMergeFillTolerance, 0.0);
-  BASPACHO_CHECK_LE(settings.supernodeMergeFillTolerance, 1.0);
-  BASPACHO_CHECK_GE(settings.maxSupernodeSize, (int64_t)0);
+  SPRUX_CHECK_GE(settings.supernodeMergeFillTolerance, 0.0);
+  SPRUX_CHECK_LE(settings.supernodeMergeFillTolerance, 1.0);
+  SPRUX_CHECK_GE(settings.maxSupernodeSize, (int64_t)0);
 
   // validate static pivoting threshold
-  BASPACHO_CHECK_GE(settings.staticPivotThreshold, -1.0);
+  SPRUX_CHECK_GE(settings.staticPivotThreshold, -1.0);
 
-  BASPACHO_CHECK((int64_t)sparseElimRanges.size() != 1);
+  SPRUX_CHECK((int64_t)sparseElimRanges.size() != 1);
   int64_t givenSparseElimEnd = sparseElimRanges.empty() ? 0 : sparseElimRanges.back();
   if (!sparseElimRanges.empty()) {
-    BASPACHO_CHECK(isStrictlyIncreasing(sparseElimRanges, 0, sparseElimRanges.size()));
+    SPRUX_CHECK(isStrictlyIncreasing(sparseElimRanges, 0, sparseElimRanges.size()));
     for (int64_t id : elimLastIds) {
-      BASPACHO_CHECK_GE(id, givenSparseElimEnd);
+      SPRUX_CHECK_GE(id, givenSparseElimEnd);
     }
   }
 
@@ -2195,7 +2195,7 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   fullLumpToSpan.resize(givenSparseElimEnd);
   ::std::iota(fullLumpToSpan.begin(), fullLumpToSpan.begin() + givenSparseElimEnd, 0);
   shiftConcat(fullLumpToSpan, givenSparseElimEnd, et.lumpToSpan.begin(), et.lumpToSpan.end());
-  BASPACHO_CHECK_EQ((int64_t)fullSpanStart.size() - 1, fullLumpToSpan.back());
+  SPRUX_CHECK_EQ((int64_t)fullSpanStart.size() - 1, fullLumpToSpan.back());
 
   // matrix with blocks not joined, we will need the first columns
   SparseStructure sortedSsT = ss.symmetricPermutation(fullInvPerm, false).transpose();
@@ -2207,7 +2207,7 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
                       sortedSsT.ptrs.begin() + givenSparseElimEnd);
   int64_t elimEndDataPtr = sortedSsT.ptrs[givenSparseElimEnd];
   shiftConcat(fullColStart, elimEndDataPtr, et.colStart.begin(), et.colStart.end());
-  BASPACHO_CHECK_EQ(fullColStart.size(), fullLumpToSpan.size());
+  SPRUX_CHECK_EQ(fullColStart.size(), fullLumpToSpan.size());
 
   // fullRowParam joining sortedSsT.inds and et.rowParam (moved)
   vector<int64_t> fullRowParam;
@@ -2215,7 +2215,7 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
   fullRowParam.insert(fullRowParam.begin(), sortedSsT.inds.begin(),
                       sortedSsT.inds.begin() + elimEndDataPtr);
   shiftConcat(fullRowParam, givenSparseElimEnd, et.rowParam.begin(), et.rowParam.end());
-  BASPACHO_CHECK_EQ((int64_t)fullRowParam.size(), fullColStart.back());
+  SPRUX_CHECK_EQ((int64_t)fullRowParam.size(), fullColStart.back());
 
   CoalescedBlockMatrixSkel factorSkel(fullSpanStart, fullLumpToSpan, fullColStart, fullRowParam);
 

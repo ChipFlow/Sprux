@@ -38,7 +38,7 @@ namespace fs = std::filesystem;
 
 // Try to find a test_data subdirectory relative to common build locations.
 static string findTestDataDir(const string& subdir) {
-  const char* envDir = getenv("BASPACHO_TEST_DATA_DIR");
+  const char* envDir = getenv("SPRUX_TEST_DATA_DIR");
   if (envDir) {
     string candidate = string(envDir) + "/" + subdir;
     if (fs::is_directory(candidate)) return candidate;
@@ -182,7 +182,7 @@ TEST(SequenceSolve, RingOscillator) {
     EXPECT_LT(residual, 1e-6) << "Matrix #" << i << " residual too large: " << residual;
 
     // Dump solution for external comparison (e.g., scipy)
-    if (getenv("BASPACHO_DUMP_SOLUTIONS")) {
+    if (getenv("SPRUX_DUMP_SOLUTIONS")) {
       cout << "SOLUTION_DUMP:" << i << ":";
       for (int64_t j = 0; j < n; j++) {
         if (j > 0) cout << " ";

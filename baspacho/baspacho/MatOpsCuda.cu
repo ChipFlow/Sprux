@@ -186,7 +186,7 @@ struct CudaSymbolicCtx : SymbolicCtx {
 
     // Build element-level work items for two-phase deterministic elimination.
     // Expand each block pair into individual element dot products.
-    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+    SPRUX_CHECK(skel.totalDataSize() < INT32_MAX);
 
     vector<CudaCholWorkItem> cholItems;
     cholItems.reserve(elim->numBlockPairs * 4);  // heuristic: ~4 elements per block pair
@@ -312,7 +312,7 @@ struct CudaSymbolicCtx : SymbolicCtx {
     elim->makeBlockPairEnumStraight.load(pairEnum);
 
     // Pre-compute LU work items for two-phase elimination
-    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+    SPRUX_CHECK(skel.totalDataSize() < INT32_MAX);
     int64_t upperDataBase = skel.dataSize();
 
     vector<CudaLUWorkItem> workItems;
@@ -1358,7 +1358,7 @@ struct CudaNumericCtx : NumericCtx<T> {
                              int64_t lumpsEnd) override {
     if (recordingMode_) return;
     const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CudaSymElimCtx& elim = *pElim;
 
     auto timer = elim.elimStat.instance<CudaSyncOps>();
@@ -1523,7 +1523,7 @@ struct CudaNumericCtx : NumericCtx<T> {
     if (recordingMode_) return;
 
     const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CudaSymElimCtx& elim = *pElim;
 
     int64_t numLumps = lumpsEnd - lumpsBegin;
@@ -1621,7 +1621,7 @@ struct CudaNumericCtx : NumericCtx<T> {
       auto [startIdx, count] = recordedFlushPoints_[precomputedFlushIdx_];
       precomputedFlushIdx_++;
       if (count == 0) return;
-      BASPACHO_CHECK(precomputedDataPtr_ != nullptr);
+      SPRUX_CHECK(precomputedDataPtr_ != nullptr);
       int wgs = 256;
       int numBlocks = ((int)count + wgs - 1) / wgs;
       GemmWorkItem* devItems = reinterpret_cast<GemmWorkItem*>(devPrecomputedItems_.ptr) + startIdx;
@@ -2143,14 +2143,14 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
   virtual ~CudaNumericCtx() override {}
 
   virtual void pseudoFactorSpans(vector<T*>* data, int64_t spanBegin, int64_t spanEnd) override {
-    BASPACHO_UNUSED(data, spanBegin, spanEnd);
+    SPRUX_UNUSED(data, spanBegin, spanEnd);
     throw std::runtime_error("pseudo factor not implemented for batched ops");
   }
 
   virtual void doElimination(const SymElimCtx& elimData, vector<T*>* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
     const CudaSymElimCtx* pElim = dynamic_cast<const CudaSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CudaSymElimCtx& elim = *pElim;
 
     auto timer = elim.elimStat.instance<CudaSyncOps>();
@@ -2216,7 +2216,7 @@ struct CudaNumericCtx<vector<T*>> : NumericCtx<vector<T*>> {
                         int64_t dstStride,  //
                         int64_t srcColDataOffset, int64_t srcRectWidth, int64_t numBlockRows,
                         int64_t numBlockCols) override {
-    BASPACHO_CHECK_LE(data->size(), devTempBufs.size());
+    SPRUX_CHECK_LE(data->size(), devTempBufs.size());
     auto timer = sym.asmblStat.instance<CudaSyncOps>(sizeof(T) + data->size() * 100, numBlockRows,
                                                      numBlockCols);
     devPtrsA.load(*data, 0);
@@ -2311,7 +2311,7 @@ void CudaNumericCtx<vector<float*>>::trsm(int64_t n, int64_t k, vector<float*>* 
 template <>
 void CudaNumericCtx<vector<double*>>::saveSyrkGemm(int64_t m, int64_t n, int64_t k,
                                                    const vector<double*>* data, int64_t offset) {
-  BASPACHO_CHECK_LE(data->size(), devTempBufs.size());
+  SPRUX_CHECK_LE(data->size(), devTempBufs.size());
   auto timer = sym.sygeStat.instance<CudaSyncOps>(sizeof(double) + data->size() * 100, m, n, k);
   devPtrsA.load(*data, offset);
   double alpha(1.0), beta(0.0);
@@ -2324,7 +2324,7 @@ void CudaNumericCtx<vector<double*>>::saveSyrkGemm(int64_t m, int64_t n, int64_t
 template <>
 void CudaNumericCtx<vector<float*>>::saveSyrkGemm(int64_t m, int64_t n, int64_t k,
                                                   const vector<float*>* data, int64_t offset) {
-  BASPACHO_CHECK_LE(data->size(), devTempBufs.size());
+  SPRUX_CHECK_LE(data->size(), devTempBufs.size());
   auto timer = sym.sygeStat.instance<CudaSyncOps>(sizeof(float) + data->size() * 100, m, n, k);
   devPtrsA.load(*data, offset);
   float alpha(1.0), beta(0.0);
@@ -3088,7 +3088,7 @@ void CudaSolveCtx<vector<double*>>::symm(const vector<double*>* data, int64_t of
                                          const vector<double*>* C, int64_t offC, int64_t ldc,
                                          vector<double*>* D, int64_t ldd, double alpha) {
   auto timer = sym.symmStat.instance<CudaSyncOps>();
-  BASPACHO_UNUSED(data, offset, n, C, offC, ldc, D, ldd, alpha);
+  SPRUX_UNUSED(data, offset, n, C, offC, ldc, D, ldd, alpha);
   throw std::runtime_error("symm not implemented for batched ops");
 }
 
@@ -3097,7 +3097,7 @@ void CudaSolveCtx<vector<float*>>::symm(const vector<float*>* data, int64_t offs
                                         const vector<float*>* C, int64_t offC, int64_t ldc,
                                         vector<float*>* D, int64_t ldd, float alpha) {
   auto timer = sym.symmStat.instance<CudaSyncOps>();
-  BASPACHO_UNUSED(data, offset, n, C, offC, ldc, D, ldd, alpha);
+  SPRUX_UNUSED(data, offset, n, C, offC, ldc, D, ldd, alpha);
   throw std::runtime_error("symm not implemented for batched ops");
 }
 
@@ -3204,10 +3204,10 @@ void CudaSolveCtx<vector<float*>>::gemvT(const vector<float*>* data, int64_t off
 NumericCtxBase* CudaSymbolicCtx::createNumericCtxForType(type_index tIdx, int64_t tempBufSize,
                                                          int batchSize) {
   if (tIdx == type_index(typeid(double))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new CudaNumericCtx<double>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else if (tIdx == type_index(typeid(float))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new CudaNumericCtx<float>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else if (tIdx == type_index(typeid(vector<double*>))) {
     return new CudaNumericCtx<vector<double*>>(*this, tempBufSize, skel.spanStart.size() - 1,
@@ -3222,10 +3222,10 @@ NumericCtxBase* CudaSymbolicCtx::createNumericCtxForType(type_index tIdx, int64_
 
 SolveCtxBase* CudaSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS, int batchSize) {
   if (tIdx == type_index(typeid(double))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new CudaSolveCtx<double>(*this, nRHS);
   } else if (tIdx == type_index(typeid(float))) {
-    BASPACHO_CHECK_EQ(batchSize, 1);
+    SPRUX_CHECK_EQ(batchSize, 1);
     return new CudaSolveCtx<float>(*this, nRHS);
   } else if (tIdx == type_index(typeid(vector<double*>))) {
     return new CudaSolveCtx<vector<double*>>(*this, nRHS, batchSize);

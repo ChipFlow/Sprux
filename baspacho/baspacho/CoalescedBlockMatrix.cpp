@@ -19,12 +19,12 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
                                                    const vector<int64_t>& colPtr,
                                                    const vector<int64_t>& rowInd)
     : spanStart(spanStart), lumpToSpan(lumpToSpan) {
-  BASPACHO_CHECK_GE(spanStart.size(), lumpToSpan.size());
-  BASPACHO_CHECK_GE((int64_t)lumpToSpan.size(), 1);
-  BASPACHO_CHECK_EQ((int64_t)spanStart.size() - 1, lumpToSpan[lumpToSpan.size() - 1]);
-  BASPACHO_CHECK_EQ(colPtr.size(), lumpToSpan.size());
-  BASPACHO_CHECK(isStrictlyIncreasing(spanStart, 0, spanStart.size()));
-  BASPACHO_CHECK(isStrictlyIncreasing(lumpToSpan, 0, lumpToSpan.size()));
+  SPRUX_CHECK_GE(spanStart.size(), lumpToSpan.size());
+  SPRUX_CHECK_GE((int64_t)lumpToSpan.size(), 1);
+  SPRUX_CHECK_EQ((int64_t)spanStart.size() - 1, lumpToSpan[lumpToSpan.size() - 1]);
+  SPRUX_CHECK_EQ(colPtr.size(), lumpToSpan.size());
+  SPRUX_CHECK(isStrictlyIncreasing(spanStart, 0, spanStart.size()));
+  SPRUX_CHECK(isStrictlyIncreasing(lumpToSpan, 0, lumpToSpan.size()));
 
   int64_t totSize = spanStart[spanStart.size() - 1];
   int64_t numSpans = spanStart.size() - 1;
@@ -59,7 +59,7 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
   for (int64_t l = 0; l < numLumps; l++) {
     int64_t colStart = colPtr[l];
     int64_t colEnd = colPtr[l + 1];
-    BASPACHO_CHECK(isStrictlyIncreasing(rowInd, colStart, colEnd));
+    SPRUX_CHECK(isStrictlyIncreasing(rowInd, colStart, colEnd));
     int64_t lSpanBegin = lumpToSpan[l];
     int64_t lSpanEnd = lumpToSpan[l + 1];
     int64_t lSpanSize = lSpanEnd - lSpanBegin;
@@ -68,11 +68,11 @@ CoalescedBlockMatrixSkel::CoalescedBlockMatrixSkel(const vector<int64_t>& spanSt
     // check the initial section is the set of params from `a`, and
     // therefore the full diagonal block is contained in the matrix
     // Column must contain full diagonal block:
-    BASPACHO_CHECK_GE(colEnd - colStart, lSpanSize);
+    SPRUX_CHECK_GE(colEnd - colStart, lSpanSize);
     // Column data must start at diagonal block:
-    BASPACHO_CHECK_EQ(rowInd[colStart], lSpanBegin);
+    SPRUX_CHECK_EQ(rowInd[colStart], lSpanBegin);
     // Column must contain full diagonal block:
-    BASPACHO_CHECK_EQ(rowInd[colStart + lSpanSize - 1], lSpanEnd - 1);
+    SPRUX_CHECK_EQ(rowInd[colStart + lSpanSize - 1], lSpanEnd - 1);
 
     chainColPtr[l] = chainRowSpan.size();
     boardColPtr[l] = boardRowLump.size();
@@ -125,9 +125,9 @@ template <typename T>
 void CoalescedBlockMatrixSkel::densify(Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>& dense,
                                        const T* data, bool fillUpperHalf,
                                        int64_t startSpanIndex) const {
-  BASPACHO_CHECK_GE(startSpanIndex, 0);
-  BASPACHO_CHECK_LT(startSpanIndex, (int64_t)spanOffsetInLump.size());
-  BASPACHO_CHECK_EQ(spanOffsetInLump[startSpanIndex], 0);
+  SPRUX_CHECK_GE(startSpanIndex, 0);
+  SPRUX_CHECK_LT(startSpanIndex, (int64_t)spanOffsetInLump.size());
+  SPRUX_CHECK_EQ(spanOffsetInLump[startSpanIndex], 0);
   int64_t startLump = spanToLump[startSpanIndex];
 
   int64_t offset = spanStart[startSpanIndex];
@@ -161,7 +161,7 @@ template <typename T>
 Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> CoalescedBlockMatrixSkel::densify(
     const std::vector<T>& data, bool fillUpperHalf) const {
   int64_t totData = chainData[chainData.size() - 1];
-  BASPACHO_CHECK_EQ(totData, (int64_t)data.size());
+  SPRUX_CHECK_EQ(totData, (int64_t)data.size());
 
   Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> dense;
   densify(dense, data.data(), fillUpperHalf);
@@ -172,7 +172,7 @@ Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> CoalescedBlockMatrixSkel::densi
 template <typename T>
 void CoalescedBlockMatrixSkel::damp(std::vector<T>& data, T alpha, T beta) const {
   int64_t totData = chainData[chainData.size() - 1];
-  BASPACHO_CHECK_EQ(totData, (int64_t)data.size());
+  SPRUX_CHECK_EQ(totData, (int64_t)data.size());
 
   for (size_t a = 0; a < chainColPtr.size() - 1; a++) {
     int64_t aStart = lumpStart[a];

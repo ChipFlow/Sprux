@@ -62,7 +62,7 @@ using Mat16 = Eigen::Matrix<double, 1, 6>;
 
 // t ~= a + b*n + c*n^2 + d*n^3
 Vec4 optimizePotrfModel(const vector<vector<double>>& samples) {
-  BASPACHO_CHECK_EQ(samples[0].size(), 2);
+  SPRUX_CHECK_EQ(samples[0].size(), 2);
   double n3coeff_sum = 0.0;
   for (auto& nt : samples) {
     double n = nt[0], t = nt[1];
@@ -101,7 +101,7 @@ Vec4 optimizePotrfModel(const vector<vector<double>>& samples) {
 
 // t ~= a + b*n + c*n^2 + (d + e*n + f*n^2)*k
 Vec6 optimizeTrsmModel(const vector<vector<double>>& samples) {
-  BASPACHO_CHECK_EQ(samples[0].size(), 3);
+  SPRUX_CHECK_EQ(samples[0].size(), 3);
   double n2k_coeff_sum = 0.0;
   for (auto& nkt : samples) {
     double n = nkt[0], k = nkt[1], t = nkt[2];
@@ -142,7 +142,7 @@ Vec6 optimizeTrsmModel(const vector<vector<double>>& samples) {
 // symmetrized in m,n it becomes (putting u=m+n, v=mn the basis of sym functions):
 //   t ~= a + b*u + c*v + d*k + e*u*k + f*v*k
 Vec6 optimizeSygeModel(const vector<vector<double>>& samples) {
-  BASPACHO_CHECK_EQ(samples[0].size(), 4);
+  SPRUX_CHECK_EQ(samples[0].size(), 4);
   double mnk_coeff_sum = 0.0;
   for (auto& mnkt : samples) {
     double m = mnkt[0], n = mnkt[1], k = mnkt[2], t = mnkt[3];
@@ -182,7 +182,7 @@ Vec6 optimizeSygeModel(const vector<vector<double>>& samples) {
 
 // t ~= a + b*br + c*bc + d*br*bc
 Vec4 optimizeAsmblModel(const vector<vector<double>>& samples) {
-  BASPACHO_CHECK_EQ(samples[0].size(), 3);
+  SPRUX_CHECK_EQ(samples[0].size(), 3);
   double brbc_coeff_sum = 0.0;
   for (auto& brbct : samples) {
     double br = brbct[0], bc = brbct[1], t = brbct[2];
@@ -261,25 +261,25 @@ int main(int argc, char* argv[]) {
 
   if (!potrf.empty()) {
     auto csvData = loadCsv(potrf);
-    BASPACHO_CHECK(!csvData.empty());
+    SPRUX_CHECK(!csvData.empty());
     model.potrfParams = optimizePotrfModel(csvData);
   }
 
   if (!trsm.empty()) {
     auto csvData = loadCsv(trsm);
-    BASPACHO_CHECK(!csvData.empty());
+    SPRUX_CHECK(!csvData.empty());
     model.trsmParams = optimizeTrsmModel(csvData);
   }
 
   if (!syge.empty()) {
     auto csvData = loadCsv(syge);
-    BASPACHO_CHECK(!csvData.empty());
+    SPRUX_CHECK(!csvData.empty());
     model.sygeParams = optimizeSygeModel(csvData);
   }
 
   if (!asmbl.empty()) {
     auto csvData = loadCsv(asmbl);
-    BASPACHO_CHECK(!csvData.empty());
+    SPRUX_CHECK(!csvData.empty());
     model.asmblParams = optimizeAsmblModel(csvData);
   }
 

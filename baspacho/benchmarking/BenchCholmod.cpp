@@ -32,7 +32,7 @@ CholmodBenchResults benchmarkCholmodSolve(const vector<int64_t>& paramSize,
     ss = ssOrig;
   }
 
-  BASPACHO_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
+  SPRUX_CHECK_EQ(paramSize.size(), ss.ptrs.size() - 1);
   vector<int64_t> rowPtr, colInd;
   vector<double> val;
   vector<int64_t> spanStart = paramSize;
@@ -103,7 +103,7 @@ CholmodBenchResults benchmarkCholmodSolve(const vector<int64_t>& paramSize,
   if (verbose >= 2) {
     std::cout << "Analysis time: " << analysisTime << "s" << std::endl;
   }
-  BASPACHO_CHECK_EQ(cc_.status, CHOLMOD_OK);
+  SPRUX_CHECK_EQ(cc_.status, CHOLMOD_OK);
 
   if (verbose >= 2) {
     std::cout << "Factoring..." << std::endl;

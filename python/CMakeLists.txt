@@ -12,32 +12,32 @@ cmake_minimum_required(VERSION 3.18)
 find_package(pybind11 REQUIRED)
 
 # Create the Python module
-pybind11_add_module(baspacho_py baspacho_bindings.cpp)
+pybind11_add_module(sprux_py baspacho_bindings.cpp)
 
-# Link against baspacho library
-target_link_libraries(baspacho_py PRIVATE baspacho)
+# Link against Sprux library
+target_link_libraries(sprux_py PRIVATE ${SPRUX_LIBRARY})
 
 # Include directories
-target_include_directories(baspacho_py PRIVATE
+target_include_directories(sprux_py PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/baspacho
 )
 
 # Propagate backend definitions
-if(BASPACHO_USE_METAL)
-    target_compile_definitions(baspacho_py PRIVATE BASPACHO_USE_METAL)
+if(SPRUX_USE_METAL)
+    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_METAL)
 endif()
 
-if(BASPACHO_USE_CUDA)
-    target_compile_definitions(baspacho_py PRIVATE BASPACHO_USE_CUDA)
+if(SPRUX_USE_CUDA)
+    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_CUDA)
 endif()
 
-if(BASPACHO_USE_OPENCL)
-    target_compile_definitions(baspacho_py PRIVATE BASPACHO_USE_OPENCL)
+if(SPRUX_USE_OPENCL)
+    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_OPENCL)
 endif()
 
 # Install the module
-install(TARGETS baspacho_py
+install(TARGETS sprux_py
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/python
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )

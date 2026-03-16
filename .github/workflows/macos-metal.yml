@@ -54,10 +54,10 @@ jobs:
         export CPPFLAGS="-I$(brew --prefix openblas)/include"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=ON \
-          -DBASPACHO_BUILD_TESTS=ON \
-          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
           -DBLA_VENDOR=OpenBLAS \
           -DCMAKE_PREFIX_PATH="$(brew --prefix openblas)"
 
@@ -105,10 +105,10 @@ jobs:
         export CPPFLAGS="-I$(brew --prefix openblas)/include"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=ON \
-          -DBASPACHO_BUILD_TESTS=OFF \
-          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON \
           -DBLA_VENDOR=OpenBLAS \
           -DCMAKE_PREFIX_PATH="$(brew --prefix openblas)"
 
@@ -126,7 +126,7 @@ jobs:
         ITERATIONS="${{ github.event.inputs.benchmark_iterations || '3' }}"
         PROBLEM_FILTER="${{ github.event.inputs.problem_filter || '' }}"
 
-        echo "=== Running BaSpaCho Benchmarks ===" | tee benchmark_output.txt
+        echo "=== Running Sprux Benchmarks ===" | tee benchmark_output.txt
         echo "Iterations per problem: $ITERATIONS" | tee -a benchmark_output.txt
         echo "Date: $(date)" | tee -a benchmark_output.txt
         echo "" | tee -a benchmark_output.txt

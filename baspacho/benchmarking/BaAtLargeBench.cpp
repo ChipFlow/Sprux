@@ -15,11 +15,11 @@
 #include "baspacho/benchmarking/BaAtLarge.h"
 #include "baspacho/testing/TestingUtils.h"
 
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
 #include "baspacho/baspacho/CudaDefs.h"
 #endif
 
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
 #include "BenchCholmod.h"
 #endif
 
@@ -128,15 +128,15 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
     cout << "Cam-Cam Factor Time..: " << secondsToString(factorTime - elimTime) << endl << endl;
   }
 
-#if defined(BASPACHO_USE_CUBLAS) || defined(BASPACHO_HAVE_CHOLMOD)
+#if defined(SPRUX_USE_CUBLAS) || defined(SPRUX_HAVE_CHOLMOD)
   // create cam-cam system
   vector<int64_t> camSz(numCams, nCameraParams);
   SparseStructure elimPtSs = origSs.addIndependentEliminationFill(0, numPts);
   SparseStructure camCamSs = elimPtSs.extractRightBottom(numPts);
-#endif  // defined(BASPACHO_USE_CUBLAS) || defined(BASPACHO_HAVE_CHOLMOD)
+#endif  // defined(SPRUX_USE_CUBLAS) || defined(SPRUX_HAVE_CHOLMOD)
 
   // test Cuda
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   {
     cout << "===========================================" << endl;
     cout << "Testing CUDA (on full Points+Cameras system)" << endl;
@@ -177,10 +177,10 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
     cout << "Point Schur-Elim Time: " << secondsToString(elimTime) << endl;
     cout << "Cam-Cam Factor Time..: " << secondsToString(factorTime - elimTime) << endl << endl;
   }
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
 
   // test Cuda
-#ifdef BASPACHO_USE_CUBLAS
+#ifdef SPRUX_USE_CUBLAS
   {
     cout << "===========================================" << endl;
     cout << "Testing CUDA (on reduced Camera-Camera matrix)" << endl;
@@ -215,10 +215,10 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
     cout << "Cam-Cam Analysis Time: " << secondsToString(analysisTime) << endl;
     cout << "Cam-Cam Factor Time..: " << secondsToString(factorTime) << endl << endl;
   }
-#endif  // BASPACHO_USE_CUBLAS
+#endif  // SPRUX_USE_CUBLAS
 
   // test Cholmod
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
   {
     cout << "===========================================" << endl;
     cout << "Testing CHOLMOD (on reduced Camera-Camera matrix)" << endl;
@@ -234,7 +234,7 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
       cout << "Cam-Cam Solve-" << nRHS << " Time.: " << secondsToString(timing) << endl;
     }
   }
-#endif  // BASPACHO_HAVE_CHOLMOD
+#endif  // SPRUX_HAVE_CHOLMOD
 }
 
 void help() {

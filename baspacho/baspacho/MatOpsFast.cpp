@@ -12,16 +12,16 @@
 #include "baspacho/baspacho/MatOpsCpuBase.h"
 #include "baspacho/baspacho/Utils.h"
 
-#ifdef BASPACHO_USE_BLAS
-#ifdef BASPACHO_USE_MKL
+#ifdef SPRUX_USE_BLAS
+#ifdef SPRUX_USE_MKL
 #include "mkl.h"
 #define BLAS_INT MKL_INT
-#define BASPACHO_USE_TRSM_WORAROUND 0
+#define SPRUX_USE_TRSM_WORAROUND 0
 #else
 #include "baspacho/baspacho/BlasDefs.h"
-#define BASPACHO_USE_TRSM_WORAROUND 1
+#define SPRUX_USE_TRSM_WORAROUND 1
 #endif
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
 namespace BaSpaCho {
 
@@ -83,7 +83,7 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
   virtual void doElimination(const SymElimCtx& elimData, T* data, int64_t lumpsBegin,
                              int64_t lumpsEnd) override {
     const CpuBaseSymElimCtx* pElim = dynamic_cast<const CpuBaseSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CpuBaseSymElimCtx& elim = *pElim;
     const CoalescedBlockMatrixSkel& skel = sym.skel;
     auto timer = elim.elimStat.instance();
@@ -147,7 +147,7 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
     }
   }
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
   virtual void potrf(int64_t n, T* data, int64_t offA) override;
 
   virtual void trsm(int64_t n, int64_t k, T* data, int64_t offA, int64_t offB) override;
@@ -170,7 +170,7 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
   virtual void saveGemm(int64_t m, int64_t n, int64_t k, const T* L, int64_t offL, int64_t ldL,
                         const T* U, int64_t offU, int64_t ldU, T* C, int64_t offC,
                         int64_t ldC) override;
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
   virtual int64_t perturbSmallDiagonals(int64_t n, T* data, int64_t offset, int64_t stride,
                                         T threshold) override {
@@ -266,7 +266,7 @@ struct BlasNumericCtx : CpuBaseNumericCtx<T> {
   const BlasSymbolicCtx& sym;
 };
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
 template <>
 void BlasNumericCtx<double>::potrf(int64_t n, double* data, int64_t offA) {
   auto timer = sym.potrfStat.instance(sizeof(double), n);
@@ -288,7 +288,7 @@ void BlasNumericCtx<double>::trsm(int64_t n, int64_t k, double* data, int64_t of
   auto timer = sym.trsmStat.instance(sizeof(double), n, k);
 
   // TSRM should be fast but appears very slow in OpenBLAS
-  static constexpr bool slowTrsmWorkaround = BASPACHO_USE_TRSM_WORAROUND;
+  static constexpr bool slowTrsmWorkaround = SPRUX_USE_TRSM_WORAROUND;
   if (slowTrsmWorkaround) {
     using MatCMajD = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
@@ -313,7 +313,7 @@ void BlasNumericCtx<float>::trsm(int64_t n, int64_t k, float* data, int64_t offA
   auto timer = sym.trsmStat.instance(sizeof(float), n, k);
 
   // TSRM should be fast but appears very slow in OpenBLAS
-  static constexpr bool slowTrsmWorkaround = BASPACHO_USE_TRSM_WORAROUND;
+  static constexpr bool slowTrsmWorkaround = SPRUX_USE_TRSM_WORAROUND;
   if (slowTrsmWorkaround) {
     using MatCMajD = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
@@ -337,7 +337,7 @@ template <>
 void BlasNumericCtx<double>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const double* data,
                                           int64_t offset) {
   auto timer = sym.sygeStat.instance(sizeof(double), m, n, k);
-  BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+  SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
   // in some cases it could be faster with syrk+gemm
   // as it saves some computation, not the case in practice
@@ -365,7 +365,7 @@ template <>
 void BlasNumericCtx<float>::saveSyrkGemm(int64_t m, int64_t n, int64_t k, const float* data,
                                          int64_t offset) {
   auto timer = sym.sygeStat.instance(sizeof(float), m, n, k);
-  BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+  SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
   // in some cases it could be faster with syrk+gemm
   // as it saves some computation, not the case in practice
@@ -553,7 +553,7 @@ void BlasNumericCtx<float>::saveGemm(int64_t m, int64_t n, int64_t k, const floa
   sym.luGemmCalls++;
 }
 
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
 using OuterStride = Eigen::OuterStride<>;
 template <typename T>
@@ -576,7 +576,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
                                 int64_t lumpsEnd, T* C, int64_t ldc) override {
     auto timer = sym.solveSparseLStat.instance();
     const CpuBaseSymElimCtx* pElim = dynamic_cast<const CpuBaseSymElimCtx*>(&elimData);
-    BASPACHO_CHECK_NOTNULL(pElim);
+    SPRUX_CHECK_NOTNULL(pElim);
     const CpuBaseSymElimCtx& elim = *pElim;
     const CoalescedBlockMatrixSkel& skel = sym.skel;
 
@@ -624,11 +624,11 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
           int64_t lumpStart = skel.lumpStart[lump];
           int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
           int64_t chainColOrd = elim.chainColOrd[i];
-          BASPACHO_CHECK_GE(chainColOrd,
+          SPRUX_CHECK_GE(chainColOrd,
                             1);  // there must be a diagonal block
 
           int64_t ptr = skel.chainColPtr[lump] + chainColOrd;
-          BASPACHO_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
+          SPRUX_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
           int64_t blockPtr = skel.chainData[ptr];
 
           Eigen::Map<const MatRMaj<T>> block(data + blockPtr, rowSpanSize, lumpSize);
@@ -653,11 +653,11 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
                 int64_t lumpStart = skel.lumpStart[lump];
                 int64_t lumpSize = skel.lumpStart[lump + 1] - lumpStart;
                 int64_t chainColOrd = elim.chainColOrd[i];
-                BASPACHO_CHECK_GE(chainColOrd,
+                SPRUX_CHECK_GE(chainColOrd,
                                   1);  // there must be a diagonal block
 
                 int64_t ptr = skel.chainColPtr[lump] + chainColOrd;
-                BASPACHO_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
+                SPRUX_CHECK_EQ(skel.chainRowSpan[ptr], rowSpan);
                 int64_t blockPtr = skel.chainData[ptr];
 
                 Eigen::Map<const MatRMaj<T>> block(data + blockPtr, rowSpanSize, lumpSize);
@@ -726,7 +726,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
     }
   }
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
   virtual void symm(const T* data, int64_t offset, int64_t n, const T* C, int64_t offC, int64_t ldc,
                     T* D, int64_t ldd, T alpha) override;
 
@@ -738,7 +738,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
 
   virtual void gemv(const T* data, int64_t offM, int64_t nRows, int64_t nCols, const T* A,
                     int64_t offA, int64_t lda, T alpha) override;
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
   static inline void stridedTransAdd(T* dst, int64_t dstStride, const T* src, int64_t srcStride,
                                      int64_t rSize, int64_t cSize) {
@@ -769,7 +769,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
     }
   }
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
   virtual void solveLt(const T* data, int64_t offM, int64_t n, T* C, int64_t offC,
                        int64_t ldc) override;
 
@@ -861,7 +861,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
     dispenso::parallel_for(
         taskSet, dispenso::makeChunkedRange(spanBegin, spanEnd, 8L),
         [&](int64_t rangeBegin, int64_t rangeEnd) {
-          BASPACHO_CHECK_LE(rangeEnd, rangeBegin + 8);
+          SPRUX_CHECK_LE(rangeEnd, rangeBegin + 8);
           int64_t dataStart = skel.spanStart[rangeBegin];
           int64_t dataSize = skel.spanStart[rangeEnd] - dataStart;
           T* outData = (T*)alloca(sizeof(T) * dataSize);
@@ -1025,7 +1025,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         dispenso::parallel_for(
             taskSet, dispenso::makeChunkedRange(subBegin, subEnd, 4L),
             [&](int64_t rangeBegin, int64_t rangeEnd) {
-              BASPACHO_CHECK_LE(rangeBegin, rangeEnd + 4);
+              SPRUX_CHECK_LE(rangeBegin, rangeEnd + 4);
               int64_t dataStart = skel.spanStart[rangeBegin];
               int64_t dataSize = skel.spanStart[rangeEnd] - dataStart;
               T* outData = (T*)alloca(sizeof(T) * dataSize);
@@ -1166,7 +1166,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
         dispenso::parallel_for(
             taskSet, dispenso::makeChunkedRange(subBegin, subEnd, 2L),
             [&](int64_t thBegin, int64_t thEnd) {
-              BASPACHO_CHECK_LE(thEnd, thBegin + 2);
+              SPRUX_CHECK_LE(thEnd, thBegin + 2);
 
               for (int64_t s = thEnd - 1; s >= thBegin; s--) {
                 int64_t sBegin = skel.spanStart[s];
@@ -1231,7 +1231,7 @@ struct BlasSolveCtx : CpuBaseSolveCtx<T> {
   const BlasSymbolicCtx& sym;
 };
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
 template <>
 void BlasSolveCtx<double>::symm(const double* data, int64_t offM, int64_t n, const double* C,
                                 int64_t offC, int64_t ldc, double* D, int64_t ldd, double alpha) {
@@ -1411,11 +1411,11 @@ template void BlasSolveCtx<float>::applyRowPermVec(const int64_t*, int64_t, floa
 template void BlasSolveCtx<double>::applyRowPermVecInv(const int64_t*, int64_t, double*, int64_t);
 template void BlasSolveCtx<float>::applyRowPermVecInv(const int64_t*, int64_t, float*, int64_t);
 
-#endif  // BASPACHO_USE_BLAS
+#endif  // SPRUX_USE_BLAS
 
 NumericCtxBase* BlasSymbolicCtx::createNumericCtxForType(std::type_index tIdx, int64_t tempBufSize,
                                                          int batchSize) {
-  BASPACHO_CHECK_EQ(batchSize, 1);
+  SPRUX_CHECK_EQ(batchSize, 1);
   if (tIdx == std::type_index(typeid(double))) {
     return new BlasNumericCtx<double>(*this, tempBufSize, skel.spanStart.size() - 1);
   } else if (tIdx == std::type_index(typeid(float))) {
@@ -1427,7 +1427,7 @@ NumericCtxBase* BlasSymbolicCtx::createNumericCtxForType(std::type_index tIdx, i
 
 SolveCtxBase* BlasSymbolicCtx::createSolveCtxForType(std::type_index tIdx, int nRHS,
                                                      int batchSize) {
-  BASPACHO_CHECK_EQ(batchSize, 1);
+  SPRUX_CHECK_EQ(batchSize, 1);
   if (tIdx == std::type_index(typeid(double))) {
     return new BlasSolveCtx<double>(*this, nRHS);
   } else if (tIdx == std::type_index(typeid(float))) {

@@ -56,10 +56,10 @@ jobs:
         export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=OFF \
-          -DBASPACHO_USE_METAL=ON \
-          -DBASPACHO_BUILD_TESTS=OFF \
-          -DBASPACHO_BUILD_EXAMPLES=ON \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON \
           -DBLA_VENDOR=OpenBLAS \
           -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
 
@@ -238,11 +238,11 @@ jobs:
       run: |
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-          -DBASPACHO_USE_CUBLAS=ON \
-          -DBASPACHO_USE_METAL=OFF \
-          -DBASPACHO_USE_OPENCL=OFF \
-          -DBASPACHO_BUILD_TESTS=OFF \
-          -DBASPACHO_BUILD_EXAMPLES=ON
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON
 
     - name: Build
       run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"

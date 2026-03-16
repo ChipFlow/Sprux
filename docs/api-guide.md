@@ -265,10 +265,10 @@ solver->factorLU(dataGpu.ptr(), pivots.data());
 ## Python Bindings
 
 ```python
-import baspacho
+import sprux
 
 # Create solver from CSR matrix
-solver = baspacho.create_solver(
+solver = sprux.create_solver(
     param_sizes=[1] * n,  # scalar blocks
     row_ptrs=row_ptr,
     col_inds=col_ind,
@@ -300,5 +300,5 @@ All errors throw `std::runtime_error` with descriptive messages. Common errors:
 - **"Zero pivot encountered"**: Singular matrix in LDL^T
 - **"Static pivot threshold must be >= -1.0"**: Invalid settings
 
-Assertion macros (`BASPACHO_CHECK`, `BASPACHO_CHECK_GE`, etc.) throw `std::runtime_error`
+Assertion macros (`SPRUX_CHECK`, `SPRUX_CHECK_GE`, etc.) throw `std::runtime_error`
 in both debug and release builds.

@@ -38,7 +38,7 @@
 
 #pragma once
 
-#ifdef BASPACHO_USE_OPENCL
+#ifdef SPRUX_USE_OPENCL
 
 #ifdef __APPLE__
 #include <OpenCL/cl.h>
@@ -250,4 +250,4 @@ class OpenCLBufferRegistry {
 
 }  // end namespace BaSpaCho
 
-#endif  // BASPACHO_USE_OPENCL
+#endif  // SPRUX_USE_OPENCL

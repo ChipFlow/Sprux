@@ -19,10 +19,10 @@ SparseMatGenerator::SparseMatGenerator(int64_t size, int64_t seed) : gen(seed), 
 
 void SparseMatGenerator::connectRanges(int64_t begin1, int64_t end1, int64_t begin2, int64_t end2,
                                        double fill, int64_t maxOffset) {
-  BASPACHO_CHECK_GE(begin1, 0);
-  BASPACHO_CHECK_GE(begin2, 0);
-  BASPACHO_CHECK_LE(end1, columns.size());
-  BASPACHO_CHECK_LE(end2, columns.size());
+  SPRUX_CHECK_GE(begin1, 0);
+  SPRUX_CHECK_GE(begin2, 0);
+  SPRUX_CHECK_LE(end1, columns.size());
+  SPRUX_CHECK_LE(end2, columns.size());
 
   if (begin1 > begin2) {
     connectRanges(begin2, end2, begin1, end1, fill, maxOffset);
@@ -92,8 +92,8 @@ SparseMatGenerator SparseMatGenerator::genMeridians(int64_t num, int64_t lineLen
   int64_t size = lineLen * num + hairLen * totHairs;
   int64_t endMeridians = lineLen * num;
 
-  BASPACHO_CHECK_LE(bandSize, lineLen);
-  BASPACHO_CHECK_LE(bandSize, hairLen);
+  SPRUX_CHECK_LE(bandSize, lineLen);
+  SPRUX_CHECK_LE(bandSize, hairLen);
 
   SparseMatGenerator retv(size, seed);
   // build structure of meridians and hairs

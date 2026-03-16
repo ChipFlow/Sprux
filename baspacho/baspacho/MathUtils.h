@@ -16,7 +16,7 @@ namespace BaSpaCho {
 
 // returns all pairs (x, y) with 0 <= x <= y < n, while p varies in 0 <= p <
 // n*(n+1)/2
-__BASPACHO_HOST_DEVICE__ inline std::pair<int64_t, int64_t> toOrderedPair(int64_t n, int64_t p) {
+__SPRUX_HOST_DEVICE__ inline std::pair<int64_t, int64_t> toOrderedPair(int64_t n, int64_t p) {
   // the trick below converts p that varies in the range 0,1,...,n*(n+1)/2
   // to a pair x<=y, where y varies in the range 0,1,...,(n-1) and,
   // for each y, x varies in the range 0,1,...,y
@@ -36,7 +36,7 @@ __BASPACHO_HOST_DEVICE__ inline std::pair<int64_t, int64_t> toOrderedPair(int64_
 
 // in-place cholesky
 template <typename T>
-__BASPACHO_HOST_DEVICE__ inline static void cholesky(T* A, int lda, int n) {
+__SPRUX_HOST_DEVICE__ inline static void cholesky(T* A, int lda, int n) {
   T* b_ii = A;
 
   for (int i = 0; i < n; i++) {
@@ -66,7 +66,7 @@ __BASPACHO_HOST_DEVICE__ inline static void cholesky(T* A, int lda, int n) {
 
 // in-place solver for A.T (A build upper-diagonal col-major)
 template <typename T>
-__BASPACHO_HOST_DEVICE__ inline static void solveUpperT(const T* A, int lda, int n, T* v) {
+__SPRUX_HOST_DEVICE__ inline static void solveUpperT(const T* A, int lda, int n, T* v) {
   const T* b_ii = A;
   for (int i = 0; i < n; i++) {
     T x = v[i];
@@ -82,7 +82,7 @@ __BASPACHO_HOST_DEVICE__ inline static void solveUpperT(const T* A, int lda, int
 
 // in-place solver for A (A build upper-diagonal col-major)
 template <typename T>
-__BASPACHO_HOST_DEVICE__ inline static void solveUpper(const T* A, int lda, int n, T* v) {
+__SPRUX_HOST_DEVICE__ inline static void solveUpper(const T* A, int lda, int n, T* v) {
   const T* b_ii = A + (lda + 1) * (n - 1);
   for (int i = n - 1; i >= 0; i--) {
     T x = v[i];
@@ -101,7 +101,7 @@ __BASPACHO_HOST_DEVICE__ inline static void solveUpper(const T* A, int lda, int 
 // in-place solver for row-major upper triangular U*x = b
 // U is stored row-major with leading dimension lda
 template <typename T>
-__BASPACHO_HOST_DEVICE__ inline static void solveUpperRowMajor(const T* A, int lda, int n, T* v) {
+__SPRUX_HOST_DEVICE__ inline static void solveUpperRowMajor(const T* A, int lda, int n, T* v) {
   for (int i = n - 1; i >= 0; i--) {
     T x = v[i];
     const T* row = A + i * lda;

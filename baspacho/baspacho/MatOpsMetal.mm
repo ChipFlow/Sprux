@@ -23,7 +23,7 @@
 #include "baspacho/baspacho/MatOps.h"
 #include "baspacho/baspacho/MetalDefs.h"
 #include "baspacho/baspacho/Utils.h"
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
 #include "baspacho/baspacho/BlasDefs.h"
 #endif
 
@@ -194,7 +194,7 @@ struct MetalSymbolicCtx : SymbolicCtx {
 
     // Build element-level work items for two-phase deterministic elimination.
     // Expand each block pair into individual element dot products.
-    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+    SPRUX_CHECK(skel.totalDataSize() < INT32_MAX);
 
     vector<CholWorkItem> cholItems;
     cholItems.reserve(elim->numBlockPairs * 4);  // heuristic: ~4 elements per block pair
@@ -326,7 +326,7 @@ struct MetalSymbolicCtx : SymbolicCtx {
 
     // Pre-compute work list: resolve all binary searches on CPU
     int64_t upperDataBase = skel.dataSize();
-    BASPACHO_CHECK(skel.totalDataSize() < INT32_MAX);
+    SPRUX_CHECK(skel.totalDataSize() < INT32_MAX);
 
     vector<LUWorkItem> workItems;
     workItems.reserve(elim->numBlockPairs);
@@ -870,7 +870,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     if (explicitRecording_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
       const MetalSymElimCtx& elim = *pElim;
 
       // Find the MTLBuffer for data
@@ -969,7 +969,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     if (explicitRecording_) return;
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
       const MetalSymElimCtx& elim = *pElim;
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -1363,7 +1363,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       // Look up MTLBuffer for data pointer
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
-      BASPACHO_CHECK_WHAT1(bufferInfo.first, "potrf: data buffer not registered");
+      SPRUX_CHECK_WHAT1(bufferInfo.first, "potrf: data buffer not registered");
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t baseOffset = bufferInfo.second;
 
@@ -1413,7 +1413,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       }
 
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
-      BASPACHO_CHECK_WHAT1(bufferInfo.first, "trsm: data buffer not registered");
+      SPRUX_CHECK_WHAT1(bufferInfo.first, "trsm: data buffer not registered");
       id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
       size_t baseOffset = bufferInfo.second;
 
@@ -1707,7 +1707,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // complement updates are dispatched before factorization of this lump.
       flushPendingGemms();
 
-#ifdef BASPACHO_USE_BLAS
+#ifdef SPRUX_USE_BLAS
       // CPU BLAS path for larger lumps: multi-threaded LAPACK sgetrf (~10-50μs)
       // is much faster than single-threadgroup GPU kernel (~1ms for n≥64).
       // In external encoder mode, we cycle the encoder (end→commit→wait→CPU→
@@ -2544,7 +2544,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
 
       // Find buffers
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -2613,7 +2613,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                  int64_t lumpsEnd, float* C, int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
 
       // Find buffers
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -2692,7 +2692,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                     int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
 
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
@@ -2742,7 +2742,7 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
 
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
@@ -3933,7 +3933,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
                              int64_t lumpsBegin, int64_t lumpsEnd) override {
     @autoreleasepool {
       const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      BASPACHO_CHECK_NOTNULL(pElim);
+      SPRUX_CHECK_NOTNULL(pElim);
       const MetalSymElimCtx& elim = *pElim;
 
       int64_t numLumps = lumpsEnd - lumpsBegin;
@@ -3981,7 +3981,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         // Dispatch once per batch item, changing only the data buffer
         for (int b = 0; b < batchSize; b++) {
           auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-          BASPACHO_CHECK_WHAT1(bufferInfo.first,
+          SPRUX_CHECK_WHAT1(bufferInfo.first,
                                "batched doElimination: data buffer not found");
           [encoder setBuffer:(__bridge id<MTLBuffer>)bufferInfo.first
                       offset:bufferInfo.second
@@ -4009,7 +4009,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
         // Phase 1 + Phase 2 per batch item (scratch buffer reused between items)
         for (int b = 0; b < batchSize; b++) {
           auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-          BASPACHO_CHECK_WHAT1(bufferInfo.first,
+          SPRUX_CHECK_WHAT1(bufferInfo.first,
                                "batched doElimination: data buffer not found");
 
           if (b > 0) {
@@ -4077,7 +4077,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
 
       for (int b = 0; b < batchSize; b++) {
         auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-        BASPACHO_CHECK_WHAT1(bufferInfo.first, "batched potrf: data buffer not registered");
+        SPRUX_CHECK_WHAT1(bufferInfo.first, "batched potrf: data buffer not registered");
         id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
         size_t baseOffset = bufferInfo.second;
 
@@ -4128,7 +4128,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
 
       for (int b = 0; b < batchSize; b++) {
         auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-        BASPACHO_CHECK_WHAT1(bufferInfo.first, "batched trsm: data buffer not registered");
+        SPRUX_CHECK_WHAT1(bufferInfo.first, "batched trsm: data buffer not registered");
         id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)bufferInfo.first;
         size_t baseOffset = bufferInfo.second;
 
@@ -4182,7 +4182,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
 
         for (int b = 0; b < batchSize; b++) {
           auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-          BASPACHO_CHECK_WHAT1(dataBufferInfo.first,
+          SPRUX_CHECK_WHAT1(dataBufferInfo.first,
                                "batched saveSyrkGemm: data buffer not found");
           id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
           size_t dataBaseOffset = dataBufferInfo.second;
@@ -4306,7 +4306,7 @@ struct MetalNumericCtx<std::vector<float*>> : NumericCtx<std::vector<float*>> {
       // Dispatch once per batch item, changing temp buffer offset and data buffer
       for (int b = 0; b < batchSize; b++) {
         auto bufferInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
-        BASPACHO_CHECK_WHAT1(bufferInfo.first, "batched assemble: data buffer not found");
+        SPRUX_CHECK_WHAT1(bufferInfo.first, "batched assemble: data buffer not found");
 
         size_t tempOffset = b * tempBufSizePerBatch * sizeof(float);
         [encoder setBuffer:tempBuf offset:tempOffset atIndex:9];
@@ -4395,9 +4395,9 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
           auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-          BASPACHO_CHECK_WHAT1(dataInfo.first,
+          SPRUX_CHECK_WHAT1(dataInfo.first,
                                "batched sparseElimSolveL: data buffer not found");
-          BASPACHO_CHECK_WHAT1(cInfo.first,
+          SPRUX_CHECK_WHAT1(cInfo.first,
                                "batched sparseElimSolveL: C buffer not found");
 
           [encoder setBuffer:(__bridge id<MTLBuffer>)dataInfo.first
@@ -4451,9 +4451,9 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
           auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-          BASPACHO_CHECK_WHAT1(dataInfo.first,
+          SPRUX_CHECK_WHAT1(dataInfo.first,
                                "batched sparseElimSolveL: data buffer not found");
-          BASPACHO_CHECK_WHAT1(cInfo.first,
+          SPRUX_CHECK_WHAT1(cInfo.first,
                                "batched sparseElimSolveL: C buffer not found");
 
           [encoder setBuffer:(__bridge id<MTLBuffer>)dataInfo.first
@@ -4532,9 +4532,9 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
           auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-          BASPACHO_CHECK_WHAT1(dataInfo.first,
+          SPRUX_CHECK_WHAT1(dataInfo.first,
                                "batched sparseElimSolveLt: data buffer not found");
-          BASPACHO_CHECK_WHAT1(cInfo.first,
+          SPRUX_CHECK_WHAT1(cInfo.first,
                                "batched sparseElimSolveLt: C buffer not found");
 
           [encoder setBuffer:(__bridge id<MTLBuffer>)dataInfo.first
@@ -4582,9 +4582,9 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
         for (int b = 0; b < batchSize; b++) {
           auto dataInfo = MetalBufferRegistry::instance().findBuffer((*data)[b]);
           auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-          BASPACHO_CHECK_WHAT1(dataInfo.first,
+          SPRUX_CHECK_WHAT1(dataInfo.first,
                                "batched sparseElimSolveLt: data buffer not found");
-          BASPACHO_CHECK_WHAT1(cInfo.first,
+          SPRUX_CHECK_WHAT1(cInfo.first,
                                "batched sparseElimSolveLt: C buffer not found");
 
           [encoder setBuffer:(__bridge id<MTLBuffer>)dataInfo.first
@@ -4708,7 +4708,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Dispatch once per batch item, changing solve buffer offset and C buffer
       for (int b = 0; b < batchSize; b++) {
         auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-        BASPACHO_CHECK_WHAT1(cInfo.first, "batched assembleVec: C buffer not found");
+        SPRUX_CHECK_WHAT1(cInfo.first, "batched assembleVec: C buffer not found");
 
         size_t solveBufOffset = b * solveBufSize * sizeof(float);
         [encoder setBuffer:solveBuf offset:solveBufOffset atIndex:3];
@@ -4805,7 +4805,7 @@ struct MetalSolveCtx<std::vector<float*>> : SolveCtx<std::vector<float*>> {
       // Dispatch once per batch item, changing C buffer and solve buffer offset
       for (int b = 0; b < batchSize; b++) {
         auto cInfo = MetalBufferRegistry::instance().findBuffer((*C)[b]);
-        BASPACHO_CHECK_WHAT1(cInfo.first, "batched assembleVecT: C buffer not found");
+        SPRUX_CHECK_WHAT1(cInfo.first, "batched assembleVecT: C buffer not found");
 
         [encoder setBuffer:(__bridge id<MTLBuffer>)cInfo.first
                     offset:cInfo.second

@@ -44,7 +44,7 @@ void runTest(const std::string& precondArg, int seed) {
   cout << "max factor: " << nocross << " / " << paramSize.size() << endl;
 
   int order = solver->order();
-  BASPACHO_CHECK_EQ(solver->skel().spanOffsetInLump[nocross], 0);
+  SPRUX_CHECK_EQ(solver->skel().spanOffsetInLump[nocross], 0);
 
   cout << "generating prob..." << endl;
   using T = double;

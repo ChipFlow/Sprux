@@ -278,7 +278,7 @@ class Solver {
   SymbolicCtx& internalSymbolicContext() { return *symCtx; }
 
   SymElimCtx& internalGetElimCtx(size_t i) {
-    BASPACHO_CHECK_LT(i, elimCtxs.size());
+    SPRUX_CHECK_LT(i, elimCtxs.size());
     return *elimCtxs[i];
   }
 
@@ -429,9 +429,9 @@ enum BackendType {
  * @brief Detect the best available backend for the current system.
  *
  * Priority order:
- * 1. CUDA (if compiled with BASPACHO_USE_CUBLAS and GPU available)
- * 2. Metal (if compiled with BASPACHO_USE_METAL on macOS with Apple Silicon)
- * 3. OpenCL (if compiled with BASPACHO_USE_OPENCL and GPU available)
+ * 1. CUDA (if compiled with SPRUX_USE_CUBLAS and GPU available)
+ * 2. Metal (if compiled with SPRUX_USE_METAL on macOS with Apple Silicon)
+ * 3. OpenCL (if compiled with SPRUX_USE_OPENCL and GPU available)
  * 4. Fast (CPU with BLAS, always available)
  *
  * @return BackendType The detected best backend (never returns BackendAuto)

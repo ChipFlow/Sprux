@@ -44,9 +44,9 @@ class MetalContextImpl {
       mtlCHECK(asyncQueue != nil, "Failed to create Metal async command queue");
 
       // Load the compiled shader library
-#ifdef BASPACHO_METAL_LIBRARY_PATH
+#ifdef SPRUX_METAL_LIBRARY_PATH
       NSError* error = nil;
-      NSString* libraryPath = @BASPACHO_METAL_LIBRARY_PATH;
+      NSString* libraryPath = @SPRUX_METAL_LIBRARY_PATH;
       NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
       library = [device newLibraryWithURL:libraryURL error:&error];
       if (error != nil) {
@@ -239,7 +239,7 @@ void MetalContext::endCapture() {
 }
 
 bool MetalContext::beginCaptureIfRequested(const char* outputPath) {
-  const char* val = getenv("BASPACHO_GPU_CAPTURE");
+  const char* val = getenv("SPRUX_GPU_CAPTURE");
   if (val && std::string(val) == "1") {
     return beginCapture(outputPath);
   }

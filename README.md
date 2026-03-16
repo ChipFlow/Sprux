@@ -14,7 +14,7 @@
 
 Sprux is a high-performance sparse direct solver with GPU acceleration.
 
-*Formerly BaSpaCho (Batched Sparse Cholesky). Code namespace and CMake variables still use `BaSpaCho` — a rename is planned.*
+*Formerly BaSpaCho (Batched Sparse Cholesky). The C++ namespace remains `BaSpaCho` for backward compatibility.*
 
 ## Features
 
@@ -32,7 +32,7 @@ Sprux is a high-performance sparse direct solver with GPU acceleration.
 
 ```bash
 # Configure (CPU with OpenBLAS, no GPU)
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPRUX_USE_CUBLAS=0
 
 # Build
 cmake --build build -j16
@@ -44,7 +44,7 @@ ctest --test-dir build
 For Metal (Apple Silicon):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DBASPACHO_USE_CUBLAS=0 -DBASPACHO_USE_METAL=1 -DBLA_VENDOR=Apple
+  -DSPRUX_USE_CUBLAS=0 -DSPRUX_USE_METAL=1 -DBLA_VENDOR=Apple
 cmake --build build -j16
 ```
 
@@ -59,10 +59,10 @@ cmake --build build -j16
 
 | Backend | Flag | Precision | GPU | Best For |
 |---------|------|-----------|-----|----------|
-| CPU BLAS | `-DBASPACHO_USE_BLAS=1` (default) | float/double | No | General use, double precision |
-| CUDA | `-DBASPACHO_USE_CUBLAS=1` (default) | float/double | NVIDIA | Large problems, double precision on GPU |
-| Metal | `-DBASPACHO_USE_METAL=1` | float only | Apple Silicon | macOS, mixed-precision with refinement |
-| OpenCL | `-DBASPACHO_USE_OPENCL=1` | float/double | Any | Experimental portable GPU |
+| CPU BLAS | `-DSPRUX_USE_BLAS=1` (default) | float/double | No | General use, double precision |
+| CUDA | `-DSPRUX_USE_CUBLAS=1` (default) | float/double | NVIDIA | Large problems, double precision on GPU |
+| Metal | `-DSPRUX_USE_METAL=1` | float only | Apple Silicon | macOS, mixed-precision with refinement |
+| OpenCL | `-DSPRUX_USE_OPENCL=1` | float/double | Any | Experimental portable GPU |
 
 Runtime selection:
 ```cpp
@@ -75,14 +75,14 @@ auto solver = createSolver(settings, paramSize, structure);
 
 | CMake Option | Default | Description |
 |-------------|---------|-------------|
-| `BASPACHO_USE_CUBLAS` | ON | Enable CUDA support |
-| `BASPACHO_USE_METAL` | OFF | Enable Metal support (macOS only) |
-| `BASPACHO_USE_OPENCL` | OFF | Enable OpenCL + CLBlast |
-| `BASPACHO_USE_BLAS` | ON | Enable CPU BLAS |
-| `BASPACHO_CUDA_ARCHS` | "detect" | CUDA architectures ("detect", "torch", or "60;70;75") |
-| `BASPACHO_USE_SUITESPARSE_AMD` | OFF | Use SuiteSparse AMD instead of Eigen |
-| `BASPACHO_BUILD_TESTS` | ON | Build unit tests |
-| `BASPACHO_BUILD_EXAMPLES` | ON | Build examples and benchmarks |
+| `SPRUX_USE_CUBLAS` | ON | Enable CUDA support |
+| `SPRUX_USE_METAL` | OFF | Enable Metal support (macOS only) |
+| `SPRUX_USE_OPENCL` | OFF | Enable OpenCL + CLBlast |
+| `SPRUX_USE_BLAS` | ON | Enable CPU BLAS |
+| `SPRUX_CUDA_ARCHS` | "detect" | CUDA architectures ("detect", "torch", or "60;70;75") |
+| `SPRUX_USE_SUITESPARSE_AMD` | OFF | Use SuiteSparse AMD instead of Eigen |
+| `SPRUX_BUILD_TESTS` | ON | Build unit tests |
+| `SPRUX_BUILD_EXAMPLES` | ON | Build examples and benchmarks |
 | `BLA_VENDOR` | (auto) | BLAS: ATLAS, OpenBLAS, Intel10_64lp_seq, Apple |
 
 ## Usage
@@ -157,14 +157,14 @@ backend design, and memory management.
 ## Python Bindings
 
 ```python
-import baspacho
-solver = baspacho.create_solver(param_sizes, row_ptrs, col_inds,
+import sprux
+solver = sprux.create_solver(param_sizes, row_ptrs, col_inds,
                                 matrix_type="general", backend="metal")
 solver.factor_lu(data, pivots)
 solver.solve_lu(data, pivots, rhs)
 ```
 
-Build with: `cmake -DBASPACHO_BUILD_PYTHON=ON` (requires pybind11).
+Build with: `cmake -DSPRUX_BUILD_PYTHON=ON` (requires pybind11).
 
 ## Examples
 

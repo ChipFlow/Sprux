@@ -8,9 +8,9 @@
 cmake_minimum_required(VERSION 3.28)
 
 # set the project name
-project(BaSpaCho CXX)
+project(Sprux CXX)
 set(CMAKE_CXX_STANDARD 17)
-set(BASPACHO_CXX_FLAGS -Wall -Wextra -pedantic) # -O1 -g -fsanitize=address -static-libsan)
+set(SPRUX_CXX_FLAGS -Wall -Wextra -pedantic) # -O1 -g -fsanitize=address -static-libsan)
 
 message("* Build type: " ${CMAKE_BUILD_TYPE})
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleStaticLibrary.cmake")
@@ -19,8 +19,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleStaticLibrary.cmake")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # general settings
-set(BASPACHO_BUILD_TESTS ON CACHE BOOL "If on (default), tests are build")
-set(BASPACHO_BUILD_EXAMPLES ON CACHE BOOL "If on (default), exampels/benchmarks are build")
+set(SPRUX_BUILD_TESTS ON CACHE BOOL "If on (default), tests are build")
+set(SPRUX_BUILD_EXAMPLES ON CACHE BOOL "If on (default), exampels/benchmarks are build")
 
 # some fancy colors for cmake messages
 if(NOT WIN32)
@@ -36,17 +36,17 @@ if(NOT WIN32)
 endif()
 
 # CUDA
-set(BASPACHO_USE_CUBLAS ON CACHE BOOL "If on, CUDA support is enabled")
-set(BASPACHO_CUDA_ARCHS "detect" CACHE STRING "List of cuda architecture (eg '60;62;75'), or 'detect', or 'torch'")
+set(SPRUX_USE_CUBLAS ON CACHE BOOL "If on, CUDA support is enabled")
+set(SPRUX_CUDA_ARCHS "detect" CACHE STRING "List of cuda architecture (eg '60;62;75'), or 'detect', or 'torch'")
 
-if(BASPACHO_USE_CUBLAS)
+if(SPRUX_USE_CUBLAS)
   message("${Cyan}==============================[ CUDA ]==================================${ColourReset}")
   enable_language(CUDA)
   include(CheckLanguage)
   check_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
-  if(BASPACHO_CUDA_ARCHS STREQUAL "detect")
+  if(SPRUX_CUDA_ARCHS STREQUAL "detect")
     message("* Detecting CUDA architecture...")
     set(CUDA_DETECT_BIN "${CMAKE_BINARY_DIR}/detect_cuda")
     set(CUDA_DETECT_SRC "${CMAKE_CURRENT_SOURCE_DIR}/cmake/detect_cuda.cu")
@@ -70,11 +70,11 @@ if(BASPACHO_USE_CUBLAS)
 
     if(CUDA_RETURN_CODE EQUAL 0)
       message("* CUDA architectures: '${RESULT}' (autodetected installed GPU)")
-      set(BASPACHO_CUDA_ARCHITECTURES "${RESULT}")
+      set(SPRUX_CUDA_ARCHITECTURES "${RESULT}")
     else()
       message(FATAL_ERROR "CUDA architecture detection failed: ${RESULT}")
     endif()
-  elseif(BASPACHO_CUDA_ARCHS STREQUAL "torch")
+  elseif(SPRUX_CUDA_ARCHS STREQUAL "torch")
     message("* Getting Torch CUDA architectures...")
     set(CUDA_GET_TORCH_ARCHS_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cmake/get_torch_cuda_archs.py")
     message("${Yellow}  python ${CUDA_GET_TORCH_ARCHS_BIN}${ColourReset}")
@@ -94,14 +94,14 @@ if(BASPACHO_USE_CUBLAS)
         message(FATAL_ERROR "Torch architectures returned an empty result.")
       endif()
 
-      set(BASPACHO_CUDA_ARCHITECTURES "${RESULT}")
+      set(SPRUX_CUDA_ARCHITECTURES "${RESULT}")
     else()
       message(FATAL_ERROR "Torch CUDA architecture detection failed: ${RESULT}")
     endif()
   else()
     # https://cmake.org/cmake/help/git-stage/prop_tgt/CUDA_ARCHITECTURES.html
-    message("* CUDA architectures: '${BASPACHO_CUDA_ARCHS}' (manually set)")
-    set(BASPACHO_CUDA_ARCHITECTURES "${BASPACHO_CUDA_ARCHS}")
+    message("* CUDA architectures: '${SPRUX_CUDA_ARCHS}' (manually set)")
+    set(SPRUX_CUDA_ARCHITECTURES "${SPRUX_CUDA_ARCHS}")
   endif()
 
   list(APPEND CUDA_NVCC_FLAGS
@@ -110,13 +110,13 @@ if(BASPACHO_USE_CUBLAS)
   message("* CUDA Includes : " ${CUDAToolkit_INCLUDE_DIRS})
   message("* CUDA Libraries: " ${CUDAToolkit_LIBRARY_DIR})
   include_directories(${CUDAToolkit_INCLUDE_DIRS})
-  add_compile_definitions(BASPACHO_USE_CUBLAS)
+  add_compile_definitions(SPRUX_USE_CUBLAS)
 endif()
 
 # METAL (macOS/iOS GPU backend)
-set(BASPACHO_USE_METAL OFF CACHE BOOL "If on, Metal support is enabled (macOS/iOS only)")
+set(SPRUX_USE_METAL OFF CACHE BOOL "If on, Metal support is enabled (macOS/iOS only)")
 
-if(BASPACHO_USE_METAL)
+if(SPRUX_USE_METAL)
   message("${Cyan}==============================[ Metal ]==================================${ColourReset}")
 
   if(NOT APPLE)
@@ -134,17 +134,17 @@ if(BASPACHO_USE_METAL)
 
   # Note: We do NOT call enable_language(OBJCXX) here because it causes
   # cmake to treat ALL .m files as Objective-C++, which breaks projects
-  # that embed BaSpaCho and have their own Objective-C code (like IREE).
+  # that embed Sprux and have their own Objective-C code (like IREE).
   # Instead, we explicitly set compile flags for .mm files in the
   # baspacho/baspacho/CMakeLists.txt.
 
-  add_compile_definitions(BASPACHO_USE_METAL)
+  add_compile_definitions(SPRUX_USE_METAL)
 endif()
 
 # OpenCL (with CLBlast for BLAS operations)
-set(BASPACHO_USE_OPENCL OFF CACHE BOOL "If on, OpenCL support is enabled (with CLBlast)")
+set(SPRUX_USE_OPENCL OFF CACHE BOOL "If on, OpenCL support is enabled (with CLBlast)")
 
-if(BASPACHO_USE_OPENCL)
+if(SPRUX_USE_OPENCL)
   message("${Cyan}==============================[ OpenCL ]=================================${ColourReset}")
 
   find_package(OpenCL REQUIRED)
@@ -157,7 +157,7 @@ if(BASPACHO_USE_OPENCL)
   message("* CLBlast Libraries: ${CLBLAST_LIBRARIES}")
 
   include_directories(${OpenCL_INCLUDE_DIRS})
-  add_compile_definitions(BASPACHO_USE_OPENCL)
+  add_compile_definitions(SPRUX_USE_OPENCL)
 endif()
 
 # BLAS. a few possibilities are:
@@ -165,9 +165,9 @@ endif()
 # * OpenBLAS
 # * Intel10_64{i}lp{_seq}
 # (if 'i' indices are 64bits, if '_seq' sequential ie single thread)
-set(BASPACHO_USE_BLAS ON CACHE BOOL "If on, BLAS support is enabled")
+set(SPRUX_USE_BLAS ON CACHE BOOL "If on, BLAS support is enabled")
 
-if(BASPACHO_USE_BLAS)
+if(SPRUX_USE_BLAS)
   message("${Cyan}==============================[ BLAS ]==================================${ColourReset}")
   set(BLA_VENDOR OpenBLAS CACHE STRING
     "BLAS Library to be searched, possibilities are: ATLAS, OpenBLAS, Intel10_64ilp_seq, etc")
@@ -183,10 +183,10 @@ if(BASPACHO_USE_BLAS)
     message("* BLAS appears to be MKL, MKL_ROOT should be set")
     message("* Adding includes: " $ENV{MKLROOT}/include)
     include_directories($ENV{MKLROOT}/include) # if MKL
-    add_compile_definitions(BASPACHO_USE_MKL)
+    add_compile_definitions(SPRUX_USE_MKL)
   endif()
 
-  add_compile_definitions(BASPACHO_USE_BLAS)
+  add_compile_definitions(SPRUX_USE_BLAS)
 endif()
 
 # use fetchcontent to download dependencies (needed by SuiteSparse and others below)
@@ -204,10 +204,10 @@ endif()
 # SuiteSparse (vendored via FetchContent)
 # Provides: AMD (fill-reducing ordering), CHOLMOD (fast symbolic analysis)
 message("${Cyan}===========================[ SuiteSparse ]==============================${ColourReset}")
-set(BASPACHO_USE_SYSTEM_SUITESPARSE OFF CACHE BOOL
+set(SPRUX_USE_SYSTEM_SUITESPARSE OFF CACHE BOOL
   "If on, use system-installed SuiteSparse instead of vendored")
 
-if(BASPACHO_USE_SYSTEM_SUITESPARSE)
+if(SPRUX_USE_SYSTEM_SUITESPARSE)
   # System SuiteSparse: find AMD, CHOLMOD, BTF via pkg-config or cmake
   find_path(SUITESPARSE_AMD_INCLUDE_DIR NAMES amd.h
     PATHS $ENV{AMDDIR} ${INCLUDE_INSTALL_DIR}
@@ -288,23 +288,23 @@ endif()
 
 # AMD from SuiteSparse is now always available (vendored or system)
 set(HAVE_SUITESPARSE_AMD 1)
-add_compile_definitions(BASPACHO_USE_SUITESPARSE_AMD)
+add_compile_definitions(SPRUX_USE_SUITESPARSE_AMD)
 message("* Using SuiteSparse AMD for fill-reducing ordering")
 
 # CHOLMOD is now always available
 set(HAVE_CHOLMOD 1)
-add_compile_definitions(BASPACHO_HAVE_CHOLMOD)
+add_compile_definitions(SPRUX_HAVE_CHOLMOD)
 message("* Using CHOLMOD for fast symbolic analysis")
 
 # BTF is now always available (for MC64 preprocessing)
 set(HAVE_BTF 1)
-add_compile_definitions(BASPACHO_HAVE_BTF)
+add_compile_definitions(SPRUX_HAVE_BTF)
 message("* Using BTF for maximum transversal (LU preprocessing)")
 
-if(BASPACHO_BUILD_EXAMPLES)
+if(SPRUX_BUILD_EXAMPLES)
 
   # cuDSS (for GPU sparse direct solver comparison)
-  if(BASPACHO_USE_CUBLAS)
+  if(SPRUX_USE_CUBLAS)
     message("${Cyan}==============================[ cuDSS ]=================================${ColourReset}")
     find_package(cuDSS)
 
@@ -312,7 +312,7 @@ if(BASPACHO_BUILD_EXAMPLES)
       set(HAVE_CUDSS 1)
       message("* cuDSS Include = " ${CUDSS_INCLUDE_DIRS})
       message("* cuDSS Libraries = " ${CUDSS_LIBRARIES})
-      add_compile_definitions(BASPACHO_HAVE_CUDSS)
+      add_compile_definitions(SPRUX_HAVE_CUDSS)
     else()
       set(HAVE_CUDSS 0)
       message("* cuDSS not found! cuDSS benchmarking comparison will not be available")
@@ -335,7 +335,7 @@ if(BASPACHO_BUILD_EXAMPLES)
     set(HAVE_UMFPACK 1)
     message("* UMFPACK Source = " ${UMFPACK_INCLUDE_DIR})
     message("* UMFPACK Libraries = " ${UMFPACK_LIBRARIES})
-    add_compile_definitions(BASPACHO_HAVE_UMFPACK)
+    add_compile_definitions(SPRUX_HAVE_UMFPACK)
     include_directories(${UMFPACK_INCLUDE_DIR})
   endif()
 endif()
@@ -363,7 +363,7 @@ message("* Dispenso Library Dir = " ${dispenso_BINARY_DIR})
 # NOTE: Check for target existence, not just gtest_SOURCE_DIR variable.
 # SuiteSparse FetchContent can set gtest_SOURCE_DIR as a cache variable
 # without actually creating the gtest targets.
-if(BASPACHO_BUILD_TESTS)
+if(SPRUX_BUILD_TESTS)
   if(NOT TARGET gtest_main)
     message("${Cyan}=============================[ GTest ]==================================${ColourReset}")
     FetchContent_Declare(
@@ -405,7 +405,7 @@ message("* Eigen Library Dir = " ${eigen_BINARY_DIR})
 include_directories(${eigen_SOURCE_DIR})
 
 # Sophus (only needed for BA problem in examples/benchmarks)
-if(BASPACHO_BUILD_EXAMPLES)
+if(SPRUX_BUILD_EXAMPLES)
   if(NOT DEFINED sophus_SOURCE_DIR)
     message("${Cyan}=============================[ Sophus ]=================================${ColourReset}")
     FetchContent_Declare(
@@ -432,24 +432,24 @@ endif()
 include_directories("${PROJECT_SOURCE_DIR}")
 
 # basic lib name depends on shared/static, so that
-# `BaSpaCho` is the bundled library if static
+# `Sprux` is the bundled library if static
 if(BUILD_SHARED_LIBS)
-  set(BASPACHO_LIBRARY BaSpaCho)
+  set(SPRUX_LIBRARY Sprux)
 else()
-  set(BASPACHO_LIBRARY BaSpaCho_static)
+  set(SPRUX_LIBRARY Sprux_static)
 endif()
 
 # unit tests
-if(BASPACHO_BUILD_TESTS)
+if(SPRUX_BUILD_TESTS)
   enable_testing()
 
-  function(add_baspacho_test TARGET)
+  function(add_sprux_test TARGET)
     add_executable(
       "${TARGET}"
       "${ARGN}"
     )
     target_link_libraries(
-      "${TARGET}" ${BASPACHO_LIBRARY} testing gtest_main gmock
+      "${TARGET}" ${SPRUX_LIBRARY} testing gtest_main gmock
     )
     gtest_discover_tests("${TARGET}")
   endfunction()

@@ -36,7 +36,7 @@ All notable changes to Sprux (formerly BaSpaCho) are documented here.
 - Custom batched GEMM kernel (eliminates per-call cuBLAS overhead)
 - CPU BLAS fallback for small dense lumps (D→H copy + BLAS + H→D)
 - Lazy bulk-copy cache for readValue (eliminates 25K × 10μs cudaMemcpy calls)
-- BASPACHO_PROFILE_LU env var for per-phase timing
+- SPRUX_PROFILE_LU env var for per-phase timing
 - Async H→D transfer via pinned memory
 
 ### Performance

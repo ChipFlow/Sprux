@@ -173,11 +173,11 @@ struct Optimizer {
   void applyStep() {
     auto accessor = solver->accessor();
     for (int64_t i = 0; i < numPts; i++) {
-      BASPACHO_CHECK_LE(accessor.paramStart(i) + 3, step.size());
+      SPRUX_CHECK_LE(accessor.paramStart(i) + 3, step.size());
       data.points[i] -= step.segment<3>(accessor.paramStart(i));
     }
     for (int64_t i = numPts; i < totNumParams; i++) {
-      BASPACHO_CHECK_LE(accessor.paramStart(i) + 6, step.size());
+      SPRUX_CHECK_LE(accessor.paramStart(i) + 6, step.size());
       data.cameras[i - numPts].T_W_C = Sophus::SE3d::exp(-step.segment<6>(accessor.paramStart(i))) *
                                        data.cameras[i - numPts].T_W_C;
     }

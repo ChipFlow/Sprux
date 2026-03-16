@@ -9,7 +9,7 @@
 
 #include <amd.h>
 
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
 #include <cholmod.h>
 #endif
 
@@ -41,7 +41,7 @@ SparseStructure SparseStructure::transpose() const {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       retv.ptrs[j]++;
     }
   }
@@ -54,8 +54,8 @@ SparseStructure SparseStructure::transpose() const {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
-      BASPACHO_CHECK_LT(retv.ptrs[j], (int64_t)retv.inds.size());
+      SPRUX_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(retv.ptrs[j], (int64_t)retv.inds.size());
       retv.inds[retv.ptrs[j]++] = i;
     }
   }
@@ -76,7 +76,7 @@ SparseStructure SparseStructure::clear(bool lowerHalf) const {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       if (i != j && (j > i) == lowerHalf) {
         continue;
       }
@@ -92,11 +92,11 @@ SparseStructure SparseStructure::clear(bool lowerHalf) const {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       if (i != j && (j > i) == lowerHalf) {
         continue;
       }
-      BASPACHO_CHECK_LT(retv.ptrs[i], (int64_t)retv.inds.size());
+      SPRUX_CHECK_LT(retv.ptrs[i], (int64_t)retv.inds.size());
       retv.inds[retv.ptrs[i]++] = j;
     }
   }
@@ -109,7 +109,7 @@ SparseStructure SparseStructure::clear(bool lowerHalf) const {
 SparseStructure SparseStructure::symmetricPermutation(const std::vector<int64_t>& mapPerm,
                                                       bool lowerHalf, bool sortIndices) const {
   int64_t ord = order();
-  BASPACHO_CHECK_EQ(ord, (int64_t)mapPerm.size());
+  SPRUX_CHECK_EQ(ord, (int64_t)mapPerm.size());
 
   SparseStructure retv;
   retv.ptrs.assign(ord + 1, 0);
@@ -118,12 +118,12 @@ SparseStructure SparseStructure::symmetricPermutation(const std::vector<int64_t>
     int64_t start = ptrs[i];
     int64_t end = ptrs[i + 1];
     int64_t newI = mapPerm[i];
-    BASPACHO_CHECK_LT(newI, ord);
+    SPRUX_CHECK_LT(newI, ord);
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       int64_t newJ = mapPerm[j];
-      BASPACHO_CHECK_LT(newJ, ord);
+      SPRUX_CHECK_LT(newJ, ord);
       int64_t col = lowerHalf ? min(newI, newJ) : max(newI, newJ);
       retv.ptrs[col]++;
     }
@@ -136,15 +136,15 @@ SparseStructure SparseStructure::symmetricPermutation(const std::vector<int64_t>
     int64_t start = ptrs[i];
     int64_t end = ptrs[i + 1];
     int64_t newI = mapPerm[i];
-    BASPACHO_CHECK_LT(newI, ord);
+    SPRUX_CHECK_LT(newI, ord);
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       int64_t newJ = mapPerm[j];
-      BASPACHO_CHECK_LT(newJ, ord);
+      SPRUX_CHECK_LT(newJ, ord);
       int64_t col = lowerHalf ? min(newI, newJ) : max(newI, newJ);
       int64_t row = lowerHalf ? max(newI, newJ) : min(newI, newJ);
-      BASPACHO_CHECK_LT(retv.ptrs[col], (int64_t)retv.inds.size());
+      SPRUX_CHECK_LT(retv.ptrs[col], (int64_t)retv.inds.size());
       retv.inds[retv.ptrs[col]++] = row;
     }
   }
@@ -292,7 +292,7 @@ SparseStructure SparseStructure::addFullEliminationFill() const {
   return retv;
 }
 
-#ifdef BASPACHO_HAVE_CHOLMOD
+#ifdef SPRUX_HAVE_CHOLMOD
 
 SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   static_assert(sizeof(SuiteSparse_long) == sizeof(int64_t),
@@ -311,7 +311,7 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   cholmod_common c;
   cholmod_l_start(&c);
 
-  // RAII-style cleanup to prevent resource leaks if BASPACHO_CHECK throws
+  // RAII-style cleanup to prevent resource leaks if SPRUX_CHECK throws
   auto cleanup = [&](cholmod_factor** Lptr) {
     if (Lptr && *Lptr) {
       cholmod_l_free_factor(Lptr, &c);
@@ -365,15 +365,15 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   cholmod_factor* L = cholmod_l_analyze(&A, &c);
   if (!L) {
     cleanup(&L);
-    BASPACHO_CHECK_NOTNULL(L);
+    SPRUX_CHECK_NOTNULL(L);
   }
 
   // Numeric factorization populates L->p and L->i with the actual fill pattern
   int ok = cholmod_l_factorize(&A, L, &c);
   if (!ok || c.status != CHOLMOD_OK) {
     cleanup(&L);
-    BASPACHO_CHECK(ok);
-    BASPACHO_CHECK(c.status == CHOLMOD_OK);
+    SPRUX_CHECK(ok);
+    SPRUX_CHECK(c.status == CHOLMOD_OK);
   }
 
   // For simplicial LDL'/LL', L->p[k] gives start of column k, L->nz[k] gives count.
@@ -414,7 +414,7 @@ SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
 
 SparseStructure SparseStructure::addFullEliminationFillCholmod() const {
   throw std::runtime_error(
-      "addFullEliminationFillCholmod requires CHOLMOD (build with BASPACHO_HAVE_CHOLMOD)");
+      "addFullEliminationFillCholmod requires CHOLMOD (build with SPRUX_HAVE_CHOLMOD)");
 }
 
 #endif
@@ -427,15 +427,15 @@ std::vector<int64_t> SparseStructure::fillReducingPermutation() const {
   amd_l_defaults(Control);
 
   int result = amd_l_order(P.size(), colPtr.data(), rowInd.data(), P.data(), Control, Info);
-  BASPACHO_CHECK_EQ(result, AMD_OK);
+  SPRUX_CHECK_EQ(result, AMD_OK);
 
   return std::vector<int64_t>(P.begin(), P.end());
 }
 
 SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
   int64_t ord = order();
-  BASPACHO_CHECK_LE(startRow, ord);
-  BASPACHO_CHECK_GE(startRow, 0);
+  SPRUX_CHECK_LE(startRow, ord);
+  SPRUX_CHECK_GE(startRow, 0);
   int64_t newOrd = ord - startRow;
 
   SparseStructure retv;
@@ -446,7 +446,7 @@ SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       if (j >= startRow) {
         retv.ptrs[i - startRow]++;
       }
@@ -461,9 +461,9 @@ SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
     int64_t end = ptrs[i + 1];
     for (int64_t k = start; k < end; k++) {
       int64_t j = inds[k];
-      BASPACHO_CHECK_LT(j, ord);
+      SPRUX_CHECK_LT(j, ord);
       if (j >= startRow) {
-        BASPACHO_CHECK_LT(retv.ptrs[i - startRow], (int64_t)retv.inds.size());
+        SPRUX_CHECK_LT(retv.ptrs[i - startRow], (int64_t)retv.inds.size());
         retv.inds[retv.ptrs[i - startRow]++] = j - startRow;
       }
     }

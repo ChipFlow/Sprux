@@ -57,7 +57,7 @@ struct CpuBaseSymbolicCtx : SymbolicCtx {
     for (int64_t i = elim.rowPtr[sRel], iEnd = elim.rowPtr[sRel + 1]; i < iEnd; i++) {
       int64_t lump = elim.colLump[i];
       int64_t chainColOrd = elim.chainColOrd[i];
-      BASPACHO_CHECK_GE(chainColOrd,
+      SPRUX_CHECK_GE(chainColOrd,
                         1);  // there must be a diagonal block
 
       int64_t ptrStart = skel.chainColPtr[lump] + chainColOrd;
@@ -250,7 +250,7 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
   // This is like saveSyrkGemm but each column of L is scaled by D[j]
   virtual void saveSyrkGemmScaled(int64_t m, int64_t n, int64_t k, T* data, int64_t offL,
                                   int64_t offD, int64_t ldD) override {
-    BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+    SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
     const T* L = data + offL;
     const T* D = data + offD;  // Diagonal block, D[j] at position D[j * ldD + j]
@@ -279,7 +279,7 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
   virtual void saveSyrkGemm(int64_t m, int64_t n, int64_t k, const T* data,
                             int64_t offset) override {
     auto timer = sym.sygeStat.instance(sizeof(T), m, n, k);
-    BASPACHO_CHECK_LE(m * n, (int64_t)tempBuffer.size());
+    SPRUX_CHECK_LE(m * n, (int64_t)tempBuffer.size());
 
     const T* AB = data + offset;
     T* C = tempBuffer.data();
@@ -419,17 +419,17 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
     for (int64_t i = elim.rowPtr[sRel], iEnd = elim.rowPtr[sRel + 1]; i < iEnd; i++) {
       int64_t lump = elim.colLump[i];
       int64_t chainColOrd = elim.chainColOrd[i];
-      BASPACHO_CHECK_GE(chainColOrd,
+      SPRUX_CHECK_GE(chainColOrd,
                         1);  // there must be a diagonal block
 
       int64_t ptrStart = skel.chainColPtr[lump] + chainColOrd;
       int64_t ptrEnd = skel.chainColPtr[lump + 1];
-      BASPACHO_CHECK_EQ(pChainRowSpan[ptrStart], s);
+      SPRUX_CHECK_EQ(pChainRowSpan[ptrStart], s);
 
       int64_t nRowsAbove = pChainRowsTillEnd[ptrStart - 1];
       int64_t nRowsChain = pChainRowsTillEnd[ptrStart] - nRowsAbove;
       T* origDataStart = data + skel.chainData[ptrStart];
-      BASPACHO_CHECK_EQ(nRowsChain, skel.spanStart[s + 1] - skel.spanStart[s]);
+      SPRUX_CHECK_EQ(nRowsChain, skel.spanStart[s + 1] - skel.spanStart[s]);
       int64_t lumpSize = skel.lumpStart[lump + 1] - skel.lumpStart[lump];
 
       T* headTargetData = data + spanOffsetInLump + pSpanToChainOffset[pChainRowSpan[ptrStart]];
@@ -445,7 +445,7 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
         int64_t s2_size = nextRelRow - relRow;
 
         // incomment below if check is needed
-        // BASPACHO_CHECK(spanToChainOffset[s2] != kInvalid);
+        // SPRUX_CHECK(spanToChainOffset[s2] != kInvalid);
         T* targetData = data + spanOffsetInLump + pSpanToChainOffset[s2];
 
         nextDataStart = elimBlock(s2_size, nRowsChain, lumpSize, targetData, targetLumpSize,
@@ -471,18 +471,18 @@ struct CpuBaseNumericCtx : NumericCtx<T> {
     for (int64_t i = elim.rowPtr[sRel], iEnd = elim.rowPtr[sRel + 1]; i < iEnd; i++) {
       int64_t lump = elim.colLump[i];
       int64_t chainColOrd = elim.chainColOrd[i];
-      BASPACHO_CHECK_GE(chainColOrd,
+      SPRUX_CHECK_GE(chainColOrd,
                         1);  // there must be a diagonal block
 
       int64_t ptrStart = skel.chainColPtr[lump] + chainColOrd;
       int64_t ptrEnd = skel.chainColPtr[lump + 1];
-      BASPACHO_CHECK_EQ(skel.chainRowSpan[ptrStart], s);
+      SPRUX_CHECK_EQ(skel.chainRowSpan[ptrStart], s);
 
       int64_t nRowsAbove = skel.chainRowsTillEnd[ptrStart - 1];
       int64_t nRowsChain = skel.chainRowsTillEnd[ptrStart] - nRowsAbove;
       int64_t nRowsOnward = skel.chainRowsTillEnd[ptrEnd - 1];
       int64_t dataOffset = skel.chainData[ptrStart];
-      BASPACHO_CHECK_EQ(nRowsChain, skel.spanStart[s + 1] - skel.spanStart[s]);
+      SPRUX_CHECK_EQ(nRowsChain, skel.spanStart[s + 1] - skel.spanStart[s]);
       int64_t lumpSize = skel.lumpStart[lump + 1] - skel.lumpStart[lump];
 
       Eigen::Map<MatRMaj<T>> chainSubMat(data + dataOffset, nRowsChain, lumpSize);
