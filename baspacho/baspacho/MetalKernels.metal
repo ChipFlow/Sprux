@@ -2391,6 +2391,78 @@ kernel void refine_spmv_kernel_float(
     xGpu[perm[j]] = rowScale[j] * residual;
 }
 
+// ---- Batched cross-matrix kernels ----
+// These process all matrices in a single dispatch using interleaved thread layout:
+//   tid = elem_id * nMat + mat_id
+// Within a SIMD group, threads from different matrices share CSR index reads
+// (broadcast) while their data reads target independent memory ranges, generating
+// maximum concurrent memory requests to hide SLC latency.
+
+// Batched accumulate: unpermute correction and accumulate into double-float solution
+// for all matrices in one dispatch.
+kernel void refine_accumulate_batch_kernel_float(
+    device const int32_t* perm [[buffer(0)]],
+    device float* allColScale [[buffer(1)]],
+    device float2* allXAccum [[buffer(2)]],
+    device const float* allXGpu [[buffer(3)]],
+    constant int32_t& nMat [[buffer(4)]],
+    constant int32_t& n [[buffer(5)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(nMat) * uint(n)) return;
+    int32_t mat_id = int32_t(tid) % nMat;
+    int32_t j = int32_t(tid) / nMat;
+    int32_t offset = mat_id * n;
+    float correction = allColScale[offset + j] * allXGpu[offset + perm[j]];
+    float hi, lo;
+    dfAdd(allXAccum[offset + j].x, allXAccum[offset + j].y, correction, hi, lo);
+    allXAccum[offset + j] = float2(hi, lo);
+}
+
+// Batched SpMV residual: compute r = rowScale * (b - A * x_accum) for all matrices
+// in one dispatch. Shared CSR structure (csrRowPtr, csrColInd, perm, rowPerm) is
+// broadcast within SIMD groups; per-matrix data accessed via offsets.
+kernel void refine_spmv_batch_kernel_float(
+    device const int32_t* csrRowPtr [[buffer(0)]],
+    device const int32_t* csrColInd [[buffer(1)]],
+    device const float* allCsrValues [[buffer(2)]],
+    device const int32_t* perm [[buffer(3)]],
+    device const int32_t* rowPerm [[buffer(4)]],
+    device const float* allRowScale [[buffer(5)]],
+    device const float* allB [[buffer(6)]],
+    device const float2* allXAccum [[buffer(7)]],
+    device float* allXGpu [[buffer(8)]],
+    constant int32_t& nMat [[buffer(9)]],
+    constant int32_t& n [[buffer(10)]],
+    constant int32_t& nnz [[buffer(11)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= uint(nMat) * uint(n)) return;
+    int32_t mat_id = int32_t(tid) % nMat;
+    int32_t j = int32_t(tid) / nMat;
+    int32_t vecOff = mat_id * n;
+    int32_t csrOff = mat_id * nnz;
+    int32_t srcRow = rowPerm[j];
+
+    // Double-float dot product: sum = A[srcRow,:] * x_accum
+    float sum_hi = 0.0f, sum_lo = 0.0f;
+    for (int32_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
+        float2 x = allXAccum[vecOff + csrColInd[k]];
+        float val = allCsrValues[csrOff + k];
+
+        // TwoProd: val * x.x = prod_hi + prod_err (exact via FMA)
+        float prod_hi, prod_err;
+        twoProd(val, x.x, prod_hi, prod_err);
+
+        // Accumulate prod_hi with compensated addition, prod_lo directly
+        dfAdd(sum_hi, sum_lo, prod_hi, sum_hi, sum_lo);
+        sum_lo += prod_err + val * x.y;
+    }
+    // Residual: b - sum, computed in double-float
+    float residual = (allB[vecOff + srcRow] - sum_hi) - sum_lo;
+    allXGpu[vecOff + perm[j]] = allRowScale[vecOff + j] * residual;
+}
+
 // SIMD-group reduction for double-float pairs.
 // Uses simd_shuffle_down with compensated addition to preserve ~float64 precision.
 // Result is in lane 0 after reduction.
