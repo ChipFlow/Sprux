@@ -3670,6 +3670,131 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
     @autoreleasepool {
       if (numLumps <= 0) return;
 
+      // CPU path: cycle external encoder, run CPU triangular solves + gemv.
+      // ~10-50us on CPU vs ~1.12ms on GPU (single threadgroup).
+      {
+        if (sym.usingExternalEncoder) {
+          [sym.externalEncoder endEncoding];
+          sym.externalEncoder = nil;
+          [sym.externalCmdBuf commit];
+          [sym.externalCmdBuf waitUntilCompleted];
+          sym.externalCmdBuf = nil;
+        } else {
+          commitPending();
+          waitForGpu();
+        }
+
+        const int64_t* chainRowsTillEnd = sym.skel.chainRowsTillEnd.data();
+        const int64_t* chainRowSpan = sym.skel.chainRowSpan.data();
+        const int64_t* spanStarts = sym.skel.spanStart.data();
+        const int64_t* upperChainRowPtr = sym.skel.upperChainRowPtr.data();
+        const int64_t* upperChainColSpan = sym.skel.upperChainColSpan.data();
+        const int64_t* upperChainData = sym.skel.upperChainData.data();
+        int64_t upperDataBase = sym.skel.dataSize();
+
+        // Temp buffer for below-diagonal gemv results
+        int32_t maxRows = 0;
+        for (int64_t i = 0; i < numLumps; i++)
+          maxRows = std::max(maxRows, fwdInfos[i].numRowsBelowDiag);
+        std::vector<float> tempVec(maxRows * nRHS);
+
+        // Cast away const for unified memory pointer arithmetic
+        float* dataW = const_cast<float*>(data);
+        float* vecW = vecData;
+
+        // === Forward L phase ===
+        for (int32_t li = 0; li < numLumps; li++) {
+          const auto& info = fwdInfos[li];
+          int64_t n = info.lumpSize;
+          const float* L = data + info.diagOffset;
+          float* x = vecW + info.lumpStart;
+
+          // Unit lower triangular solve (row-major L)
+          for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            float* xr = x + rhs * stride;
+            for (int64_t i = 0; i < n; i++)
+              for (int64_t j = i + 1; j < n; j++)
+                xr[j] -= L[j * n + i] * xr[i];
+          }
+
+          if (info.numRowsBelowDiag <= 0) continue;
+
+          // Gemv: tempVec = -M_below * x_diag
+          const float* M = data + info.belowDiagOffset;
+          int64_t rows = info.numRowsBelowDiag;
+          for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            const float* xr = x + rhs * stride;
+            float* tv = tempVec.data() + rhs * rows;
+            for (int64_t r = 0; r < rows; r++) {
+              float sum = 0.0f;
+              for (int64_t c = 0; c < n; c++)
+                sum += M[r * n + c] * xr[c];
+              tv[r] = -sum;
+            }
+          }
+
+          // Scatter tempVec → vecData using chain structure
+          int64_t chainBase = info.chainColPtr;
+          int64_t row = info.startRow;
+          for (int32_t ci = 0; ci < info.numColItems; ci++) {
+            int64_t rowEnd = chainRowsTillEnd[chainBase + ci];
+            int64_t span = chainRowSpan[chainBase + ci];
+            int64_t spanOff = spanStarts[span];
+            for (; row < rowEnd; row++) {
+              for (int64_t rhs = 0; rhs < nRHS; rhs++)
+                vecW[spanOff + rhs * stride] += tempVec[rhs * rows + (row - info.startRow)];
+              spanOff++;
+            }
+          }
+        }
+
+        // === Backward U phase ===
+        for (int32_t li = numLumps - 1; li >= 0; li--) {
+          const auto& bInfo = bwdInfos[li];
+          int64_t n = bInfo.lumpSize;
+          int32_t lump = bInfo.lumpIndex;
+
+          // Gather: y -= U * x for each upper chain entry
+          int64_t upperRowStart = upperChainRowPtr[lump];
+          int64_t upperRowEnd = upperChainRowPtr[lump + 1];
+          for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+            int64_t colSpan = upperChainColSpan[i];
+            int64_t colStart = spanStarts[colSpan];
+            int64_t colSize = spanStarts[colSpan + 1] - colStart;
+            const float* U = data + upperDataBase + upperChainData[i];
+            for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+              float* yr = vecW + bInfo.lumpStart + rhs * stride;
+              const float* xr = vecW + colStart + rhs * stride;
+              for (int64_t r = 0; r < n; r++) {
+                float sum = 0.0f;
+                for (int64_t c = 0; c < colSize; c++)
+                  sum += U[r * colSize + c] * xr[c];
+                yr[r] -= sum;
+              }
+            }
+          }
+
+          // Upper triangular solve (row-major U)
+          const float* Udiag = data + bInfo.diagOffset;
+          for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            float* xr = vecW + bInfo.lumpStart + rhs * stride;
+            for (int64_t i = n - 1; i >= 0; i--) {
+              for (int64_t j = i + 1; j < n; j++)
+                xr[i] -= Udiag[i * n + j] * xr[j];
+              xr[i] /= Udiag[i * n + i];
+            }
+          }
+        }
+
+        // Re-create external encoder for subsequent GPU dispatches
+        if (sym.usingExternalEncoder) {
+          sym.externalCmdBuf = [sym.commandQueue commandBuffer];
+          sym.externalEncoder = [sym.externalCmdBuf computeCommandEncoder];
+        }
+        return;
+      }
+
+      // GPU path (unreachable with CPU path above, kept for reference)
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
       if (!dataBufferInfo.first || !vecBufferInfo.first) {
