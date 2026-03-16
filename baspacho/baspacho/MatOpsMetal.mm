@@ -3634,74 +3634,117 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   virtual void fusedDenseSolveLU(const float* data, float* vecData, int64_t stride,
       int64_t numLumps, const ForwardLLumpInfo* fwdInfos,
       const BackwardULumpInfo* bwdInfos) override {
-    @autoreleasepool {
-      if (numLumps <= 0) return;
+    if (numLumps <= 0) return;
 
-      auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
-      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
-      if (!dataBufferInfo.first || !vecBufferInfo.first) {
-        throw std::runtime_error("MetalSolveCtx::fusedDenseSolveLU: buffer not found");
+    // CPU fallback: single-threadgroup GPU kernel is single-core bound.
+    // CPU processes 16 dense lumps (max n=111) in ~10-50us vs ~1-2ms on GPU.
+    commitPending();
+    waitForGpu();
+
+    const int64_t* chainRowsTillEnd = sym.devChainRowsTillEnd.ptr();
+    const int64_t* chainRowSpan = sym.devChainRowSpan.ptr();
+    const int64_t* spanStarts = sym.devSpanStart.ptr();
+    const int64_t* upperChainRowPtr = sym.devUpperChainRowPtr.ptr();
+    const int64_t* upperChainColSpan = sym.devUpperChainColSpan.ptr();
+    const int64_t* upperChainData = sym.devUpperChainData.ptr();
+    int64_t upperDataBase = sym.skel.dataSize();
+
+    // Temp buffer for below-diagonal gemv results
+    int32_t maxRows = 0;
+    for (int64_t i = 0; i < numLumps; i++) {
+      maxRows = std::max(maxRows, fwdInfos[i].numRowsBelowDiag);
+    }
+    std::vector<float> tempVec(maxRows * nRHS);
+
+    // === Forward L phase ===
+    for (int32_t li = 0; li < numLumps; li++) {
+      const auto& info = fwdInfos[li];
+      int64_t n = info.lumpSize;
+      const float* L = data + info.diagOffset;
+      float* x = vecData + info.lumpStart;
+
+      // Unit lower triangular solve (row-major L from getrf)
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float* xr = x + rhs * stride;
+        for (int64_t i = 0; i < n; i++) {
+          for (int64_t j = i + 1; j < n; j++) {
+            xr[j] -= L[j * n + i] * xr[i];
+          }
+        }
       }
-      id<MTLBuffer> dataBuffer = (__bridge id<MTLBuffer>)dataBufferInfo.first;
-      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
-      size_t dataBaseOffset = dataBufferInfo.second;
-      size_t vecBaseOffset = vecBufferInfo.second;
 
-      // Compute max numRowsBelowDiag for tempVec sizing
-      int32_t maxRows = 0;
-      for (int64_t i = 0; i < numLumps; i++) {
-        if (fwdInfos[i].numRowsBelowDiag > maxRows)
-          maxRows = fwdInfos[i].numRowsBelowDiag;
+      if (info.numRowsBelowDiag <= 0) continue;
+
+      // Gemv: tempVec = -M_below * x_diag
+      const float* Mbelow = data + info.belowDiagOffset;
+      int64_t m = info.numRowsBelowDiag;
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        const float* xr = x + rhs * stride;
+        for (int64_t i = 0; i < m; i++) {
+          float sum = 0.0f;
+          for (int64_t j = 0; j < n; j++) {
+            sum += Mbelow[i * n + j] * xr[j];
+          }
+          tempVec[i + rhs * m] = -sum;
+        }
       }
-      tempVecBuffer.resizeToAtLeast(maxRows * nRHS);
 
-      // Threadgroup size: max of all lump sizes and numRowsBelowDiag (from forward L)
-      int maxThr = 0;
-      for (int64_t i = 0; i < numLumps; i++) {
-        maxThr = std::max(maxThr, (int)fwdInfos[i].lumpSize);
-        maxThr = std::max(maxThr, (int)fwdInfos[i].numRowsBelowDiag);
+      // AssembleVec: scatter tempVec → vecData using chain structure
+      int64_t startRow = info.startRow;
+      for (int32_t ci = 0; ci < info.numColItems; ci++) {
+        int64_t rowEnd = chainRowsTillEnd[info.chainColPtr + ci];
+        int64_t span = chainRowSpan[info.chainColPtr + ci];
+        int64_t dstStart = spanStarts[span];
+        int64_t numRows = rowEnd - startRow;
+        for (int64_t r = 0; r < numRows; r++) {
+          for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+            vecData[dstStart + r + rhs * stride] += tempVec[startRow + r + rhs * m];
+          }
+        }
+        startRow = rowEnd;
       }
-      maxThr = std::min(maxThr, 256);
-      int numThreads = 1;
-      while (numThreads < maxThr) numThreads <<= 1;
+    }
 
-      id<MTLComputePipelineState> pipeline = getPipeline(
-              "lu_fusedDenseSolve_kernel_float");
+    // === Backward U phase ===
+    for (int32_t li = numLumps - 1; li >= 0; li--) {
+      const auto& bInfo = bwdInfos[li];
+      int64_t n = bInfo.lumpSize;
+      int32_t lump = bInfo.lumpIndex;
 
-      int64_t nRHS64 = nRHS;
-      int64_t upperDataBase = sym.skel.dataSize();
-      int32_t numLumps32 = (int32_t)numLumps;
-      encodeKernelWithGroups(
-          pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
-            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
-            // Forward L buffers
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowsTillEnd.buffer()
-                        offset:0 atIndex:4];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainRowSpan.buffer()
-                        offset:0 atIndex:5];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                        offset:0 atIndex:6];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)tempVecBuffer.buffer()
-                        offset:0 atIndex:7];
-            [encoder setBytes:fwdInfos length:numLumps * sizeof(ForwardLLumpInfo) atIndex:8];
-            // Backward U buffers
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
-                        offset:0 atIndex:9];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                        offset:0 atIndex:10];
-            [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                        offset:0 atIndex:11];
-            [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:12];
-            [encoder setBytes:bwdInfos length:numLumps * sizeof(BackwardULumpInfo) atIndex:13];
-            // Shared
-            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:14];
-          },
-          1,  // single threadgroup
-          (NSUInteger)numThreads);
+      // Gather upper chain contributions: y -= U_upper * x_col
+      int64_t upperRowStart = upperChainRowPtr[lump];
+      int64_t upperRowEnd = upperChainRowPtr[lump + 1];
+      for (int64_t i = upperRowStart; i < upperRowEnd; i++) {
+        int64_t colSpan = upperChainColSpan[i];
+        int64_t colStart = spanStarts[colSpan];
+        int64_t colSize = spanStarts[colSpan + 1] - colStart;
+        int64_t dataOff = upperDataBase + upperChainData[i];
+        const float* Ublock = data + dataOff;
+        for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+          const float* src = vecData + colStart + rhs * stride;
+          float* dst = vecData + bInfo.lumpStart + rhs * stride;
+          for (int64_t row = 0; row < n; row++) {
+            float sum = 0.0f;
+            for (int64_t col = 0; col < colSize; col++) {
+              sum += Ublock[row * colSize + col] * src[col];
+            }
+            dst[row] -= sum;
+          }
+        }
+      }
+
+      // Upper triangular solve (row-major U from getrf)
+      const float* U = data + bInfo.diagOffset;
+      float* x = vecData + bInfo.lumpStart;
+      for (int64_t rhs = 0; rhs < nRHS; rhs++) {
+        float* xr = x + rhs * stride;
+        for (int64_t i = n - 1; i >= 0; i--) {
+          xr[i] /= U[i * n + i];
+          for (int64_t j = 0; j < i; j++) {
+            xr[j] -= U[j * n + i] * xr[i];
+          }
+        }
+      }
     }
   }
 
