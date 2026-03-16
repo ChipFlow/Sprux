@@ -1016,47 +1016,23 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
             (NSUInteger)numLumps);
       }
 
-      // Step 2: LU Schur complement — two-phase deterministic elimination
-      if (elim.numWorkItems > 0 && elim.numSegments > 0) {
-        elimScratchBuffer.resizeToAtLeast(elim.numWorkItems);
-
-        // Phase 1: compute products into scratch
-        id<MTLComputePipelineState> p1Pipeline =
+      // Step 2: LU Schur complement — atomic elimination (single kernel)
+      // Uses atomicSub directly; iterative refinement compensates for float precision.
+      if (elim.numWorkItems > 0) {
+        id<MTLComputePipelineState> elimPipeline =
             (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-                "lu_sparse_elim_phase1_float");
+                "lu_sparse_elim_precomputed_float");
 
         dispatchKernel(
-            sym.commandQueue, p1Pipeline,
+            sym.commandQueue, elimPipeline,
             ^(id<MTLComputeCommandEncoder> encoder) {
               [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
               [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
                           offset:0
                          atIndex:1];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
-                          offset:0
-                         atIndex:2];
-              [encoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:3];
+              [encoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
             },
             (NSUInteger)elim.numWorkItems);
-
-        // Phase 2: deterministic segmented sum
-        id<MTLComputePipelineState> p2Pipeline =
-            (__bridge id<MTLComputePipelineState>)MetalContext::instance().getPipelineState(
-                "sparse_elim_phase2_float");
-
-        dispatchKernel(
-            sym.commandQueue, p2Pipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
-                          offset:0
-                         atIndex:1];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)elim.devSegments.buffer()
-                          offset:0
-                         atIndex:2];
-              [encoder setBytes:&elim.numSegments length:sizeof(int64_t) atIndex:3];
-            },
-            (NSUInteger)elim.numSegments);
       }
 
       // Read back perturb count
@@ -1065,8 +1041,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   }
 
   // Batch all LU sparse elimination levels into a single command buffer
-  // on the ASYNC queue. Uses two-phase deterministic accumulation:
-  //   Phase 1: compute L*U products into scratch buffer (no atomics)
+  // on the ASYNC queue. Uses atomic elimination (single kernel per level):
   //   Phase 2: segmented sum per target in fixed order (deterministic)
   // Signals the shared event so beginDenseOps/waitForGpu can synchronize.
   void doAllEliminationsLU(const std::vector<SymElimCtxPtr>& elimCtxs,
@@ -1090,22 +1065,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
       id<MTLComputePipelineState> factorPipeline =
           getPipeline("lu_factor_lumps_kernel_float");
-      id<MTLComputePipelineState> phase1Pipeline =
-          getPipeline("lu_sparse_elim_phase1_float");
-      id<MTLComputePipelineState> phase2Pipeline =
-          getPipeline("sparse_elim_phase2_float");
-
-      // Compute max scratch buffer size across all levels
-      int64_t maxScratchSize = 0;
-      for (size_t l = 0; l + 1 < ranges.size(); l++) {
-        if (!elimCtxs[l]) continue;
-        const MetalSymElimCtx& elim =
-            *dynamic_cast<const MetalSymElimCtx*>(elimCtxs[l].get());
-        maxScratchSize = std::max(maxScratchSize, elim.numWorkItems);
-      }
-      if (maxScratchSize > 0) {
-        elimScratchBuffer.resizeToAtLeast(maxScratchSize);
-      }
+      id<MTLComputePipelineState> elimPipeline =
+          getPipeline("lu_sparse_elim_precomputed_float");
 
       // Create a dedicated command buffer on the ASYNC queue.
       id<MTLCommandBuffer> asyncCmdBuf = [sym.asyncCommandQueue commandBuffer];
@@ -1155,40 +1116,21 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                      threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
         dispatchCount++;
 
-        // LU Schur complement: two-phase deterministic elimination
-        if (elim.numWorkItems > 0 && elim.numSegments > 0) {
-          // Phase 1: compute products into scratch buffer
+        // LU Schur complement: atomic elimination (single kernel)
+        // Uses atomicSub directly; iterative refinement compensates for float precision.
+        if (elim.numWorkItems > 0) {
           [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-          [asyncEncoder setComputePipelineState:phase1Pipeline];
+          [asyncEncoder setComputePipelineState:elimPipeline];
           [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
           [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devWorkItems.buffer()
                            offset:0 atIndex:1];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
-                           offset:0 atIndex:2];
-          [asyncEncoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:3];
+          [asyncEncoder setBytes:&elim.numWorkItems length:sizeof(int64_t) atIndex:2];
 
-          NSUInteger etgs = MIN(phase1Pipeline.maxTotalThreadsPerThreadgroup, 256);
+          NSUInteger etgs = MIN(elimPipeline.maxTotalThreadsPerThreadgroup, 256);
           etgs = MIN(etgs, (NSUInteger)elim.numWorkItems);
           [asyncEncoder dispatchThreadgroups:
               MTLSizeMake(((NSUInteger)elim.numWorkItems + etgs - 1) / etgs, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(etgs, 1, 1)];
-          dispatchCount++;
-
-          // Phase 2: deterministic segmented sum
-          [asyncEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-          [asyncEncoder setComputePipelineState:phase2Pipeline];
-          [asyncEncoder setBuffer:dataBuffer offset:dataBaseOffset atIndex:0];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elimScratchBuffer.buffer()
-                           offset:0 atIndex:1];
-          [asyncEncoder setBuffer:(__bridge id<MTLBuffer>)elim.devSegments.buffer()
-                           offset:0 atIndex:2];
-          [asyncEncoder setBytes:&elim.numSegments length:sizeof(int64_t) atIndex:3];
-
-          NSUInteger stgs = MIN(phase2Pipeline.maxTotalThreadsPerThreadgroup, 256);
-          stgs = MIN(stgs, (NSUInteger)elim.numSegments);
-          [asyncEncoder dispatchThreadgroups:
-              MTLSizeMake(((NSUInteger)elim.numSegments + stgs - 1) / stgs, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(stgs, 1, 1)];
           dispatchCount++;
         }
       }
