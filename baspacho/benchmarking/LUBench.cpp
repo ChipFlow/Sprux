@@ -446,9 +446,7 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
 
     symCtx.setExternalEncoder(cmdBuf, encoder);
     solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
-    symCtx.clearExternalEncoder();
-
-    metalCtx.commitAndWait(cmdBuf);
+    symCtx.clearExternalEncoder();  // ends encoder, commits+waits
     numCtx->flush();
 
     res.factorTime = tdelta(Clock::now() - tFactor).count();
@@ -473,8 +471,7 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
       symCtx.setExternalEncoder(cmdBuf2, encoder2);
       solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
                       *solveCtx, PivotLocation::Device);
-      symCtx.clearExternalEncoder();
-      metalCtx.commitAndWait(cmdBuf2);
+      symCtx.clearExternalEncoder();  // ends encoder, commits+waits
     }
     memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
     for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
@@ -506,8 +503,7 @@ static vector<LUTimingResult> benchmarkLUMetalExternalEncoder(
         symCtx.setExternalEncoder(cmdBuf2, encoder2);
         solver->solveLU(dataGpu.ptr(), devPivots.ptr(), xGpu.ptr(), n, 1,
                         *solveCtx, PivotLocation::Device);
-        symCtx.clearExternalEncoder();
-        metalCtx.commitAndWait(cmdBuf2);
+        symCtx.clearExternalEncoder();  // ends encoder, commits+waits
       }
       memcpy(xVec.data(), xGpu.ptr(), n * sizeof(float));
       for (int64_t j = 0; j < n; j++) bp(j) = xVec[j];
@@ -975,8 +971,7 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     }
   }
 
-  symCtx.clearExternalEncoder();
-  metalCtx.commitAndWait(cmdBuf);
+  symCtx.clearExternalEncoder();  // ends encoder, commits+waits
 
   double totalGpuTime = tdelta(Clock::now() - tGpu).count();
 

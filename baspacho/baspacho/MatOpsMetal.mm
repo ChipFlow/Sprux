@@ -432,9 +432,13 @@ struct MetalSymbolicCtx : SymbolicCtx {
   void clearExternalEncoder() override {
     if (externalEncoder) {
       [externalEncoder endEncoding];
+      externalEncoder = nil;
     }
-    externalCmdBuf = nil;
-    externalEncoder = nil;
+    if (externalCmdBuf) {
+      [externalCmdBuf commit];
+      [externalCmdBuf waitUntilCompleted];
+      externalCmdBuf = nil;
+    }
     usingExternalEncoder = false;
   }
 
@@ -1704,10 +1708,20 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 #ifdef BASPACHO_USE_BLAS
       // CPU BLAS path for larger lumps: multi-threaded LAPACK sgetrf (~10-50μs)
       // is much faster than single-threadgroup GPU kernel (~1ms for n≥64).
-      // The commit+wait sync cost (~100-200μs) is recovered by the speedup.
-      if (!sym.usingExternalEncoder && minMN >= 64) {
-        commitPending();
-        waitForGpu();
+      // In external encoder mode, we cycle the encoder (end→commit→wait→CPU→
+      // re-create) since unified memory means CPU BLAS works on the same data.
+      if (minMN >= 64) {
+        if (sym.usingExternalEncoder) {
+          // End current encoder and commit the command buffer
+          [sym.externalEncoder endEncoding];
+          sym.externalEncoder = nil;
+          [sym.externalCmdBuf commit];
+          [sym.externalCmdBuf waitUntilCompleted];
+          sym.externalCmdBuf = nil;
+        } else {
+          commitPending();
+          waitForGpu();
+        }
         float* A = data + offA;
 
         // BaSpaCho stores row-major; LAPACK expects col-major.
@@ -1744,6 +1758,12 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         // Also write to host pivots array
         for (int64_t i = 0; i < minMN; i++) {
           pivots[i] = ipiv[i] - 1;
+        }
+
+        // Re-create external encoder for subsequent GPU dispatches
+        if (sym.usingExternalEncoder) {
+          sym.externalCmdBuf = [sym.commandQueue commandBuffer];
+          sym.externalEncoder = [sym.externalCmdBuf computeCommandEncoder];
         }
 
         return info;
