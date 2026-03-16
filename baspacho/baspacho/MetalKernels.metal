@@ -2334,21 +2334,19 @@ inline void dfAdd2(float a_hi, float a_lo, float b_hi, float b_lo,
 // One thread per element.
 // x_accum = (hi, lo) pair; correction = colScale[j] * xGpu[perm[j]]
 kernel void refine_accumulate_kernel_float(
-    device const int64_t* perm [[buffer(0)]],
+    device const int32_t* perm [[buffer(0)]],
     device const float* colScale [[buffer(1)]],
-    device float* x_accum_hi [[buffer(2)]],
-    device float* x_accum_lo [[buffer(3)]],
-    device const float* xGpu [[buffer(4)]],
-    constant int64_t& n [[buffer(5)]],
+    device float2* x_accum [[buffer(2)]],
+    device const float* xGpu [[buffer(3)]],
+    constant int32_t& n [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= uint(n)) return;
-    int64_t j = int64_t(tid);
+    int32_t j = int32_t(tid);
     float correction = colScale[j] * xGpu[perm[j]];
     float hi, lo;
-    dfAdd(x_accum_hi[j], x_accum_lo[j], correction, hi, lo);
-    x_accum_hi[j] = hi;
-    x_accum_lo[j] = lo;
+    dfAdd(x_accum[j].x, x_accum[j].y, correction, hi, lo);
+    x_accum[j] = float2(hi, lo);
 }
 
 // Step 2: SpMV residual with double-float precision.
@@ -2356,44 +2354,39 @@ kernel void refine_accumulate_kernel_float(
 // compensated summation for the dot product. Achieves ~float64 residual
 // precision, enabling iterative refinement convergence for κ(A) up to ~1e14.
 kernel void refine_spmv_kernel_float(
-    device const int64_t* csrRowPtr [[buffer(0)]],
-    device const int64_t* csrColInd [[buffer(1)]],
+    device const int32_t* csrRowPtr [[buffer(0)]],
+    device const int32_t* csrColInd [[buffer(1)]],
     device const float* csrValues [[buffer(2)]],
-    device const int64_t* perm [[buffer(3)]],
-    device const int64_t* rowPerm [[buffer(4)]],
+    device const int32_t* perm [[buffer(3)]],
+    device const int32_t* rowPerm [[buffer(4)]],
     device const float* rowScale [[buffer(5)]],
     device const float* b_hi [[buffer(6)]],
-    device const float* x_accum_hi [[buffer(7)]],
-    device const float* x_accum_lo [[buffer(8)]],
-    device float* xGpu [[buffer(9)]],
-    constant int64_t& n [[buffer(10)]],
+    device const float2* x_accum [[buffer(7)]],
+    device float* xGpu [[buffer(8)]],
+    constant int32_t& n [[buffer(9)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= uint(n)) return;
-    int64_t j = int64_t(tid);
-    int64_t srcRow = rowPerm[j];
+    int32_t j = int32_t(tid);
+    int32_t srcRow = rowPerm[j];
 
     // Double-float dot product: sum = A[srcRow,:] * x_accum
     // Each product uses TwoProd for exact error capture, then
-    // accumulated via double-float addition.
+    // accumulated via compensated addition (dfAdd for hi, direct add for lo).
     float sum_hi = 0.0f, sum_lo = 0.0f;
-    for (int64_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
-        int64_t col = csrColInd[k];
+    for (int32_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
+        float2 x = x_accum[csrColInd[k]];
         float val = csrValues[k];
-        float x_hi = x_accum_hi[col];
-        float x_lo = x_accum_lo[col];
 
-        // TwoProd: val * x_hi = prod_hi + prod_err (exact via FMA)
+        // TwoProd: val * x.x = prod_hi + prod_err (exact via FMA)
         float prod_hi, prod_err;
-        twoProd(val, x_hi, prod_hi, prod_err);
-        // Full product ≈ prod_hi + (prod_err + val * x_lo)
-        float prod_lo = prod_err + val * x_lo;
+        twoProd(val, x.x, prod_hi, prod_err);
 
-        // Accumulate (prod_hi, prod_lo) into (sum_hi, sum_lo)
-        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+        // Accumulate prod_hi with compensated addition, prod_lo directly
+        dfAdd(sum_hi, sum_lo, prod_hi, sum_hi, sum_lo);
+        sum_lo += prod_err + val * x.y;
     }
     // Residual: b - sum, computed in double-float
-    // (sum_hi + sum_lo) ≈ A[row,:] * x with ~float64 precision
     float residual = (b_hi[srcRow] - sum_hi) - sum_lo;
     xGpu[perm[j]] = rowScale[j] * residual;
 }
@@ -2412,49 +2405,44 @@ inline void dfSimdReduce(thread float& sum_hi, thread float& sum_lo) {
 // Two-phase SpMV: short-row kernel (one thread per row).
 // Processes a subset of rows via index list. Includes fast path for nnz==1 rows.
 kernel void refine_spmv_short_kernel_float(
-    device const int64_t* csrRowPtr [[buffer(0)]],
-    device const int64_t* csrColInd [[buffer(1)]],
+    device const int32_t* csrRowPtr [[buffer(0)]],
+    device const int32_t* csrColInd [[buffer(1)]],
     device const float* csrValues [[buffer(2)]],
-    device const int64_t* perm [[buffer(3)]],
-    device const int64_t* rowPerm [[buffer(4)]],
+    device const int32_t* perm [[buffer(3)]],
+    device const int32_t* rowPerm [[buffer(4)]],
     device const float* rowScale [[buffer(5)]],
     device const float* b_hi [[buffer(6)]],
-    device const float* x_accum_hi [[buffer(7)]],
-    device const float* x_accum_lo [[buffer(8)]],
-    device float* xGpu [[buffer(9)]],
-    device const int32_t* rowIndices [[buffer(10)]],
-    constant int32_t& numRows [[buffer(11)]],
+    device const float2* x_accum [[buffer(7)]],
+    device float* xGpu [[buffer(8)]],
+    device const int32_t* rowIndices [[buffer(9)]],
+    constant int32_t& numRows [[buffer(10)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= uint(numRows)) return;
     int32_t j = rowIndices[tid];
-    int64_t srcRow = rowPerm[j];
-    int64_t start = csrRowPtr[srcRow];
-    int64_t end = csrRowPtr[srcRow + 1];
+    int32_t srcRow = rowPerm[j];
+    int32_t start = csrRowPtr[srcRow];
+    int32_t end = csrRowPtr[srcRow + 1];
 
     // Fast path for single-element rows (40% of c6288)
     if (end - start == 1) {
-        int64_t col = csrColInd[start];
+        float2 x = x_accum[csrColInd[start]];
         float val = csrValues[start];
-        float x_hi = x_accum_hi[col];
-        float x_lo = x_accum_lo[col];
         float prod_hi, prod_err;
-        twoProd(val, x_hi, prod_hi, prod_err);
-        float residual = (b_hi[srcRow] - prod_hi) - (prod_err + val * x_lo);
+        twoProd(val, x.x, prod_hi, prod_err);
+        float residual = (b_hi[srcRow] - prod_hi) - (prod_err + val * x.y);
         xGpu[perm[j]] = rowScale[j] * residual;
         return;
     }
 
     float sum_hi = 0.0f, sum_lo = 0.0f;
-    for (int64_t k = start; k < end; k++) {
-        int64_t col = csrColInd[k];
+    for (int32_t k = start; k < end; k++) {
+        float2 x = x_accum[csrColInd[k]];
         float val = csrValues[k];
-        float x_hi = x_accum_hi[col];
-        float x_lo = x_accum_lo[col];
         float prod_hi, prod_err;
-        twoProd(val, x_hi, prod_hi, prod_err);
-        float prod_lo = prod_err + val * x_lo;
-        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+        twoProd(val, x.x, prod_hi, prod_err);
+        dfAdd(sum_hi, sum_lo, prod_hi, sum_hi, sum_lo);
+        sum_lo += prod_err + val * x.y;
     }
     float residual = (b_hi[srcRow] - sum_hi) - sum_lo;
     xGpu[perm[j]] = rowScale[j] * residual;
@@ -2464,18 +2452,17 @@ kernel void refine_spmv_short_kernel_float(
 // 32 lanes stripe through nonzeros, then reduce with compensated SIMD shuffle.
 // Dispatch: numLongRows * 32 threads, threadgroup size 256 (= 8 SIMD groups per TG).
 kernel void refine_spmv_long_kernel_float(
-    device const int64_t* csrRowPtr [[buffer(0)]],
-    device const int64_t* csrColInd [[buffer(1)]],
+    device const int32_t* csrRowPtr [[buffer(0)]],
+    device const int32_t* csrColInd [[buffer(1)]],
     device const float* csrValues [[buffer(2)]],
-    device const int64_t* perm [[buffer(3)]],
-    device const int64_t* rowPerm [[buffer(4)]],
+    device const int32_t* perm [[buffer(3)]],
+    device const int32_t* rowPerm [[buffer(4)]],
     device const float* rowScale [[buffer(5)]],
     device const float* b_hi [[buffer(6)]],
-    device const float* x_accum_hi [[buffer(7)]],
-    device const float* x_accum_lo [[buffer(8)]],
-    device float* xGpu [[buffer(9)]],
-    device const int32_t* rowIndices [[buffer(10)]],
-    constant int32_t& numRows [[buffer(11)]],
+    device const float2* x_accum [[buffer(7)]],
+    device float* xGpu [[buffer(8)]],
+    device const int32_t* rowIndices [[buffer(9)]],
+    constant int32_t& numRows [[buffer(10)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint tg_id [[threadgroup_position_in_grid]])
@@ -2485,21 +2472,19 @@ kernel void refine_spmv_long_kernel_float(
     if (rowIdx >= uint(numRows)) return;
 
     int32_t j = rowIndices[rowIdx];
-    int64_t srcRow = rowPerm[j];
-    int64_t start = csrRowPtr[srcRow];
-    int64_t end = csrRowPtr[srcRow + 1];
+    int32_t srcRow = rowPerm[j];
+    int32_t start = csrRowPtr[srcRow];
+    int32_t end = csrRowPtr[srcRow + 1];
 
     // Each lane processes elements at stride 32
     float sum_hi = 0.0f, sum_lo = 0.0f;
-    for (int64_t k = start + int64_t(simd_lane_id); k < end; k += 32) {
-        int64_t col = csrColInd[k];
+    for (int32_t k = start + int32_t(simd_lane_id); k < end; k += 32) {
+        float2 x = x_accum[csrColInd[k]];
         float val = csrValues[k];
-        float x_hi = x_accum_hi[col];
-        float x_lo = x_accum_lo[col];
         float prod_hi, prod_err;
-        twoProd(val, x_hi, prod_hi, prod_err);
-        float prod_lo = prod_err + val * x_lo;
-        dfAdd2(sum_hi, sum_lo, prod_hi, prod_lo, sum_hi, sum_lo);
+        twoProd(val, x.x, prod_hi, prod_err);
+        dfAdd(sum_hi, sum_lo, prod_hi, sum_hi, sum_lo);
+        sum_lo += prod_err + val * x.y;
     }
 
     // Compensated SIMD-group reduction (result in lane 0)
@@ -2514,29 +2499,29 @@ kernel void refine_spmv_long_kernel_float(
 // Legacy single-threaded version for small matrices (n <= ~100).
 // Uses simple float32 — sufficient for well-conditioned small systems.
 kernel void refine_step_kernel_float(
-    device const int64_t* csrRowPtr [[buffer(0)]],
-    device const int64_t* csrColInd [[buffer(1)]],
+    device const int32_t* csrRowPtr [[buffer(0)]],
+    device const int32_t* csrColInd [[buffer(1)]],
     device const float* csrValues [[buffer(2)]],
-    device const int64_t* perm [[buffer(3)]],
-    device const int64_t* rowPerm [[buffer(4)]],
+    device const int32_t* perm [[buffer(3)]],
+    device const int32_t* rowPerm [[buffer(4)]],
     device const float* rowScale [[buffer(5)]],
     device const float* colScale [[buffer(6)]],
     device const float* b [[buffer(7)]],
     device float* x_accum [[buffer(8)]],
     device float* xGpu [[buffer(9)]],
-    constant int64_t& n [[buffer(10)]],
+    constant int32_t& n [[buffer(10)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0) return;
 
-    for (int64_t j = 0; j < n; j++) {
+    for (int32_t j = 0; j < n; j++) {
         x_accum[j] += colScale[j] * xGpu[perm[j]];
     }
 
-    for (int64_t j = 0; j < n; j++) {
-        int64_t srcRow = rowPerm[j];
+    for (int32_t j = 0; j < n; j++) {
+        int32_t srcRow = rowPerm[j];
         float dot = 0.0f;
-        for (int64_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
+        for (int32_t k = csrRowPtr[srcRow]; k < csrRowPtr[srcRow + 1]; k++) {
             dot += csrValues[k] * x_accum[csrColInd[k]];
         }
         xGpu[perm[j]] = rowScale[j] * (b[srcRow] - dot);
