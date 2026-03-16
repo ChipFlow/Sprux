@@ -837,41 +837,23 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     numCtx->flush();
   }
 
-  // 8. Get batched refinement kernel pipeline states
-  // Batched kernels work for any nMat (including 1): mat_id = tid % nMat.
-  void* accumBatchPipeline =
-      metalCtx.getPipelineState("refine_accumulate_batch_kernel_float");
-  void* spmvBatchPipeline =
-      metalCtx.getPipelineState("refine_spmv_batch_kernel_float");
-
   // ==== Phase 1: CPU preprocessing — prepare ALL matrices upfront ====
   // All CPU work happens here. GPU encoding follows in one shot.
 
   size_t nMat = matrices.size();
-  int64_t nnz = matrices[0].first.rowPtr.back();
-
-  // Shared buffers (same sparsity structure for all matrices)
-  // int32 indices halve index bandwidth for SpMV kernels
-  MetalMirror<int32_t> csrRowPtr(vector<int32_t>(matrices[0].first.rowPtr.begin(),
-                                                  matrices[0].first.rowPtr.end()));
-  MetalMirror<int32_t> csrColInd(vector<int32_t>(matrices[0].first.colInd.begin(),
-                                                  matrices[0].first.colInd.end()));
-  MetalMirror<int32_t> devPerm(vector<int32_t>(perm.begin(), perm.end()));
-  MetalMirror<int32_t> devRowPerm(vector<int32_t>(preproc.rowPerm.begin(),
-                                                   preproc.rowPerm.end()));
 
   // Per-matrix factorization data (each matrix needs its own solver data)
   vector<MetalMirror<float>> matData(nMat);
 
-  // Concatenated per-matrix buffers for batched refinement kernels.
-  // Layout: [mat0 data | mat1 data | ... | mat(nMat-1) data]
-  // Works for nMat=1 too (batched kernel with nMat=1 ≡ unbatched).
+  // Concatenated xGpu buffer for GPU solveLU (all matrices share one MTLBuffer)
   MetalMirror<float> allXGpu;      allXGpu.resizeToAtLeast(nMat * n);
-  MetalMirror<float> allXAccum;    allXAccum.resizeToAtLeast(nMat * 2 * n);  // float2 packed
-  MetalMirror<float> allCsrVal;    allCsrVal.resizeToAtLeast(nMat * nnz);
-  MetalMirror<float> allRowScale;  allRowScale.resizeToAtLeast(nMat * n);
-  MetalMirror<float> allColScale;  allColScale.resizeToAtLeast(nMat * n);
-  MetalMirror<float> allB;         allB.resizeToAtLeast(nMat * n);
+
+  // CPU-side double-precision accumulators for iterative refinement.
+  // Native double on CPU gives ~52-bit mantissa (better than GPU's float2 ~48-bit).
+  vector<double> xAccumCpu(nMat * n, 0.0);
+
+  // Per-matrix equilibration scales (double precision, for CPU SpMV)
+  vector<vector<double>> matRowScales(nMat), matColScales(nMat);
 
   for (size_t mi = 0; mi < nMat; mi++) {
     const CsrMatrix& A = matrices[mi].first;
@@ -897,17 +879,9 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     for (int64_t j = 0; j < n; j++)
       allXGpu.ptr()[mi * n + perm[j]] = float(rowScale[j] * b(preproc.rowPerm[j]));
 
-    // Zero-init accumulated solution (float2 hi,lo pairs)
-    memset(allXAccum.ptr() + mi * 2 * n, 0, 2 * n * sizeof(float));
-
-    // Copy refinement data into concatenated buffers
-    for (int64_t k = 0; k < nnz; k++)
-      allCsrVal.ptr()[mi * nnz + k] = float(A.values[k]);
-    for (int64_t j = 0; j < n; j++) {
-      allRowScale.ptr()[mi * n + j] = float(rowScale[j]);
-      allColScale.ptr()[mi * n + j] = float(colScale[j]);
-      allB.ptr()[mi * n + j] = float(b(j));
-    }
+    // Save equilibration scales for CPU SpMV refinement
+    matRowScales[mi] = std::move(rowScale);
+    matColScales[mi] = std::move(colScale);
   }
 
   // ==== Phase 2: GPU — encode ALL matrices into ONE command buffer ====
@@ -929,42 +903,46 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
                     allXGpu.ptr() + mi * n, n, 1, *solveCtx, PivotLocation::Device);
   }
 
-  // Iteration-major refinement: batched accum + SpMV, per-matrix solveLU
-  int32_t n32 = int32_t(n), nMat32 = int32_t(nMat), nnz32 = int32_t(nnz);
+  // Iteration-major refinement: CPU accum + SpMV, GPU solveLU per matrix.
+  // Uses encoder cycling: clearExternalEncoder → CPU work → re-create encoder.
+  // CPU SpMV uses native double with original double-precision matrix values,
+  // giving ~52-bit mantissa (better than GPU's float2 ~48-bit double-float).
+  const auto& rowPtr0 = matrices[0].first.rowPtr;
+  const auto& colInd0 = matrices[0].first.colInd;
+
   for (int iter = 0; iter < maxRefine; iter++) {
-    void* enc = symCtx.getExternalEncoder();
+    // Cycle encoder: flush GPU solveLU results to unified memory
+    symCtx.clearExternalEncoder();
 
-    // Batched accumulate: 1 dispatch for all matrices
-    metalCtx.setPipelineState(enc, accumBatchPipeline);
-    metalCtx.setBuffer(enc, devPerm.buffer(), 0);
-    metalCtx.setBuffer(enc, allColScale.buffer(), 1);
-    metalCtx.setBuffer(enc, allXAccum.buffer(), 2);
-    metalCtx.setBuffer(enc, allXGpu.buffer(), 3);
-    metalCtx.setBytes(enc, &nMat32, sizeof(int32_t), 4);
-    metalCtx.setBytes(enc, &n32, sizeof(int32_t), 5);
-    metalCtx.dispatchThreads(enc, accumBatchPipeline, nMat * n);
+    // CPU accumulate + SpMV for all matrices
+    for (size_t mi = 0; mi < nMat; mi++) {
+      const CsrMatrix& A = matrices[mi].first;
+      const Eigen::VectorXd& b = matrices[mi].second;
+      const vector<double>& rowScale = matRowScales[mi];
+      const vector<double>& colScale = matColScales[mi];
+      double* xacc = xAccumCpu.data() + mi * n;
+      float* xgpu = allXGpu.ptr() + mi * n;
 
-    metalCtx.memoryBarrier(enc);
+      // Accumulate: x_accum[j] += colScale[j] * xGpu[perm[j]]
+      for (int64_t j = 0; j < n; j++)
+        xacc[j] += colScale[j] * double(xgpu[perm[j]]);
 
-    // Batched SpMV: 1 dispatch for all matrices
-    metalCtx.setPipelineState(enc, spmvBatchPipeline);
-    metalCtx.setBuffer(enc, csrRowPtr.buffer(), 0);
-    metalCtx.setBuffer(enc, csrColInd.buffer(), 1);
-    metalCtx.setBuffer(enc, allCsrVal.buffer(), 2);
-    metalCtx.setBuffer(enc, devPerm.buffer(), 3);
-    metalCtx.setBuffer(enc, devRowPerm.buffer(), 4);
-    metalCtx.setBuffer(enc, allRowScale.buffer(), 5);
-    metalCtx.setBuffer(enc, allB.buffer(), 6);
-    metalCtx.setBuffer(enc, allXAccum.buffer(), 7);
-    metalCtx.setBuffer(enc, allXGpu.buffer(), 8);
-    metalCtx.setBytes(enc, &nMat32, sizeof(int32_t), 9);
-    metalCtx.setBytes(enc, &n32, sizeof(int32_t), 10);
-    metalCtx.setBytes(enc, &nnz32, sizeof(int32_t), 11);
-    metalCtx.dispatchThreads(enc, spmvBatchPipeline, nMat * n);
+      // SpMV residual: xGpu[perm[j]] = rowScale[j] * (b[srcRow] - A[srcRow,:] * x_accum)
+      for (int64_t j = 0; j < n; j++) {
+        int64_t srcRow = preproc.rowPerm[j];
+        double sum = 0.0;
+        for (int64_t k = rowPtr0[srcRow]; k < rowPtr0[srcRow + 1]; k++)
+          sum += A.values[k] * xacc[colInd0[k]];
+        double residual = b(srcRow) - sum;
+        xgpu[perm[j]] = float(rowScale[j] * residual);
+      }
+    }
 
-    // Per-matrix solveLU (uses existing solver infrastructure)
-    // solveLU accesses vec through raw pointers — MetalBufferRegistry::findBuffer()
-    // resolves the containing allXGpu MTLBuffer from the offset pointer.
+    // Re-create encoder for GPU solveLU
+    void* newCmdBuf = metalCtx.createCommandBuffer();
+    void* newEncoder = metalCtx.createComputeEncoder(newCmdBuf);
+    symCtx.setExternalEncoder(newCmdBuf, newEncoder);
+
     for (size_t mi = 0; mi < nMat; mi++) {
       solver->solveLU(matData[mi].ptr(), devPivots.ptr(),
                       allXGpu.ptr() + mi * n, n, 1, *solveCtx, PivotLocation::Device);
@@ -984,16 +962,13 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     const Eigen::VectorXd& b = matrices[mi].second;
     LUTimingResult res;
 
-    // Apply final correction (last solveLU result not yet accumulated by GPU kernel)
-    // Use float64 for the final accumulation to recover full double-float precision
+    // Apply final correction: last solveLU result not yet accumulated
     Eigen::VectorXd x(n);
-    float* xacc = allXAccum.ptr() + mi * 2 * n;
-    float* xgpu = allXGpu.ptr() + mi * n;
-    for (int64_t j = 0; j < n; j++) {
-      double accum = double(xacc[2 * j]) + double(xacc[2 * j + 1]);
-      accum += double(allColScale.ptr()[mi * n + j]) * double(xgpu[perm[j]]);
-      x(j) = accum;
-    }
+    const double* xacc = xAccumCpu.data() + mi * n;
+    const float* xgpu = allXGpu.ptr() + mi * n;
+    const vector<double>& colScale = matColScales[mi];
+    for (int64_t j = 0; j < n; j++)
+      x(j) = xacc[j] + colScale[j] * double(xgpu[perm[j]]);
 
     res.factorTime = totalGpuTime / double(nMat);  // approximate per-matrix
     res.solveTime = 0;
