@@ -79,13 +79,38 @@ static double computeResidualDouble(const CsrMatrix& A, const Eigen::VectorXd& x
 }
 
 // Discover sequence files in a directory
+// Ensure a .mtx file exists, decompressing from .mtx.xz if needed.
+// Returns true if the file is available (already existed or was decompressed).
+static bool ensureDecompressed(const string& mtxPath) {
+  if (fs::exists(mtxPath)) return true;
+  string xzPath = mtxPath + ".xz";
+  if (!fs::exists(xzPath)) return false;
+  string cmd = "xz -dk \"" + xzPath + "\"";
+  int rc = system(cmd.c_str());
+  if (rc != 0) {
+    cerr << "Warning: failed to decompress " << xzPath << " (exit " << rc << ")" << endl;
+    return false;
+  }
+  return fs::exists(mtxPath);
+}
+
 static vector<pair<string, string>> discoverSequenceFiles(const string& dir) {
   vector<pair<string, string>> pairs;
+
+  // Check if decompression will be needed (first .mtx missing but .mtx.xz exists)
+  {
+    ostringstream jacName;
+    jacName << dir << "/jacobian_0000.mtx";
+    if (!fs::exists(jacName.str()) && fs::exists(jacName.str() + ".xz")) {
+      cerr << "Decompressing " << dir << " sequence files..." << endl;
+    }
+  }
+
   for (int idx = 0;; idx++) {
     ostringstream jacName, rhsName;
     jacName << dir << "/jacobian_" << setw(4) << setfill('0') << idx << ".mtx";
     rhsName << dir << "/rhs_" << setw(4) << setfill('0') << idx << ".mtx";
-    if (!fs::exists(jacName.str()) || !fs::exists(rhsName.str())) break;
+    if (!ensureDecompressed(jacName.str()) || !ensureDecompressed(rhsName.str())) break;
     pairs.push_back({jacName.str(), rhsName.str()});
   }
   return pairs;
