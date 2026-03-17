@@ -16,7 +16,7 @@ echo ""
 
 # Clone repository
 echo "=== Cloning Repository ==="
-REPO_URL="https://github.com/${GITHUB_REPOSITORY:-facebookresearch/baspacho}.git"
+REPO_URL="https://github.com/${GITHUB_REPOSITORY:-ChipFlow/Sprux}.git"
 if [ -n "${GITHUB_TOKEN:-}" ]; then
     REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 fi
