@@ -1,10 +1,10 @@
-# CUDA Sparse LU Implementation in BaSpaCho
+# CUDA Sparse LU Implementation in Sprux
 
-This document describes how BaSpaCho implements sparse LU factorization on NVIDIA GPUs using CUDA, with particular attention to what runs on the CPU vs GPU.
+This document describes how Sprux implements sparse LU factorization on NVIDIA GPUs using CUDA, with particular attention to what runs on the CPU vs GPU.
 
 ## Overview
 
-BaSpaCho performs supernodal LU factorization of a block-sparse matrix. The sparse structure (which blocks exist) is analyzed on the **CPU** during a symbolic phase, while the dense numeric operations within each block run on the **GPU** using cuBLAS, cuSOLVER, and custom CUDA kernels.
+Sprux performs supernodal LU factorization of a block-sparse matrix. The sparse structure (which blocks exist) is analyzed on the **CPU** during a symbolic phase, while the dense numeric operations within each block run on the **GPU** using cuBLAS, cuSOLVER, and custom CUDA kernels.
 
 The factorization computes **PA = LU** with partial pivoting, where:
 - **P** is a row permutation (pivots)
@@ -104,9 +104,9 @@ This is the most complex GPU operation due to the row-major vs col-major mismatc
 | Copy pivots D->H | **GPU->CPU** | `cudaMemcpy` (small: `n` ints) |
 | Convert pivot format | **CPU** | 1-based -> 0-based, `int` -> `int64_t` |
 
-The transpose workaround is necessary because cuSOLVER's `getrf` expects column-major input, but BaSpaCho stores blocks in row-major order. Rather than maintaining a separate col-major copy, the diagonal block is transposed in-place on the GPU before and after the factorization.
+The transpose workaround is necessary because cuSOLVER's `getrf` expects column-major input, but Sprux stores blocks in row-major order. Rather than maintaining a separate col-major copy, the diagonal block is transposed in-place on the GPU before and after the factorization.
 
-**Pivot format**: cuSOLVER outputs 1-based `int` pivots in column-major convention. BaSpaCho converts these to 0-based `int64_t` pivots on the CPU. This is the **only per-lump D->H transfer** during factorization.
+**Pivot format**: cuSOLVER outputs 1-based `int` pivots in column-major convention. Sprux converts these to 0-based `int64_t` pivots on the CPU. This is the **only per-lump D->H transfer** during factorization.
 
 ##### 2b. Apply row permutation to off-diagonal blocks (`applyRowPerm`)
 
@@ -219,7 +219,7 @@ The matrix data itself stays on the GPU throughout. The only per-lump transfers 
 
 ## Key Design Decisions
 
-1. **Row-major storage with col-major libraries**: BaSpaCho stores blocks row-major for cache-friendly access patterns in the supernodal structure. cuBLAS/cuSOLVER expect col-major. Rather than maintaining dual layouts, the code uses transpose tricks (swap operands for GEMM, explicit transpose for getrf).
+1. **Row-major storage with col-major libraries**: Sprux stores blocks row-major for cache-friendly access patterns in the supernodal structure. cuBLAS/cuSOLVER expect col-major. Rather than maintaining dual layouts, the code uses transpose tricks (swap operands for GEMM, explicit transpose for getrf).
 
 2. **Asynchronous dispatch**: All GPU operations are submitted to a CUDA stream without synchronization. The CPU loop runs ahead, preparing the next lump's work while the GPU processes the current one. Only pivot D->H copies force implicit synchronization (via `cudaMemcpy`).
 

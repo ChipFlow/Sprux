@@ -46,8 +46,8 @@
 #include "sprux/sprux/BlasDefs.h"
 #endif
 
-using namespace BaSpaCho;
-using namespace BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace Sprux::testing_utils;
 using namespace std;
 namespace fs = std::filesystem;
 
@@ -954,7 +954,7 @@ static void resultToRecords(const string& problem, const string& solver,
     rec.solver = solver;
     rec.operation = "factor";
     for (const auto& t : timings) rec.times_sec.push_back(t.factorTime);
-    rec.median_sec = BaSpaCho::computeMedian(rec.times_sec);
+    rec.median_sec = Sprux::computeMedian(rec.times_sec);
     records.push_back(std::move(rec));
   }
 
@@ -965,7 +965,7 @@ static void resultToRecords(const string& problem, const string& solver,
     rec.solver = solver;
     rec.operation = "solve";
     for (const auto& t : timings) rec.times_sec.push_back(t.solveTime);
-    rec.median_sec = BaSpaCho::computeMedian(rec.times_sec);
+    rec.median_sec = Sprux::computeMedian(rec.times_sec);
     records.push_back(std::move(rec));
   }
 
@@ -976,7 +976,7 @@ static void resultToRecords(const string& problem, const string& solver,
     rec.solver = solver;
     rec.operation = "total";
     for (const auto& t : timings) rec.times_sec.push_back(t.factorTime + t.solveTime);
-    rec.median_sec = BaSpaCho::computeMedian(rec.times_sec);
+    rec.median_sec = Sprux::computeMedian(rec.times_sec);
     records.push_back(std::move(rec));
   }
 }
@@ -1324,7 +1324,7 @@ int main(int argc, char* argv[]) {
 
   // JSON output
   if (jsonOutput) {
-    BaSpaCho::writeJson(cout, allRecords);
+    Sprux::writeJson(cout, allRecords);
   }
 
   return 0;

@@ -17,7 +17,7 @@
 #include "sprux/sprux/DebugMacros.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -473,4 +473,4 @@ SparseStructure SparseStructure::extractRightBottom(int64_t startRow) {
   return retv;
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

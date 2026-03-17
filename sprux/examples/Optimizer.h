@@ -125,7 +125,7 @@ class VariableStoreBase {
   virtual ~VariableStoreBase() {}
 
   virtual void applyStep(const Eigen::VectorXd& step,
-                         const BaSpaCho::PermutedCoalescedAccessor& acc) = 0;
+                         const Sprux::PermutedCoalescedAccessor& acc) = 0;
 
   virtual int64_t totalSize() const = 0;
 
@@ -166,7 +166,7 @@ class VariableStore : public VariableStoreBase {
   }
 
   virtual void applyStep(const Eigen::VectorXd& step,
-                         const BaSpaCho::PermutedCoalescedAccessor& acc) override {
+                         const Sprux::PermutedCoalescedAccessor& acc) override {
     for (auto var : variables) {
       VarUtil<typename Variable::DataType>::tangentStep(
           step.segment<Variable::TangentDim>(acc.paramStart(var->index)), var->value);
@@ -192,7 +192,7 @@ class FactorStoreBase {
 
   virtual double computeCost(dispenso::ThreadPool* threadPool = nullptr) = 0;
 
-  virtual double computeGradHess(double* gradData, const BaSpaCho::PermutedCoalescedAccessor& acc,
+  virtual double computeGradHess(double* gradData, const Sprux::PermutedCoalescedAccessor& acc,
                                  double* hessData, dispenso::ThreadPool* threadPool = nullptr) = 0;
 
   virtual void registerVariables(std::vector<int64_t>& sizes,
@@ -331,7 +331,7 @@ class FactorStore : public FactorStoreBase {
 
   template <typename Ops>
   double computeSingleGradHess(int64_t k, double* gradData,
-                               const BaSpaCho::PermutedCoalescedAccessor& acc, double* hessData) {
+                               const Sprux::PermutedCoalescedAccessor& acc, double* hessData) {
     auto& factor = std::get<0>(boundFactors[k]);
     auto& args = std::get<1>(boundFactors[k]);
     const auto& loss = getLoss(k);
@@ -414,7 +414,7 @@ class FactorStore : public FactorStoreBase {
     }
   }
 
-  virtual double computeGradHess(double* gradData, const BaSpaCho::PermutedCoalescedAccessor& acc,
+  virtual double computeGradHess(double* gradData, const Sprux::PermutedCoalescedAccessor& acc,
                                  double* hessData,
                                  dispenso::ThreadPool* threadPool = nullptr) override {
     if (threadPool) {  // multi-threaded
@@ -541,7 +541,7 @@ class Optimizer {
     elimRanges.push_back(paramSizes.size());
   }
 
-  double computeGradHess(double* gradData, const BaSpaCho::PermutedCoalescedAccessor& acc,
+  double computeGradHess(double* gradData, const Sprux::PermutedCoalescedAccessor& acc,
                          double* hessData, dispenso::ThreadPool* threadPool = nullptr) {
     double retv = 0.0;
     for (auto& [ti, fStore] : factorStores.stores) {
@@ -590,13 +590,13 @@ class Optimizer {
     }
   }
 
-  void applyStep(const Eigen::VectorXd& step, const BaSpaCho::PermutedCoalescedAccessor& acc) {
+  void applyStep(const Eigen::VectorXd& step, const Sprux::PermutedCoalescedAccessor& acc) {
     for (auto& [ti, vStore] : variableStores.stores) {
       vStore->applyStep(step, acc);
     }
   }
 
-  void addDamping(Eigen::VectorXd& hess, const BaSpaCho::PermutedCoalescedAccessor& acc,
+  void addDamping(Eigen::VectorXd& hess, const Sprux::PermutedCoalescedAccessor& acc,
                   int64_t nVars, double lambda) {
     for (int64_t i = 0; i < nVars; i++) {
       auto diag = acc.diagBlock(hess.data(), i).diagonal();
@@ -631,7 +631,7 @@ class Optimizer {
   }
 
   // creates a solver
-  BaSpaCho::SolverPtr initSolver(int numThreads, bool fullElim = true) {
+  Sprux::SolverPtr initSolver(int numThreads, bool fullElim = true) {
     // collect variable sizes and (lower) off-diagonal blocks that need to be set
     std::unordered_set<std::pair<int64_t, int64_t>, pair_hash> blockSet;
     for (auto& [ti, fStore] : factorStores.stores) {
@@ -660,14 +660,14 @@ class Optimizer {
     // create sparse linear solver
     return createSolver(
         {.numThreads = numThreads,
-         .addFillPolicy = (fullElim ? BaSpaCho::AddFillComplete : BaSpaCho::AddFillForGivenElims)},
-        paramSizes, BaSpaCho::SparseStructure(std::move(ptrs), std::move(inds)), elimRanges);
+         .addFillPolicy = (fullElim ? Sprux::AddFillComplete : Sprux::AddFillForGivenElims)},
+        paramSizes, Sprux::SparseStructure(std::move(ptrs), std::move(inds)), elimRanges);
   }
 
   // creates a "solve" function that will either
   // 1. invoke the direct solver
   // 2. apply partial elimination, run PCG, backtrack to a full solution
-  std::function<std::string(Eigen::VectorXd&)> solveFunction(BaSpaCho::Solver& solver,
+  std::function<std::string(Eigen::VectorXd&)> solveFunction(Sprux::Solver& solver,
                                                              Eigen::VectorXd& hess,
                                                              SolverType solverType,
                                                              int iterativeStart) {
@@ -774,7 +774,7 @@ class Optimizer {
 
   void optimize(const Settings& settings) {
     // create sparse linear solver
-    BaSpaCho::SolverPtr solver = initSolver(
+    Sprux::SolverPtr solver = initSolver(
         settings.numThreads,
         (settings.solverType == Solver_Direct || settings.solverType == Solver_PCG_LowerPrecSolve));
     auto accessor = solver->accessor();

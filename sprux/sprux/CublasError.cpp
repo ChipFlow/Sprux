@@ -7,7 +7,7 @@
 
 #include "sprux/sprux/CudaDefs.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 const char* cublasGetErrorEnum(cublasStatus_t error) {
   switch (error) {
@@ -183,4 +183,4 @@ const char* cusolverGetErrorEnum(cusolverStatus_t error) {
   return "<unknown>";
 }
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

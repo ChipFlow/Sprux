@@ -11,7 +11,7 @@
 #include <set>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Holds the pointers/indices to represent a sparse structure, the indices
 // inds[ptrs[i]:ptrs[i+1]] contain the column indices of the i-th row (if CSR)
@@ -63,4 +63,4 @@ struct SparseStructure {
   SparseStructure extractRightBottom(int64_t start);
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

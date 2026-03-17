@@ -7,7 +7,7 @@
 
 #include "sprux/sprux/ComputationModel.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 const ComputationModel ComputationModel::model_OpenBlas_i7_1185g7{
     {3.527141723946874224e-07, -5.382557351808083451e-08, 4.677984682984275924e-09,
@@ -29,4 +29,4 @@ const ComputationModel ComputationModel::model_Cuda117_2080Ti{
     {1.975089750288875748e-06, -1.339369810950508464e-10, -3.758728373628488434e-10,
      1.745285595679570848e-13}};
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

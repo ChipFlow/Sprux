@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 struct EliminationTree;
 
@@ -43,4 +43,4 @@ std::vector<int64_t> computeLumpParent(const EliminationTree& et);
 void computeRelaxedMerges(EliminationTree& et, double fillTolerance = 0.25,
                           int64_t maxSupernodeSize = 256);
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

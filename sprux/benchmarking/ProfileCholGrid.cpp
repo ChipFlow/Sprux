@@ -18,7 +18,7 @@
 #include "sprux/testing/TestingMatGen.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 using namespace testing_utils;
 using namespace std;
 

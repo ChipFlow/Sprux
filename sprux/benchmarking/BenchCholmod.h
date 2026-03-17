@@ -18,5 +18,5 @@ struct CholmodBenchResults {
 };
 
 CholmodBenchResults benchmarkCholmodSolve(const std::vector<int64_t>& paramSize,
-                                          const BaSpaCho::SparseStructure& ss,
+                                          const Sprux::SparseStructure& ss,
                                           const std::vector<int64_t>& nRHSs = {}, int verbose = 0);

@@ -14,8 +14,8 @@
 
 using namespace std;
 using namespace ::testing;
-using namespace ::BaSpaCho::testing_utils;
-using namespace ::BaSpaCho;
+using namespace ::Sprux::testing_utils;
+using namespace ::Sprux;
 
 TEST(SparseStructure, Transpose) {
   /*

@@ -8,7 +8,7 @@
 #include "sprux/testing/TestingMatGen.h"
 #include "sprux/sprux/DebugMacros.h"
 
-namespace BaSpaCho::testing_utils {
+namespace Sprux::testing_utils {
 using namespace std;
 
 SparseMatGenerator::SparseMatGenerator(int64_t size, int64_t seed) : gen(seed), columns(size) {
@@ -200,4 +200,4 @@ SparseMatGenerator SparseMatGenerator::genGrid(int64_t width, int64_t height, do
   return retv;
 }
 
-}  // end namespace BaSpaCho::testing_utils
+}  // end namespace Sprux::testing_utils

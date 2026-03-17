@@ -11,7 +11,7 @@
 #include <set>
 #include <vector>
 
-namespace BaSpaCho::testing_utils {
+namespace Sprux::testing_utils {
 
 //
 struct SparseMatGenerator {
@@ -42,4 +42,4 @@ struct SparseMatGenerator {
   std::vector<std::set<int64_t>> columns;
 };
 
-}  // end namespace BaSpaCho::testing_utils
+}  // end namespace Sprux::testing_utils

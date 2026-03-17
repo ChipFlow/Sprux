@@ -92,7 +92,7 @@ void sgetrs_(const char* trans, const BLAS_INT* n, const BLAS_INT* nrhs, const f
 #define LAPACK_COL_MAJOR 0
 // #define LAPACK_ROW_MAJOR ... (not supported)
 
-namespace BaSpaCho {
+namespace Sprux {
 
 inline void cblas_dgemm(const CBLAS_LAYOUT /* Layout */, const CBLAS_TRANSPOSE TransA,
                         const CBLAS_TRANSPOSE TransB, const BLAS_INT M, const BLAS_INT N,
@@ -194,4 +194,4 @@ inline BLAS_INT LAPACKE_sgetrs(char trans, BLAS_INT n, BLAS_INT nrhs, const floa
   return info;
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

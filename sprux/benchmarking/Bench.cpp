@@ -36,7 +36,7 @@
 #include "BenchCudss.h"
 #endif
 
-using namespace BaSpaCho;
+using namespace Sprux;
 using namespace testing_utils;
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -47,7 +47,7 @@ struct SparseProblem {
   vector<int64_t> paramSize;
 };
 
-using BenchRecord = BaSpaCho::BenchRecord;
+using BenchRecord = Sprux::BenchRecord;
 
 struct BenchResults {
   double analysisTime;
@@ -840,8 +840,8 @@ void runBenchmarks(const BenchmarkSettings& settings, int seed = 37) {
   }
 }
 
-using BaSpaCho::jsonEscape;
-using BaSpaCho::writeJson;
+using Sprux::jsonEscape;
+using Sprux::writeJson;
 
 void help() {
   cout << "This program runs a benchmark of several solver configurations"

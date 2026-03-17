@@ -16,7 +16,7 @@
 #include "sprux/sprux/Utils.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 using namespace testing_utils;
 using namespace std;
 using Vec1 = Eigen::Vector<double, 1>;
@@ -287,7 +287,7 @@ int main(int argc, char* argv[]) {
     stringstream ss;
     ss.precision(numeric_limits<double>::max_digits10 + 2);
     ss << "\n\nCopy & paste computation model code:\n"
-       << "BaSpaCho::ComputationModel myModel {\n"
+       << "Sprux::ComputationModel myModel {\n"
        << "  { " << model.potrfParams[0] << ", " << model.potrfParams[1] << ", "
        << model.potrfParams[2] << ", " << model.potrfParams[3] << "},\n"
        << "  { " << model.trsmParams[0] << ", " << model.trsmParams[1] << ", "

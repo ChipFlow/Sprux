@@ -14,7 +14,7 @@
 #include "sprux/sprux/DebugMacros.h"
 #include "sprux/sprux/EliminationTree.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -180,4 +180,4 @@ void computeRelaxedMerges(EliminationTree& et, double fillTolerance,
   }
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

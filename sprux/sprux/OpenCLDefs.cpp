@@ -14,7 +14,7 @@
 #include <sstream>
 #include <unordered_map>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Read kernel source from file
 static std::string readKernelSource(const char* path) {
@@ -316,6 +316,6 @@ template class OpenCLMirror<int32_t>;
 template class OpenCLPtrMirror<float>;
 template class OpenCLPtrMirror<double>;
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux
 
 #endif  // SPRUX_USE_OPENCL

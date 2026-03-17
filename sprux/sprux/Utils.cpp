@@ -11,7 +11,7 @@
 #include <iomanip>
 #include "sprux/sprux/DebugMacros.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -104,4 +104,4 @@ void rewindVec(std::vector<int64_t>& v, int64_t downTo, int64_t value) {
   v[downTo] = value;
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

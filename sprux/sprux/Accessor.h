@@ -12,7 +12,7 @@
 #include "sprux/sprux/DebugMacros.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // allows to retrieve a block in a coalesced-block matrix
 struct CoalescedAccessor {
@@ -253,4 +253,4 @@ struct PermutedCoalescedAccessor {
   const int64_t* permutation;
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

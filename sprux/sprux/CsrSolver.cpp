@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 namespace {
 
@@ -105,7 +105,7 @@ SparseStructure blockCsrToSparseStructure(const BlockCsrDescriptor& desc) {
   SparseStructure ss(std::move(ptrs), std::move(inds));
 
   // Handle matrix view:
-  // - MVIEW_LOWER: Already in correct format for BaSpaCho (lower triangular CSR)
+  // - MVIEW_LOWER: Already in correct format for Sprux (lower triangular CSR)
   // - MVIEW_UPPER: Need to transpose to get lower triangular
   // - MVIEW_FULL: For SPD, we only need lower triangle, so clear upper
   if (desc.mview == MVIEW_UPPER) {
@@ -199,4 +199,4 @@ template SolverPtr createSolverFromBlockCsrWithValues<double>(const Settings& se
                                                               std::vector<double>& outData,
                                                               const std::vector<int64_t>& sparseElimRanges);
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

@@ -14,7 +14,7 @@
 #include "sprux/sprux/SupernodeMerger.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -418,4 +418,4 @@ vector<int64_t> EliminationTree::computeSpanStart() {
   return spanStart;
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

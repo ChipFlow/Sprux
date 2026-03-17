@@ -20,8 +20,8 @@
 #include "sprux/sprux/SupernodeMerger.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
-using namespace ::BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace ::Sprux::testing_utils;
 
 // Build an EliminationTree and run through processTree (standard merges).
 // Returns the tree ready for computeRelaxedMerges() or computeLumpParent().

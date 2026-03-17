@@ -14,7 +14,7 @@ Sprux (formerly BaSpaCho — Batched Sparse Cholesky) is a high-performance spar
 - Mixed-precision iterative refinement (float factor + double accumulation)
 - Block-structured matrices with partial factor/solve for marginals
 
-The C++ namespace remains `BaSpaCho` for backward compatibility.
+The C++ namespace is `Sprux`.
 
 ## Build Commands
 

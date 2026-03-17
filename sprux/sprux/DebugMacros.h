@@ -16,12 +16,12 @@
 
 #define SPRUX_CHECK_WHAT1(a, msg)                 \
   if (!(a)) {                                        \
-    ::BaSpaCho::throwError(__FILE__, __LINE__, msg); \
+    ::Sprux::throwError(__FILE__, __LINE__, msg); \
   }
 
 #define SPRUX_CHECK_WHAT2(a, what, v1, v2)                 \
   if (!(a)) {                                                 \
-    ::BaSpaCho::throwError(__FILE__, __LINE__, what, v1, v2); \
+    ::Sprux::throwError(__FILE__, __LINE__, what, v1, v2); \
   }
 
 #if defined(SPRUX_CHECKS) && !defined(__CUDACC__)
@@ -33,8 +33,8 @@
     SPRUX_CHECK_WHAT2(aEval op bEval, #a " " #op " " #b, aEval, bEval) \
   }
 #else
-#define SPRUX_CHECK(a) ::BaSpaCho::SPRUX_UNUSED(a)
-#define SPRUX_CHECK_OP(a, b, op) ::BaSpaCho::SPRUX_UNUSED(a, b)
+#define SPRUX_CHECK(a) ::Sprux::SPRUX_UNUSED(a)
+#define SPRUX_CHECK_OP(a, b, op) ::Sprux::SPRUX_UNUSED(a, b)
 #endif
 
 #define SPRUX_CHECK_EQ(a, b) SPRUX_CHECK_OP(a, b, ==)

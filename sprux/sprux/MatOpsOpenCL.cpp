@@ -16,7 +16,7 @@
 #include "sprux/sprux/OpenCLDefs.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -780,6 +780,6 @@ SolveCtxBase* OpenCLSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS
 
 OpsPtr openclOps() { return OpsPtr(new OpenCLOps); }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux
 
 #endif  // SPRUX_USE_OPENCL

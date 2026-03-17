@@ -11,7 +11,7 @@
 #include "sprux/sprux/MatOpsCpuBase.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -356,4 +356,4 @@ SolveCtxBase* SimpleSymbolicCtx::createSolveCtxForType(std::type_index tIdx, int
 
 OpsPtr simpleOps() { return OpsPtr(new SimpleOps); }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 /**
  * Matrix mathematical properties - determines factorization algorithm.
@@ -30,7 +30,7 @@ enum MatrixType {
  */
 enum MatrixView {
   MVIEW_FULL,   // Full matrix stored (both triangles)
-  MVIEW_LOWER,  // Only lower triangle stored (BaSpaCho's native format)
+  MVIEW_LOWER,  // Only lower triangle stored (Sprux's native format)
   MVIEW_UPPER   // Only upper triangle stored
 };
 
@@ -84,7 +84,7 @@ inline const char* matrixViewToString(MatrixView mview) {
 }
 
 /**
- * Validate matrix type/view combination for BaSpaCho.
+ * Validate matrix type/view combination for Sprux.
  * Throws std::invalid_argument if unsupported.
  */
 inline void validateMatrixTypeView(MatrixType mtype, MatrixView mview) {
@@ -109,4 +109,4 @@ inline void validateMatrixTypeView(MatrixType mtype, MatrixView mview) {
   }
 }
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

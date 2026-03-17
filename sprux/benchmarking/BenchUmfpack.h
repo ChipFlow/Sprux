@@ -12,7 +12,7 @@
 #include <vector>
 #include "sprux/sprux/SparseStructure.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 struct UmfpackBenchResults {
   double analysisTime;
@@ -32,4 +32,4 @@ UmfpackBenchResults benchmarkUmfpackSolve(const std::vector<int64_t>& paramSize,
                                            const std::vector<int64_t>& nRHSs = {1}, int verbose = 1,
                                            bool symmetric = false);
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

@@ -36,8 +36,8 @@
 #include "sprux/testing/MatrixMarketReader.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
-using namespace ::BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace ::Sprux::testing_utils;
 using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;

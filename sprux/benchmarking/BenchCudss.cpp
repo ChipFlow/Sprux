@@ -15,7 +15,7 @@
 #include "sprux/sprux/DebugMacros.h"
 #include "sprux/sprux/Utils.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 using namespace std;
 using hrc = chrono::high_resolution_clock;
 using tdelta = chrono::duration<double>;

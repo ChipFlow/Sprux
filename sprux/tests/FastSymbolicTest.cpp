@@ -12,7 +12,7 @@
 
 #include "sprux/sprux/SparseStructure.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 
 // Helper to create a small SYMMETRIC lower-triangular test matrix (CSR lower half).
 // The input must be symmetric for Cholesky fill computation to be well-defined.

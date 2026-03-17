@@ -38,7 +38,7 @@ static os_log_t spruxSignpostLog() {
 #define SPRUX_SIGNPOST_END(name) ((void)0)
 #endif
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -2367,4 +2367,4 @@ template void Solver::extractToCsr<float>(const int64_t*, const int64_t*, const 
 template void Solver::extractToCsr<double>(const int64_t*, const int64_t*, const int64_t*,
                                            const double*, double*) const;
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

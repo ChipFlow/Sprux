@@ -9,7 +9,7 @@
 
 #include <Eigen/Geometry>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 /**
  * @brief A class modelling the timings of fundamental kernel operations used in factor
@@ -113,4 +113,4 @@ struct ComputationModel {
   static const ComputationModel model_Cuda117_2080Ti;
 };
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

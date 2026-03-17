@@ -17,7 +17,7 @@
 #include "sprux/sprux/SparseStructure.h"
 #include "sprux/sprux/SupernodeMerger.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Where pivot data resides (host or device memory).
 // Used by persistent-context factorLU/solveLU overloads to avoid D2H→H2D roundtrips.
@@ -286,7 +286,7 @@ class Solver {
    * Load values from CSR format into internal data buffer.
    *
    * Maps block values from CSR order (row-major within blocks, blocks in
-   * CSR traversal order) to BaSpaCho's internal coalesced format.
+   * CSR traversal order) to Sprux's internal coalesced format.
    *
    * @param csrRowStart  CSR row pointers [numBlocks+1]
    * @param csrColInds   CSR column indices [numBlockNonzeros]
@@ -490,4 +490,4 @@ SolverPtr createSolver(const Settings& settings, const std::vector<int64_t>& par
                        const SparseStructure& ss, const std::vector<int64_t>& sparseElimRanges = {},
                        const std::unordered_set<int64_t>& elimLastIds = {});
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

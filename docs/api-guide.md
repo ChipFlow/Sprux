@@ -1,6 +1,6 @@
 # Sprux API Guide
 
-Sprux (formerly BaSpaCho) provides a C++ API for sparse direct solving. This guide
+Sprux (formerly Sprux) provides a C++ API for sparse direct solving. This guide
 covers common usage patterns for each decomposition type and backend.
 
 ## Input Format
@@ -11,7 +11,7 @@ Sprux takes block-structured sparse matrices in CSR format:
 #include "sprux/sprux/Solver.h"
 #include "sprux/sprux/SparseStructure.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 
 // Define parameter block sizes
 std::vector<int64_t> paramSize = {3, 3, 6, 6};  // 4 blocks of varying size

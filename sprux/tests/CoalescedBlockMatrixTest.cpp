@@ -40,8 +40,8 @@ EXPECT_THAT(foo, testing::UnorderedElementsAreArray(result, 3));
 EXPECT_THAT(foo, testing::ContainerEq(result));
 #endif
 
-using namespace BaSpaCho;
-using namespace ::BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace ::Sprux::testing_utils;
 using namespace std;
 using namespace ::testing;
 

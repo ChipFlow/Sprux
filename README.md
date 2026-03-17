@@ -14,7 +14,7 @@
 
 Sprux is a high-performance sparse direct solver with GPU acceleration.
 
-*Formerly BaSpaCho (Batched Sparse Cholesky). The C++ namespace remains `BaSpaCho` for backward compatibility.*
+*Formerly BaSpaCho (Batched Sparse Cholesky).*
 
 ## Features
 
@@ -91,7 +91,7 @@ auto solver = createSolver(settings, paramSize, structure);
 
 ```cpp
 #include "sprux/sprux/Solver.h"
-using namespace BaSpaCho;
+using namespace Sprux;
 
 Settings settings;
 settings.backend = BackendFast;

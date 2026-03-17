@@ -10,7 +10,7 @@
 #include <random>
 #include "sprux/sprux/DebugMacros.h"
 
-namespace BaSpaCho::testing_utils {
+namespace Sprux::testing_utils {
 using namespace std;
 
 vector<int64_t> randomPermutation(size_t size, int64_t seed) {
@@ -229,4 +229,4 @@ vector<set<int64_t>> makeIndependentElimSet(vector<set<int64_t>>& columns, int64
   return retvCols;
 }
 
-}  // end namespace BaSpaCho::testing_utils
+}  // end namespace Sprux::testing_utils

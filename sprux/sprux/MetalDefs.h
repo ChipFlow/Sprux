@@ -9,7 +9,7 @@
 
 /**
  * @file MetalDefs.h
- * @brief Metal GPU backend definitions for BaSpaCho
+ * @brief Metal GPU backend definitions for Sprux
  *
  * This file provides the Metal compute backend for Apple Silicon GPUs.
  *
@@ -53,7 +53,7 @@
 #include <utility>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Error checking macro for Metal operations
 #define mtlCHECK(condition, msg)                                               \
@@ -255,4 +255,4 @@ class MetalBufferRegistry {
   std::vector<BufferInfo> buffers_;
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

@@ -10,7 +10,7 @@
 #include <Eigen/Geometry>
 #include "sprux/sprux/SparseStructure.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 struct ComputationModel;
 
@@ -98,4 +98,4 @@ struct EliminationTree {
   std::vector<int64_t> rowParam;
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

@@ -19,8 +19,8 @@
 #include "sprux/sprux/Utils.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
-using namespace ::BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace ::Sprux::testing_utils;
 using namespace std;
 using namespace ::testing;
 

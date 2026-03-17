@@ -18,7 +18,7 @@
 
 #include "btf.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 LUPreprocessing computeMaxTransversal(int64_t n, const int64_t* csrRowPtr,
                                       const int64_t* csrColInd) {
@@ -219,4 +219,4 @@ SparseStructure csrToSymmetricSparseStructure(int64_t n, const int64_t* rowPtr,
   return SparseStructure(std::move(ptrs), std::move(inds)).transpose();
 }
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

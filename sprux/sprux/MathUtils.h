@@ -12,7 +12,7 @@
 #include <cmath>
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // returns all pairs (x, y) with 0 <= x <= y < n, while p varies in 0 <= p <
 // n*(n+1)/2
@@ -112,4 +112,4 @@ __SPRUX_HOST_DEVICE__ inline static void solveUpperRowMajor(const T* A, int lda,
   }
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

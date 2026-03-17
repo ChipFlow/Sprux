@@ -14,7 +14,7 @@
 
 #include "sprux/sprux/Solver.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 
 struct sprux_solver {
   std::unique_ptr<Solver> solver;

@@ -27,7 +27,7 @@ class Preconditioner {
 template <typename T>
 class IdentityPrecond : public Preconditioner<T> {
  public:
-  IdentityPrecond(const BaSpaCho::Solver& solver, int64_t paramStart)
+  IdentityPrecond(const Sprux::Solver& solver, int64_t paramStart)
       : solver(solver), vecSize(solver.order() - solver.spanVectorOffset(paramStart)) {}
 
   virtual ~IdentityPrecond() override {}
@@ -40,7 +40,7 @@ class IdentityPrecond : public Preconditioner<T> {
   }
 
  private:
-  const BaSpaCho::Solver& solver;
+  const Sprux::Solver& solver;
   int64_t vecSize;
 };
 
@@ -50,7 +50,7 @@ class BlockJacobiPrecond : public Preconditioner<T> {
  public:
   using Mat = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
-  BlockJacobiPrecond(const BaSpaCho::Solver& solver, int64_t paramStart)
+  BlockJacobiPrecond(const Sprux::Solver& solver, int64_t paramStart)
       : solver(solver),
         paramStart(paramStart),
         vecSize(solver.order() - solver.spanVectorOffset(paramStart)) {
@@ -97,7 +97,7 @@ class BlockJacobiPrecond : public Preconditioner<T> {
   }
 
  private:
-  const BaSpaCho::Solver& solver;
+  const Sprux::Solver& solver;
   int64_t paramStart;
   int64_t vecSize;
   std::vector<int64_t> diagBlockOffset;
@@ -108,7 +108,7 @@ class BlockJacobiPrecond : public Preconditioner<T> {
 template <typename T>
 class BlockGaussSeidelPrecond : public Preconditioner<T> {
  public:
-  BlockGaussSeidelPrecond(const BaSpaCho::Solver& solver, int64_t paramStart)
+  BlockGaussSeidelPrecond(const Sprux::Solver& solver, int64_t paramStart)
       : solver(solver),
         paramStart(paramStart),
         vecSize(solver.order() - solver.spanVectorOffset(paramStart)) {}
@@ -132,7 +132,7 @@ class BlockGaussSeidelPrecond : public Preconditioner<T> {
   }
 
  private:
-  const BaSpaCho::Solver& solver;
+  const Sprux::Solver& solver;
   int64_t paramStart;
   int64_t vecSize;
   std::vector<T> matData;
@@ -146,7 +146,7 @@ template <>
 class LowerPrecSolvePrecond<double> : public Preconditioner<double> {
  public:
   using T = double;
-  LowerPrecSolvePrecond(const BaSpaCho::Solver& solver, int64_t paramStart)
+  LowerPrecSolvePrecond(const Sprux::Solver& solver, int64_t paramStart)
       : solver(solver),
         vecSize(solver.order() - solver.spanVectorOffset(paramStart)),
         paramStart(paramStart) {}
@@ -199,7 +199,7 @@ class LowerPrecSolvePrecond<double> : public Preconditioner<double> {
   }
 
  private:
-  const BaSpaCho::Solver& solver;
+  const Sprux::Solver& solver;
   int64_t vecSize;
   int64_t paramStart;
   std::vector<float> matData;

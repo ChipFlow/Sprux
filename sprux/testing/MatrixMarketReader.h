@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace BaSpaCho::testing_utils {
+namespace Sprux::testing_utils {
 
 struct CsrMatrix {
   int64_t nRows;
@@ -174,4 +174,4 @@ inline double computeResidual(const CsrMatrix& A, const Eigen::VectorXd& x,
   return (Ax - b).norm() / b.norm();
 }
 
-}  // end namespace BaSpaCho::testing_utils
+}  // end namespace Sprux::testing_utils

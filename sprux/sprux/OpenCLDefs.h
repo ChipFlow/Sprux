@@ -7,11 +7,11 @@
 
 /**
  * @file OpenCLDefs.h
- * @brief OpenCL GPU backend definitions for BaSpaCho
+ * @brief OpenCL GPU backend definitions for Sprux
  *
  * This file provides the OpenCL compute backend for portable GPU acceleration.
  * It uses CLBlast for high-performance BLAS operations and custom OpenCL
- * kernels for BaSpaCho-specific sparse operations.
+ * kernels for Sprux-specific sparse operations.
  *
  * ## Usage
  *
@@ -54,7 +54,7 @@
 #include <utility>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Error checking macro for OpenCL operations
 #define clCHECK(err)                                                             \
@@ -248,6 +248,6 @@ class OpenCLBufferRegistry {
   std::vector<BufferInfo> buffers_;
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux
 
 #endif  // SPRUX_USE_OPENCL

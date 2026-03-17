@@ -14,7 +14,7 @@
 #include "sprux/sprux/Accessor.h"
 #include "sprux/sprux/CsrTypes.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 constexpr int64_t kInvalid = -1;
 
@@ -144,4 +144,4 @@ struct CoalescedBlockMatrixSkel {
   int64_t totalDataSize() const { return dataSize() + upperDataSize(); }
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

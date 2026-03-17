@@ -33,28 +33,28 @@ public:
         int64_t nnz = indices_buf.size;
 
         // Create solver based on backend selection
-        BaSpaCho::OpsPtr ops;
+        Sprux::OpsPtr ops;
         if (backend == "metal") {
 #ifdef SPRUX_USE_METAL
-            ops = BaSpaCho::createMetalOps();
+            ops = Sprux::createMetalOps();
 #else
             throw std::runtime_error("Sprux was not built with Metal support");
 #endif
         } else if (backend == "cuda") {
 #ifdef SPRUX_USE_CUDA
-            ops = BaSpaCho::createCudaOps();
+            ops = Sprux::createCudaOps();
 #else
             throw std::runtime_error("Sprux was not built with CUDA support");
 #endif
         } else if (backend == "opencl") {
 #ifdef SPRUX_USE_OPENCL
-            ops = BaSpaCho::createOpenCLOps();
+            ops = Sprux::createOpenCLOps();
 #else
             throw std::runtime_error("Sprux was not built with OpenCL support");
 #endif
         } else {
             // CPU/auto - use Eigen backend
-            ops = BaSpaCho::createEigenOps();
+            ops = Sprux::createEigenOps();
         }
 
         // Create sparse structure from CSR format
@@ -68,10 +68,10 @@ public:
         );
 
         // Create solver with symbolic analysis
-        auto sparseStruct = BaSpaCho::SparseStructure::fromCSR(n, row_ptr, col_idx);
+        auto sparseStruct = Sprux::SparseStructure::fromCSR(n, row_ptr, col_idx);
 
         // Create solver - will perform fill-reducing ordering and symbolic factorization
-        solver_ = BaSpaCho::createSolver(sparseStruct, std::move(ops));
+        solver_ = Sprux::createSolver(sparseStruct, std::move(ops));
 
         // Allocate factor storage
         factor_nnz_ = solver_->factorDataSize();
@@ -134,7 +134,7 @@ public:
 private:
     int64_t n_;
     int64_t factor_nnz_;
-    std::unique_ptr<BaSpaCho::Solver> solver_;
+    std::unique_ptr<Sprux::Solver> solver_;
     std::vector<double> factor_data_;
     std::vector<int64_t> pivots_;
 };

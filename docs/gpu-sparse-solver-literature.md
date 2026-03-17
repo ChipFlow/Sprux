@@ -247,19 +247,19 @@ Several systems (including the 2024 arXiv paper) merge small supernodes before G
 
 ---
 
-## 8. Relevance to BaSpaCho
+## 8. Relevance to Sprux
 
-BaSpaCho implements a batched supernodal Cholesky/LU solver with both CUDA and Metal backends. Several findings from this literature review are directly relevant:
+Sprux implements a batched supernodal Cholesky/LU solver with both CUDA and Metal backends. Several findings from this literature review are directly relevant:
 
-1. **Threshold-based offloading** is the dominant strategy. BaSpaCho currently sends everything to GPU regardless of size -- adding a size threshold for CPU fallback on small lumps would match the field consensus.
+1. **Threshold-based offloading** is the dominant strategy. Sprux currently sends everything to GPU regardless of size -- adding a size threshold for CPU fallback on small lumps would match the field consensus.
 
-2. **Batched kernel launches** are critical. BaSpaCho's recent work on fusing saveGemm dispatches into batched kernels for Metal aligns with the CHOLMOD subtree and SuperLU_DIST level-set approaches.
+2. **Batched kernel launches** are critical. Sprux's recent work on fusing saveGemm dispatches into batched kernels for Metal aligns with the CHOLMOD subtree and SuperLU_DIST level-set approaches.
 
-3. **Custom kernels for small operations** (as in STRUMPACK) are more effective than calling vendor BLAS for small supernodes. BaSpaCho's Metal backend with custom .metal kernels follows this pattern.
+3. **Custom kernels for small operations** (as in STRUMPACK) are more effective than calling vendor BLAS for small supernodes. Sprux's Metal backend with custom .metal kernels follows this pattern.
 
-4. **Static pivoting** for LU is the practical choice on GPU. The "perturb then refine" approach from SuperLU_DIST is well-established and would eliminate BaSpaCho's per-lump D->H pivot transfer.
+4. **Static pivoting** for LU is the practical choice on GPU. The "perturb then refine" approach from SuperLU_DIST is well-established and would eliminate Sprux's per-lump D->H pivot transfer.
 
-5. **Apple Silicon's unified memory** eliminates the PCIe bottleneck that dominates all the NVIDIA-based systems reviewed. This is a significant architectural advantage for BaSpaCho's Metal backend -- no data transfer overhead means even small supernodes can benefit from GPU acceleration.
+5. **Apple Silicon's unified memory** eliminates the PCIe bottleneck that dominates all the NVIDIA-based systems reviewed. This is a significant architectural advantage for Sprux's Metal backend -- no data transfer overhead means even small supernodes can benefit from GPU acceleration.
 
 6. **Right-looking approaches** generally achieve better GPU utilization than left-looking, at the cost of higher temporary memory usage. The RLB variant from the 2024 arXiv paper offers a middle ground.
 

@@ -10,7 +10,7 @@
 #include "sprux/sprux/DebugMacros.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -298,4 +298,4 @@ void CoalescedBlockMatrixSkel::initUpperTriangle() {
   }
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

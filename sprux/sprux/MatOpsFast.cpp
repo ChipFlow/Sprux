@@ -23,7 +23,7 @@
 #endif
 #endif  // SPRUX_USE_BLAS
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -402,7 +402,7 @@ static void transposeSquareInPlace(T* data, int64_t n) {
 }
 
 // LAPACK getrf with workaround for row-major storage:
-// BaSpaCho stores blocks row-major, but LAPACKE only supports COL_MAJOR for getrf.
+// Sprux stores blocks row-major, but LAPACKE only supports COL_MAJOR for getrf.
 // When LAPACK interprets row-major data as col-major, it sees A^T instead of A.
 // To get correct P * A = L * U with L in lower and U in upper (row-major view),
 // we transpose A before getrf (so LAPACK sees A), then transpose back after.
@@ -1439,4 +1439,4 @@ SolveCtxBase* BlasSymbolicCtx::createSolveCtxForType(std::type_index tIdx, int n
 
 OpsPtr fastOps(int numThreads) { return OpsPtr(new BlasOps(numThreads)); }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

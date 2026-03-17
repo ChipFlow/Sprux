@@ -17,8 +17,8 @@
 #include "sprux/sprux/SparseStructure.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
-using namespace ::BaSpaCho::testing_utils;
+using namespace Sprux;
+using namespace ::Sprux::testing_utils;
 using namespace std;
 
 // Helper: build a CSR matrix from COO triplets

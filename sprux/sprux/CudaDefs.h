@@ -16,13 +16,13 @@
 #include <cstdio>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 const char* cublasGetErrorEnum(cublasStatus_t error);
 const char* cusparseGetErrorEnum(cusparseStatus_t error);
 const char* cusolverGetErrorEnum(cusolverStatus_t error);
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux
 
 #define cuCHECK(call)                                                                           \
   do {                                                                                          \
@@ -38,7 +38,7 @@ const char* cusolverGetErrorEnum(cusolverStatus_t error);
   do {                                                                               \
     cublasStatus_t status = (call);                                                  \
     if (CUBLAS_STATUS_SUCCESS != status) {                                           \
-      fprintf(stderr, "CUBLAS Error: %s\n", ::BaSpaCho::cublasGetErrorEnum(status)); \
+      fprintf(stderr, "CUBLAS Error: %s\n", ::Sprux::cublasGetErrorEnum(status)); \
       cudaDeviceReset();                                                             \
       abort();                                                                       \
     }                                                                                \
@@ -48,7 +48,7 @@ const char* cusolverGetErrorEnum(cusolverStatus_t error);
   do {                                                                                   \
     cusparseStatus_t status = (call);                                                    \
     if (CUSPARSE_STATUS_SUCCESS != status) {                                             \
-      fprintf(stderr, "CUSPARSE Error: %s\n", ::BaSpaCho::cusparseGetErrorEnum(status)); \
+      fprintf(stderr, "CUSPARSE Error: %s\n", ::Sprux::cusparseGetErrorEnum(status)); \
       cudaDeviceReset();                                                                 \
       abort();                                                                           \
     }                                                                                    \
@@ -58,7 +58,7 @@ const char* cusolverGetErrorEnum(cusolverStatus_t error);
   do {                                                                                   \
     cusolverStatus_t status = (call);                                                    \
     if (CUSOLVER_STATUS_SUCCESS != status) {                                             \
-      fprintf(stderr, "CUSOLVER Error: %s\n", ::BaSpaCho::cusolverGetErrorEnum(status)); \
+      fprintf(stderr, "CUSOLVER Error: %s\n", ::Sprux::cusolverGetErrorEnum(status)); \
       cudaDeviceReset();                                                                 \
       abort();                                                                           \
     }                                                                                    \

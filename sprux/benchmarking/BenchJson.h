@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 struct BenchRecord {
   std::string problem;
@@ -89,4 +89,4 @@ inline double computeMedian(std::vector<double> v) {
   return v[v.size() / 2];
 }
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

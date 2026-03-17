@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // throw exception with debug message
 void throwError(const char* file, int line, const char* msg);
@@ -195,4 +195,4 @@ int64_t cumSumVec(std::vector<int64_t>& v);
 // set v[i+1] to v[i] for decreating i, setting v[downTo] = value
 void rewindVec(std::vector<int64_t>& v, int64_t downTo = 0, int64_t value = 0);
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

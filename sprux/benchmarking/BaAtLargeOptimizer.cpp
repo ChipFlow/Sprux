@@ -12,7 +12,7 @@
 #include "sprux/benchmarking/BaAtLarge.h"
 #include "sprux/testing/TestingUtils.h"
 
-using namespace BaSpaCho;
+using namespace Sprux;
 using namespace testing_utils;
 using namespace ba_at_large;
 using namespace std;

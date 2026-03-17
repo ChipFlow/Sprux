@@ -27,7 +27,7 @@
 #include "sprux/sprux/BlasDefs.h"
 #endif
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 
@@ -1726,7 +1726,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         }
         float* A = data + offA;
 
-        // BaSpaCho stores row-major; LAPACK expects col-major.
+        // Sprux stores row-major; LAPACK expects col-major.
         // Transpose before + after gives correct row-major L*U result.
         if (m == n) {
           for (int64_t i = 0; i < n; i++)
@@ -4875,4 +4875,4 @@ SolveCtxBase* MetalSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS,
 // Public factory function
 OpsPtr metalOps() { return OpsPtr(new MetalOps); }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

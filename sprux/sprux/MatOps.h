@@ -17,7 +17,7 @@
 #include <vector>
 #include "sprux/sprux/CoalescedBlockMatrix.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 struct Ops;
 struct SymbolicCtx;
@@ -832,4 +832,4 @@ OpsPtr metalOps();
 OpsPtr openclOps();
 #endif
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

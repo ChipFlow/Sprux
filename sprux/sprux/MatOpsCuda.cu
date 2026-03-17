@@ -19,7 +19,7 @@
 #include "sprux/sprux/MathUtils.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using namespace std;
 using hrc = chrono::high_resolution_clock;
@@ -756,7 +756,7 @@ __global__ void maxAbsDiagKernel(const T* data, const int64_t* lumpStart,
   }
 }
 
-// Convert cuSolver pivots (int, 1-based) to BaSpaCho format (int64_t, 0-based) on GPU
+// Convert cuSolver pivots (int, 1-based) to Sprux format (int64_t, 0-based) on GPU
 __global__ void convertPivotsKernel(const int* src, int64_t* dst, int64_t count) {
   int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < count) {
@@ -3238,4 +3238,4 @@ SolveCtxBase* CudaSymbolicCtx::createSolveCtxForType(type_index tIdx, int nRHS, 
 
 OpsPtr cudaOps() { return OpsPtr(new CudaOps); }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

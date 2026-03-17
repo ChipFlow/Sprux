@@ -13,7 +13,7 @@
 #include <vector>
 #include "sprux/sprux/SparseStructure.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Result of LU preprocessing: row permutation (and optionally scaling)
 // to improve diagonal quality before fill-reducing ordering.
@@ -66,4 +66,4 @@ void applyRowPermAndScaleToCsr(int64_t n, const int64_t* rowPtr, const int64_t* 
 SparseStructure csrToSymmetricSparseStructure(int64_t n, const int64_t* rowPtr,
                                               const int64_t* colInd);
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

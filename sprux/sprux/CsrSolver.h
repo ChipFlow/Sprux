@@ -13,7 +13,7 @@
 #include "sprux/sprux/CsrTypes.h"
 #include "sprux/sprux/Solver.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 /**
  * Block CSR matrix descriptor - holds structure metadata (no numeric data).
@@ -94,7 +94,7 @@ SolverPtr createSolverFromBlockCsrWithValues(const Settings& settings,
 /**
  * Convert block CSR descriptor to SparseStructure.
  *
- * Internal helper function that converts the CSR format to BaSpaCho's
+ * Internal helper function that converts the CSR format to Sprux's
  * internal SparseStructure representation.
  *
  * @param desc Block CSR descriptor
@@ -110,4 +110,4 @@ SparseStructure blockCsrToSparseStructure(const BlockCsrDescriptor& desc);
  */
 std::vector<int64_t> getParamSizes(const BlockCsrDescriptor& desc);
 
-}  // namespace BaSpaCho
+}  // namespace Sprux

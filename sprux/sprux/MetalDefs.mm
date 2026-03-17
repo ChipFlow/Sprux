@@ -17,7 +17,7 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace BaSpaCho {
+namespace Sprux {
 
 // Implementation class for MetalContext - holds Objective-C objects
 class MetalContextImpl {
@@ -396,4 +396,4 @@ std::pair<void*, size_t> MetalBufferRegistry::findBuffer(const void* ptr) const 
   return {nullptr, 0};
 }
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux

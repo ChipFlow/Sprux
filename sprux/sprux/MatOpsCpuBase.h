@@ -13,7 +13,7 @@
 #include "sprux/sprux/MatOps.h"
 #include "sprux/sprux/Utils.h"
 
-namespace BaSpaCho {
+namespace Sprux {
 
 using OuterStride = Eigen::OuterStride<>;
 template <typename T>
@@ -601,4 +601,4 @@ struct CpuBaseSolveCtx : SolveCtx<T> {
   std::vector<T> tmpBuf;
 };
 
-}  // end namespace BaSpaCho
+}  // end namespace Sprux
