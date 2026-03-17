@@ -127,7 +127,7 @@ def run_sprux(test_bin: Path, gtest_filter: str) -> list[dict]:
 def find_test_binary(build_dir: Path, name: str) -> Path | None:
     """Find the test binary in the build directory."""
     candidates = [
-        build_dir / "baspacho" / "tests" / name,
+        build_dir / "sprux" / "tests" / name,
         build_dir / "tests" / name,
         build_dir / name,
     ]

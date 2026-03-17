@@ -37,7 +37,7 @@ Input (CSR + param sizes)
 
 ### SparseStructure
 
-Defined in `baspacho/baspacho/SparseStructure.h`.
+Defined in `sprux/sprux/SparseStructure.h`.
 
 CSR-format sparse structure storing block-level connectivity (not individual elements).
 Two vectors:
@@ -52,7 +52,7 @@ Key operations:
 
 ### CoalescedBlockMatrixSkel
 
-Defined in `baspacho/baspacho/CoalescedBlockMatrix.h`.
+Defined in `sprux/sprux/CoalescedBlockMatrix.h`.
 
 The skeleton (structure without numeric data) of the block-sparse factor. Key terminology:
 
@@ -78,7 +78,7 @@ The coalesced layout enables dense BLAS calls on supernodal blocks:
 
 ### Solver
 
-Defined in `baspacho/baspacho/Solver.h`.
+Defined in `sprux/sprux/Solver.h`.
 
 The main user-facing class. Created via `createSolver()`. Provides:
 - `factor()`: Cholesky factorization (SPD matrices)
@@ -271,8 +271,8 @@ any data transfer overhead.
 ## Directory Structure
 
 ```
-baspacho/
-  baspacho/          # Core library sources
+sprux/
+  sprux/             # Core library sources
     Solver.h/.cpp      # Main Solver class and createSolver()
     MatOpsFast.cpp     # CPU BLAS backend
     MatOpsCuda.cu      # CUDA backend

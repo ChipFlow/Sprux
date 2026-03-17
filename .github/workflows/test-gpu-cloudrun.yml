@@ -69,10 +69,10 @@ jobs:
     - name: Run benchmarks
       run: |
         echo "=== CPU Baseline (BLAS) ==="
-        ./build/baspacho/benchmarking/bench -S "BLAS" -n 3 2>&1 || true
+        ./build/sprux/benchmarking/bench -S "BLAS" -n 3 2>&1 || true
         echo ""
         echo "=== Metal GPU ==="
-        ./build/baspacho/benchmarking/bench -S "Metal" -n 3 2>&1 || true
+        ./build/sprux/benchmarking/bench -S "Metal" -n 3 2>&1 || true
 
     - name: Summary
       if: always()

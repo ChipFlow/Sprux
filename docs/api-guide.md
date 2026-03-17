@@ -8,8 +8,8 @@ covers common usage patterns for each decomposition type and backend.
 Sprux takes block-structured sparse matrices in CSR format:
 
 ```cpp
-#include "baspacho/baspacho/Solver.h"
-#include "baspacho/baspacho/SparseStructure.h"
+#include "sprux/sprux/Solver.h"
+#include "sprux/sprux/SparseStructure.h"
 
 using namespace BaSpaCho;
 
@@ -89,7 +89,7 @@ solver->solveLU(data.data(), pivots.data(), rhs.data(), solver->order(), 1);
 For ill-conditioned matrices, use BTF + equilibration:
 
 ```cpp
-#include "baspacho/baspacho/Preprocessing.h"
+#include "sprux/sprux/Preprocessing.h"
 
 // Load your matrix (e.g., from Matrix Market format)
 int n = ...;
@@ -155,7 +155,7 @@ solver->solveLDLT(data.data(), rhs.data(), solver->order(), 1);
 ### Basic Usage (Float Only)
 
 ```cpp
-#include "baspacho/baspacho/MetalDefs.h"
+#include "sprux/sprux/MetalDefs.h"
 
 Settings settings;
 settings.backend = BackendMetal;
@@ -223,7 +223,7 @@ for (int i = 0; i < numMatrices; i++) {
 ## CUDA Backend
 
 ```cpp
-#include "baspacho/baspacho/CudaDefs.h"
+#include "sprux/sprux/CudaDefs.h"
 
 Settings settings;
 settings.backend = BackendCuda;

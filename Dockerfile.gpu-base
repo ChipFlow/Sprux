@@ -30,7 +30,7 @@ RUN curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.8.2/sccac
     | tar -xz -C /usr/local/bin --strip-components=1 sccache-v0.8.2-x86_64-unknown-linux-musl/sccache
 
 # Configure sccache to use GCS
-ENV SCCACHE_GCS_BUCKET=baspacho-sccache
+ENV SCCACHE_GCS_BUCKET=sprux-sccache
 ENV SCCACHE_GCS_RW_MODE=READ_WRITE
 ENV CMAKE_C_COMPILER_LAUNCHER=sccache
 ENV CMAKE_CXX_COMPILER_LAUNCHER=sccache

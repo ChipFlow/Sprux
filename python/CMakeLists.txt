@@ -20,7 +20,7 @@ target_link_libraries(sprux_py PRIVATE ${SPRUX_LIBRARY})
 # Include directories
 target_include_directories(sprux_py PRIVATE
     ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/baspacho
+    ${CMAKE_SOURCE_DIR}/sprux
 )
 
 # Propagate backend definitions

@@ -92,15 +92,15 @@ Input (CSR + param sizes) → Symbolic Analysis → Numeric Factorization → So
 
 ### Core Data Structures
 
-**SparseStructure** (`baspacho/baspacho/SparseStructure.h`): CSR-format sparse structure storing `ptrs` and `inds` vectors representing block indices (not individual elements).
+**SparseStructure** (`sprux/sprux/SparseStructure.h`): CSR-format sparse structure storing `ptrs` and `inds` vectors representing block indices (not individual elements).
 
-**CoalescedBlockMatrixSkel** (`baspacho/baspacho/CoalescedBlockMatrix.h`): Block matrix skeleton with coalesced columns. Key terminology:
+**CoalescedBlockMatrixSkel** (`sprux/sprux/CoalescedBlockMatrix.h`): Block matrix skeleton with coalesced columns. Key terminology:
 - **span**: basic parameter block grouping
 - **lump**: aggregation of consecutive spans (supernode)
 - **chain**: span rows × lump cols
 - **board**: all spans in a lump of rows × lump cols
 
-**Solver** (`baspacho/baspacho/Solver.h`): Main interface created via `createSolver()`. Provides:
+**Solver** (`sprux/sprux/Solver.h`): Main interface created via `createSolver()`. Provides:
 - `factor()` / `factorLU()` / `factorLDLT()`: factorization
 - `solve()` / `solveLU()` / `solveLDLT()`: triangular solves
 - `factorUpTo()` / `solveLUpTo()`: partial factorization for marginals
@@ -132,8 +132,8 @@ The Metal backend supports embedding into external GPU pipelines:
 ### Directory Structure
 
 ```
-baspacho/
-  baspacho/       # Core library sources
+sprux/
+  sprux/          # Core library sources
   testing/        # Test utilities (TestingMatGen, TestingUtils, MatrixMarketReader)
   tests/          # Unit tests (gtest)
   benchmarking/   # Performance benchmarks (bench, BAL_bench, lu_bench)
@@ -215,14 +215,14 @@ See [docs/benchmarks.md](docs/benchmarks.md) for full details.
 
 ```bash
 # Cholesky benchmarks with CHOLMOD baseline
-build/baspacho/benchmarking/bench -B 1_CHOLMOD
+build/sprux/benchmarking/bench -B 1_CHOLMOD
 
 # Bundle Adjustment problem
-build/baspacho/benchmarking/BAL_bench -i ~/BAL/problem-871-527480-pre.txt
+build/sprux/benchmarking/BAL_bench -i ~/BAL/problem-871-527480-pre.txt
 
 # LU benchmarks on circuit Jacobians
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
 
 # Collect timing statistics for computation model fitting
-build/baspacho/benchmarking/bench -B 1_CHOLMOD -Z
+build/sprux/benchmarking/bench -B 1_CHOLMOD -Z
 ```

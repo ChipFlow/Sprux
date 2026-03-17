@@ -136,7 +136,7 @@ if(SPRUX_USE_METAL)
   # cmake to treat ALL .m files as Objective-C++, which breaks projects
   # that embed Sprux and have their own Objective-C code (like IREE).
   # Instead, we explicitly set compile flags for .mm files in the
-  # baspacho/baspacho/CMakeLists.txt.
+  # sprux/sprux/CMakeLists.txt.
 
   add_compile_definitions(SPRUX_USE_METAL)
 endif()
@@ -456,4 +456,4 @@ if(SPRUX_BUILD_TESTS)
 endif()
 
 # add subfolders
-add_subdirectory(baspacho)
+add_subdirectory(sprux)

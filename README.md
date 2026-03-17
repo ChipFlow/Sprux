@@ -90,7 +90,7 @@ auto solver = createSolver(settings, paramSize, structure);
 ### Cholesky (SPD)
 
 ```cpp
-#include "baspacho/baspacho/Solver.h"
+#include "sprux/sprux/Solver.h"
 using namespace BaSpaCho;
 
 Settings settings;
@@ -129,13 +129,13 @@ persistent contexts, preprocessing pipeline, and Python bindings.
 
 ```bash
 # Cholesky — compare with CHOLMOD baseline
-build/baspacho/benchmarking/bench -B 1_CHOLMOD
+build/sprux/benchmarking/bench -B 1_CHOLMOD
 
 # Bundle Adjustment in the Large
-build/baspacho/benchmarking/BAL_bench -i ~/BAL/problem-871-527480-pre.txt
+build/sprux/benchmarking/BAL_bench -i ~/BAL/problem-871-527480-pre.txt
 
 # LU — circuit Jacobians with Metal/CUDA/CPU backends
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
 ```
 
 See [docs/benchmarks.md](docs/benchmarks.md) for benchmark tools, test data, and CI setup.

@@ -7,9 +7,9 @@ problem types, backends, and hardware.
 
 | Tool | Binary | Purpose |
 |------|--------|---------|
-| `bench` | `build/baspacho/benchmarking/bench` | Cholesky on synthetic problems (FLAT, GRID, MERI) |
-| `BAL_bench` | `build/baspacho/benchmarking/BAL_bench` | Bundle Adjustment in the Large |
-| `lu_bench` | `build/baspacho/benchmarking/lu_bench` | LU on real circuit Jacobians (sequences) |
+| `bench` | `build/sprux/benchmarking/bench` | Cholesky on synthetic problems (FLAT, GRID, MERI) |
+| `BAL_bench` | `build/sprux/benchmarking/BAL_bench` | Bundle Adjustment in the Large |
+| `lu_bench` | `build/sprux/benchmarking/lu_bench` | LU on real circuit Jacobians (sequences) |
 
 ## bench — Cholesky Benchmarks
 
@@ -27,13 +27,13 @@ Benchmarks Cholesky factorization on synthetic SPD problems with varying structu
 
 ```bash
 # Run all problems, compare with CHOLMOD baseline
-build/baspacho/benchmarking/bench -B 1_CHOLMOD
+build/sprux/benchmarking/bench -B 1_CHOLMOD
 
 # Run specific problem types
-build/baspacho/benchmarking/bench -P GRID
+build/sprux/benchmarking/bench -P GRID
 
 # Factor operation only (default)
-build/baspacho/benchmarking/bench -B 1_CHOLMOD -O factor
+build/sprux/benchmarking/bench -B 1_CHOLMOD -O factor
 ```
 
 ### Collecting Timing Statistics
@@ -42,7 +42,7 @@ For fitting a computation model to your hardware:
 
 ```bash
 # Collect per-operation timings
-build/baspacho/benchmarking/bench -B 1_CHOLMOD -Z
+build/sprux/benchmarking/bench -B 1_CHOLMOD -Z
 
 # This generates CSV files:
 #   stats_cpu_f64_potrf.csv
@@ -51,7 +51,7 @@ build/baspacho/benchmarking/bench -B 1_CHOLMOD -Z
 #   stats_cpu_f64_asmbl.csv
 
 # Fit a computation model
-build/baspacho/examples/opt_comp_model \
+build/sprux/examples/opt_comp_model \
   -p stats_cpu_f64_potrf.csv \
   -a stats_cpu_f64_asmbl.csv \
   -t stats_cpu_f64_trsm.csv \
@@ -60,7 +60,7 @@ build/baspacho/examples/opt_comp_model \
 
 ### Command-Line Options
 
-Run `build/baspacho/benchmarking/bench -h` for all options. Key flags:
+Run `build/sprux/benchmarking/bench -h` for all options. Key flags:
 - `-B <baseline>`: Baseline solver (e.g., `1_CHOLMOD`)
 - `-P <pattern>`: Problem filter (regex)
 - `-O <operation>`: Operation to benchmark (`factor`, `analysis`, `solve-X`)
@@ -76,7 +76,7 @@ wget https://grail.cs.washington.edu/projects/bal/data/ladybug/problem-49-7776-p
 bunzip2 problem-49-7776-pre.txt.bz2
 
 # Run benchmark
-build/baspacho/benchmarking/BAL_bench -i problem-49-7776-pre.txt
+build/sprux/benchmarking/BAL_bench -i problem-49-7776-pre.txt
 ```
 
 Tests both:
@@ -92,19 +92,19 @@ Supports multiple backends and outputs JSON for CI regression tracking.
 
 ```bash
 # CPU (double precision)
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b CPU
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b CPU
 
 # Metal (float + iterative refinement)
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse
 
 # Metal dense baseline (Accelerate sgetrf/sgetrs)
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Dense
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Dense
 
 # CUDA (double precision)
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b CUDA
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b CUDA
 
 # cuDSS (NVIDIA's sparse direct solver)
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b cuDSS
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b cuDSS
 ```
 
 ### Options
@@ -120,7 +120,7 @@ build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b cuDSS
 ### JSON Output
 
 ```bash
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json
 ```
 
 Output format:
@@ -184,11 +184,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j16
 
 # Run benchmark and save baseline
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json \
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json \
   > baseline.json
 
 # After changes, compare
-build/baspacho/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json \
+build/sprux/benchmarking/lu_bench -d test_data/c6288_sequence -b Metal_Sparse --json \
   > current.json
 # Compare avg_factor_ms and avg_solve_ms
 ```

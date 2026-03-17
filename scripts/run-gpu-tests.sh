@@ -21,8 +21,8 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 fi
 
-git clone --depth=1 "$REPO_URL" /workspace/baspacho
-cd /workspace/baspacho
+git clone --depth=1 "$REPO_URL" /workspace/sprux
+cd /workspace/sprux
 
 # Checkout specific commit if provided
 if [ -n "${GITHUB_SHA:-}" ]; then
@@ -73,7 +73,7 @@ if [ $TEST_RESULT -eq 0 ] && command -v nsys &> /dev/null; then
     echo "=== Profiling CUDA LU (Nsight Systems) ==="
     nsys profile --trace=cuda --stats=true --force-overwrite=true \
         --output /tmp/cuda_lu_profile \
-        ./baspacho/tests/CudaLUTest --gtest_filter="CudaLU.BlockSparse_double" 2>&1 | \
+        ./sprux/tests/CudaLUTest --gtest_filter="CudaLU.BlockSparse_double" 2>&1 | \
         grep -E "cublas|cusolver|Kernel|cudaMemcpy|CUDA API|GPU" || true
     echo ""
 fi
@@ -84,11 +84,11 @@ if [ $TEST_RESULT -eq 0 ]; then
 
     # Quick benchmark with a few problems
     echo "--- CUDA Backend ---"
-    ./baspacho/benchmarking/bench -S "CUDA" -n 3 2>&1 || echo "CUDA benchmark completed with warnings"
+    ./sprux/benchmarking/bench -S "CUDA" -n 3 2>&1 || echo "CUDA benchmark completed with warnings"
 
     echo ""
     echo "--- BLAS CPU Backend ---"
-    ./baspacho/benchmarking/bench -S "BLAS" -n 3 2>&1 || echo "BLAS benchmark completed with warnings"
+    ./sprux/benchmarking/bench -S "BLAS" -n 3 2>&1 || echo "BLAS benchmark completed with warnings"
 fi
 
 echo ""

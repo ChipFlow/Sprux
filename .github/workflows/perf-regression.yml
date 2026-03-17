@@ -79,7 +79,7 @@ jobs:
 
     - name: Run benchmarks
       run: |
-        ./build/baspacho/benchmarking/bench -J \
+        ./build/sprux/benchmarking/bench -J \
           -S "Metal|BLAS" \
           -R "10_FLAT|30_GRID|40_MERI|MTX" \
           -i test_data/c6288_jacobian/jacobian.mtx \
@@ -151,7 +151,7 @@ jobs:
 
     - name: Run LU benchmarks
       run: |
-        ./build/baspacho/benchmarking/lu_bench -J \
+        ./build/sprux/benchmarking/lu_bench -J \
           -i test_data/c6288_jacobian/jacobian.mtx \
           -r test_data/c6288_jacobian/rhs.mtx \
           -n "$ITERATIONS" > results-lu-metal.json
@@ -257,7 +257,7 @@ jobs:
 
     - name: Run benchmarks
       run: |
-        ./build/baspacho/benchmarking/bench -J \
+        ./build/sprux/benchmarking/bench -J \
           -S "CUDA|BLAS|cuDSS" \
           -R "10_FLAT|30_GRID|40_MERI|MTX" \
           -i test_data/c6288_jacobian/jacobian.mtx \
@@ -329,7 +329,7 @@ jobs:
 
     - name: Run LU benchmarks
       run: |
-        ./build/baspacho/benchmarking/lu_bench -J \
+        ./build/sprux/benchmarking/lu_bench -J \
           -i test_data/c6288_jacobian/jacobian.mtx \
           -r test_data/c6288_jacobian/rhs.mtx \
           -n "$ITERATIONS" -S "CUDA|CPU|cuDSS" > results-lu-cuda.json

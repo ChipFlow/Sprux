@@ -67,7 +67,7 @@ jobs:
           --stats=true \
           --output /tmp/cudss_vs_sprux \
           ${{ inputs.nsys_args }} \
-          ./build/baspacho/tests/CudssBenchmarkTest
+          ./build/sprux/tests/CudssBenchmarkTest
 
     - name: Generate stats summary
       run: |

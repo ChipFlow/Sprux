@@ -134,18 +134,18 @@ jobs:
         # Run CPU baseline benchmark
         echo "=== CPU Baseline (BLAS) ===" | tee -a benchmark_output.txt
         if [ -n "$PROBLEM_FILTER" ]; then
-          ../build/baspacho/benchmarking/bench -S "BLAS" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
+          ../build/sprux/benchmarking/bench -S "BLAS" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
         else
-          ../build/baspacho/benchmarking/bench -S "BLAS" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
+          ../build/sprux/benchmarking/bench -S "BLAS" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
         fi
 
         # Run Metal GPU benchmark
         echo "" | tee -a benchmark_output.txt
         echo "=== Metal GPU ===" | tee -a benchmark_output.txt
         if [ -n "$PROBLEM_FILTER" ]; then
-          ../build/baspacho/benchmarking/bench -S "Metal" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
+          ../build/sprux/benchmarking/bench -S "Metal" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
         else
-          ../build/baspacho/benchmarking/bench -S "Metal" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
+          ../build/sprux/benchmarking/bench -S "Metal" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
         fi
 
     - name: Upload Benchmark Results
