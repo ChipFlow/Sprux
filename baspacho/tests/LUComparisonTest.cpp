@@ -40,7 +40,7 @@ using Vector = Eigen::Vector<T, Eigen::Dynamic>;
 // Helper functions for filling block matrix data from dense matrices
 // ============================================================================
 
-// Fill BaSpaCho block data from a dense matrix.
+// Fill Sprux block data from a dense matrix.
 // This properly fills both lower triangle (chainData) and upper triangle
 // (upperChainData) storage from the corresponding entries in fullMat.
 template <typename T>
@@ -128,7 +128,7 @@ void fillDataFromDenseMatrix(const CoalescedBlockMatrixSkel& skel, T* data,
   }
 }
 
-// Reconstruct a dense matrix from BaSpaCho block data.
+// Reconstruct a dense matrix from Sprux block data.
 // This is useful for verifying that data was filled correctly.
 template <typename T>
 Matrix<T> reconstructDenseMatrix(const CoalescedBlockMatrixSkel& skel, const T* data,
@@ -212,7 +212,7 @@ struct UmfpackSolveResult {
   Vector<double> solution;
 };
 
-// Helper struct to hold BaSpaCho solve results
+// Helper struct to hold Sprux solve results
 struct BaspachoSolveResult {
   double analysisTime;
   double factorTime;
@@ -284,7 +284,7 @@ UmfpackSolveResult solveWithUmfpack(const vector<int64_t>& colPtr, const vector<
   return result;
 }
 
-// Compare UMFPACK and BaSpaCho on a randomly generated sparse matrix
+// Compare UMFPACK and Sprux on a randomly generated sparse matrix
 TEST(LUComparison, VsUmfpack_SmallDense) {
   // Create a small dense test matrix
   int64_t n = 10;
@@ -322,7 +322,7 @@ TEST(LUComparison, VsUmfpack_SmallDense) {
   // Solve with UMFPACK
   auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, n, b);
 
-  // Solve with BaSpaCho
+  // Solve with Sprux
   // Create single-block structure
   vector<set<int64_t>> colBlocks{{0}};
   SparseStructure ss = columnsToCscStruct(colBlocks).transpose();
@@ -342,20 +342,20 @@ TEST(LUComparison, VsUmfpack_SmallDense) {
 
   auto startAnalysis = hrc::now();
   Solver solver(std::move(factorSkel), {}, {}, fastOps());
-  double baspachoAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
+  double spruxAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
 
   vector<int64_t> pivots(n);
 
   auto startFactor = hrc::now();
   solver.factorLU(data.data(), pivots.data());
-  double baspachoFactorTime = tdelta(hrc::now() - startFactor).count();
+  double spruxFactorTime = tdelta(hrc::now() - startFactor).count();
 
   Vector<double> x = b;
   auto startSolve = hrc::now();
   solver.solveLU(data.data(), pivots.data(), x.data(), n, 1);
-  double baspachoSolveTime = tdelta(hrc::now() - startSolve).count();
+  double spruxSolveTime = tdelta(hrc::now() - startSolve).count();
 
-  double baspachoResidual = (A * x - b).norm() / b.norm();
+  double spruxResidual = (A * x - b).norm() / b.norm();
 
   // Print comparison
   cout << "\n=== Small Dense Matrix Comparison (n=" << n << ") ===" << endl;
@@ -364,15 +364,15 @@ TEST(LUComparison, VsUmfpack_SmallDense) {
        << "\n  Factor:   " << umfResult.factorTime * 1000 << " ms"
        << "\n  Solve:    " << umfResult.solveTime * 1000 << " ms"
        << "\n  Residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho:"
-       << "\n  Analysis: " << baspachoAnalysisTime * 1000 << " ms"
-       << "\n  Factor:   " << baspachoFactorTime * 1000 << " ms"
-       << "\n  Solve:    " << baspachoSolveTime * 1000 << " ms"
-       << "\n  Residual: " << baspachoResidual << endl;
+  cout << "Sprux:"
+       << "\n  Analysis: " << spruxAnalysisTime * 1000 << " ms"
+       << "\n  Factor:   " << spruxFactorTime * 1000 << " ms"
+       << "\n  Solve:    " << spruxSolveTime * 1000 << " ms"
+       << "\n  Residual: " << spruxResidual << endl;
 
   // Both should have small residuals
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-10) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-10) << "Sprux residual too large";
 
   // Solutions should be similar (not identical due to different pivoting strategies)
   double solutionDiff = (x - umfResult.solution).norm() / umfResult.solution.norm();
@@ -419,7 +419,7 @@ TEST(LUComparison, VsUmfpack_TwoBlock) {
   // Solve with UMFPACK
   auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, totalSize, b);
 
-  // Solve with BaSpaCho (using exact same setup as LUFactorTest)
+  // Solve with Sprux (using exact same setup as LUFactorTest)
   vector<int64_t> spanStart{0, 3, 5};
   vector<int64_t> lumpToSpan{0, 1, 2};
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
@@ -475,34 +475,34 @@ TEST(LUComparison, VsUmfpack_TwoBlock) {
 
   auto startAnalysis = hrc::now();
   Solver solver(std::move(factorSkel), {}, {}, fastOps());
-  double baspachoAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
+  double spruxAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
 
   vector<int64_t> pivots(totalSize);
 
   auto startFactor = hrc::now();
   solver.factorLU(data.data(), pivots.data());
-  double baspachoFactorTime = tdelta(hrc::now() - startFactor).count();
+  double spruxFactorTime = tdelta(hrc::now() - startFactor).count();
 
   Vector<double> x = b;
   auto startSolve = hrc::now();
   solver.solveLU(data.data(), pivots.data(), x.data(), totalSize, 1);
-  double baspachoSolveTime = tdelta(hrc::now() - startSolve).count();
+  double spruxSolveTime = tdelta(hrc::now() - startSolve).count();
 
-  double baspachoResidual = (fullMat * x - b).norm() / b.norm();
+  double spruxResidual = (fullMat * x - b).norm() / b.norm();
 
   cout << "UMFPACK:"
        << "\n  Analysis: " << umfResult.analysisTime * 1000 << " ms"
        << "\n  Factor:   " << umfResult.factorTime * 1000 << " ms"
        << "\n  Solve:    " << umfResult.solveTime * 1000 << " ms"
        << "\n  Residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho:"
-       << "\n  Analysis: " << baspachoAnalysisTime * 1000 << " ms"
-       << "\n  Factor:   " << baspachoFactorTime * 1000 << " ms"
-       << "\n  Solve:    " << baspachoSolveTime * 1000 << " ms"
-       << "\n  Residual: " << baspachoResidual << endl;
+  cout << "Sprux:"
+       << "\n  Analysis: " << spruxAnalysisTime * 1000 << " ms"
+       << "\n  Factor:   " << spruxFactorTime * 1000 << " ms"
+       << "\n  Solve:    " << spruxSolveTime * 1000 << " ms"
+       << "\n  Residual: " << spruxResidual << endl;
 
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
   double solutionDiff = (x - umfResult.solution).norm() / umfResult.solution.norm();
   cout << "Solution difference: " << solutionDiff << endl;
@@ -571,7 +571,7 @@ TEST(LUComparison, DebugBlockSparse) {
 
   cout << "\nFull matrix (before factorization):\n" << fullMat << endl;
 
-  // Build BaSpaCho skeleton
+  // Build Sprux skeleton
   vector<int64_t> lumpToSpan(paramSize.size() + 1);
   iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
@@ -715,7 +715,7 @@ TEST(LUComparison, DebugBlockSparse) {
   solver.solveLU(data.data(), pivots.data(), x.data(), totalSize, 1);
 
   double residual = (fullMat * x - b).norm() / b.norm();
-  cout << "BaSpaCho solution: " << x.transpose() << endl;
+  cout << "Sprux solution: " << x.transpose() << endl;
   cout << "Residual: " << residual << endl;
 
   // Compare with Eigen
@@ -724,7 +724,7 @@ TEST(LUComparison, DebugBlockSparse) {
   cout << "Eigen solution: " << xRef.transpose() << endl;
   cout << "Eigen residual: " << residualRef << endl;
 
-  EXPECT_LT(residual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(residual, 1e-8) << "Sprux residual too large";
 }
 
 // Compare on a sparse block matrix
@@ -806,7 +806,7 @@ TEST(LUComparison, VsUmfpack_BlockSparse) {
   // Solve with UMFPACK
   auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, totalSize, b);
 
-  // Solve with BaSpaCho
+  // Solve with Sprux
   vector<int64_t> lumpToSpan(paramSize.size() + 1);
   iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
@@ -864,20 +864,20 @@ TEST(LUComparison, VsUmfpack_BlockSparse) {
 
   auto startAnalysis = hrc::now();
   Solver solver(std::move(factorSkel), {}, {}, fastOps());
-  double baspachoAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
+  double spruxAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
 
   vector<int64_t> pivots(totalSize);
 
   auto startFactor = hrc::now();
   solver.factorLU(data.data(), pivots.data());
-  double baspachoFactorTime = tdelta(hrc::now() - startFactor).count();
+  double spruxFactorTime = tdelta(hrc::now() - startFactor).count();
 
   Vector<double> x = b;
   auto startSolve = hrc::now();
   solver.solveLU(data.data(), pivots.data(), x.data(), totalSize, 1);
-  double baspachoSolveTime = tdelta(hrc::now() - startSolve).count();
+  double spruxSolveTime = tdelta(hrc::now() - startSolve).count();
 
-  double baspachoResidual = (fullMat * x - b).norm() / b.norm();
+  double spruxResidual = (fullMat * x - b).norm() / b.norm();
 
   // Print comparison
   cout << "UMFPACK:"
@@ -885,15 +885,15 @@ TEST(LUComparison, VsUmfpack_BlockSparse) {
        << "\n  Factor:   " << umfResult.factorTime * 1000 << " ms"
        << "\n  Solve:    " << umfResult.solveTime * 1000 << " ms"
        << "\n  Residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho:"
-       << "\n  Analysis: " << baspachoAnalysisTime * 1000 << " ms"
-       << "\n  Factor:   " << baspachoFactorTime * 1000 << " ms"
-       << "\n  Solve:    " << baspachoSolveTime * 1000 << " ms"
-       << "\n  Residual: " << baspachoResidual << endl;
+  cout << "Sprux:"
+       << "\n  Analysis: " << spruxAnalysisTime * 1000 << " ms"
+       << "\n  Factor:   " << spruxFactorTime * 1000 << " ms"
+       << "\n  Solve:    " << spruxSolveTime * 1000 << " ms"
+       << "\n  Residual: " << spruxResidual << endl;
 
   // Both should have small residuals
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
   // Solutions should be similar
   double solutionDiff = (x - umfResult.solution).norm() / umfResult.solution.norm();
@@ -976,7 +976,7 @@ TEST(LUComparison, VsUmfpack_Performance) {
   // Warmup and solve with UMFPACK
   auto umfResult = solveWithUmfpack(colPtr, rowIdx, val, totalSize, b);
 
-  // Solve with BaSpaCho
+  // Solve with Sprux
   vector<int64_t> lumpToSpan(paramSize.size() + 1);
   iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
@@ -1030,39 +1030,39 @@ TEST(LUComparison, VsUmfpack_Performance) {
 
   auto startAnalysis = hrc::now();
   Solver solver(std::move(factorSkel), {}, {}, fastOps());
-  double baspachoAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
+  double spruxAnalysisTime = tdelta(hrc::now() - startAnalysis).count();
 
   vector<int64_t> pivots(totalSize);
 
   auto startFactor = hrc::now();
   solver.factorLU(data.data(), pivots.data());
-  double baspachoFactorTime = tdelta(hrc::now() - startFactor).count();
+  double spruxFactorTime = tdelta(hrc::now() - startFactor).count();
 
   Vector<double> x = b;
   auto startSolve = hrc::now();
   solver.solveLU(data.data(), pivots.data(), x.data(), totalSize, 1);
-  double baspachoSolveTime = tdelta(hrc::now() - startSolve).count();
+  double spruxSolveTime = tdelta(hrc::now() - startSolve).count();
 
-  double baspachoResidual = (fullMat * x - b).norm() / b.norm();
+  double spruxResidual = (fullMat * x - b).norm() / b.norm();
 
   cout << "UMFPACK:"
        << "\n  Analysis: " << umfResult.analysisTime * 1000 << " ms"
        << "\n  Factor:   " << umfResult.factorTime * 1000 << " ms"
        << "\n  Solve:    " << umfResult.solveTime * 1000 << " ms"
        << "\n  Residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho:"
-       << "\n  Analysis: " << baspachoAnalysisTime * 1000 << " ms"
-       << "\n  Factor:   " << baspachoFactorTime * 1000 << " ms"
-       << "\n  Solve:    " << baspachoSolveTime * 1000 << " ms"
-       << "\n  Residual: " << baspachoResidual << endl;
+  cout << "Sprux:"
+       << "\n  Analysis: " << spruxAnalysisTime * 1000 << " ms"
+       << "\n  Factor:   " << spruxFactorTime * 1000 << " ms"
+       << "\n  Solve:    " << spruxSolveTime * 1000 << " ms"
+       << "\n  Residual: " << spruxResidual << endl;
 
   // Both should have reasonable residuals
   EXPECT_LT(umfResult.residual, 1e-8) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-6) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-6) << "Sprux residual too large";
 }
 
 // ============================================================================
-// Helper: Build non-symmetric block-sparse matrix and fill BaSpaCho + UMFPACK data
+// Helper: Build non-symmetric block-sparse matrix and fill Sprux + UMFPACK data
 // ============================================================================
 
 struct LUTestData {
@@ -1119,7 +1119,7 @@ LUTestData buildNonSymmetricTestData(const SparseStructure& ss, const vector<int
   // Diagonal dominance
   for (int64_t i = 0; i < td.totalSize; i++) td.fullMat(i, i) += td.totalSize * 3;
 
-  // Build BaSpaCho skeleton
+  // Build Sprux skeleton
   vector<int64_t> lumpToSpan(paramSize.size() + 1);
   iota(lumpToSpan.begin(), lumpToSpan.end(), 0);
   SparseStructure groupedSs = columnsToCscStruct(joinColums(csrStructToColumns(ss), lumpToSpan));
@@ -1127,7 +1127,7 @@ LUTestData buildNonSymmetricTestData(const SparseStructure& ss, const vector<int
                                                         groupedSs.inds);
   td.factorSkel->initUpperTriangle();
 
-  // Fill BaSpaCho data
+  // Fill Sprux data
   td.data.resize(td.factorSkel->totalDataSize());
   fillDataFromDenseMatrix(*td.factorSkel, td.data.data(), td.fullMat);
 
@@ -1146,8 +1146,8 @@ LUTestData buildNonSymmetricTestData(const SparseStructure& ss, const vector<int
   return td;
 }
 
-// Helper to run BaSpaCho LU solve and return residual
-double solveBaSpaCho(LUTestData& td, const Vector<double>& b, Vector<double>& xOut) {
+// Helper to run Sprux LU solve and return residual
+double solveSprux(LUTestData& td, const Vector<double>& b, Vector<double>& xOut) {
   Solver solver(std::move(*td.factorSkel), {}, {}, fastOps());
   vector<int64_t> pivots(td.totalSize);
   solver.factorLU(td.data.data(), pivots.data());
@@ -1172,18 +1172,18 @@ TEST(LUComparison, VsUmfpack_NonSymmetric) {
 
   auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
 
-  Vector<double> xBaspacho;
-  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+  Vector<double> xSprux;
+  double spruxResidual = solveSprux(td, b, xSprux);
 
   cout << "\n=== Non-Symmetric Matrix Comparison ===" << endl;
   cout << "Size: " << td.totalSize << "x" << td.totalSize << endl;
   cout << "UMFPACK residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+  cout << "Sprux residual: " << spruxResidual << endl;
 
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
-  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  double solutionDiff = (xSprux - umfResult.solution).norm() / umfResult.solution.norm();
   cout << "Solution difference: " << solutionDiff << endl;
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }
@@ -1207,19 +1207,19 @@ TEST(LUComparison, VsUmfpack_LargerMixedBlocks) {
 
   auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
 
-  Vector<double> xBaspacho;
-  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+  Vector<double> xSprux;
+  double spruxResidual = solveSprux(td, b, xSprux);
 
   cout << "\n=== Larger Mixed-Block Non-Symmetric Comparison ===" << endl;
   cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
        << endl;
   cout << "UMFPACK residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+  cout << "Sprux residual: " << spruxResidual << endl;
 
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
-  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  double solutionDiff = (xSprux - umfResult.solution).norm() / umfResult.solution.norm();
   cout << "Solution difference: " << solutionDiff << endl;
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }
@@ -1240,7 +1240,7 @@ TEST(LUComparison, VsUmfpack_MultipleRHS) {
   for (int64_t i = 0; i < td.totalSize; i++)
     for (int j = 0; j < nRHS; j++) B(i, j) = unif(rng);
 
-  // Solve with BaSpaCho (multiple RHS at once)
+  // Solve with Sprux (multiple RHS at once)
   Solver solver(std::move(*td.factorSkel), {}, {}, fastOps());
   vector<int64_t> pivots(td.totalSize);
   solver.factorLU(td.data.data(), pivots.data());
@@ -1257,13 +1257,13 @@ TEST(LUComparison, VsUmfpack_MultipleRHS) {
     auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, bCol);
 
     Vector<double> xCol = X.col(rhs);
-    double baspachoResidual = (td.fullMat * xCol - bCol).norm() / bCol.norm();
+    double spruxResidual = (td.fullMat * xCol - bCol).norm() / bCol.norm();
 
     cout << "  RHS " << rhs << ": UMFPACK=" << umfResult.residual
-         << ", BaSpaCho=" << baspachoResidual << endl;
+         << ", Sprux=" << spruxResidual << endl;
 
     EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large for RHS " << rhs;
-    EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large for RHS " << rhs;
+    EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large for RHS " << rhs;
 
     double solutionDiff = (xCol - umfResult.solution).norm() / umfResult.solution.norm();
     EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much for RHS " << rhs;
@@ -1288,19 +1288,19 @@ TEST(LUComparison, VsUmfpack_GridTopology) {
 
   auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
 
-  Vector<double> xBaspacho;
-  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+  Vector<double> xSprux;
+  double spruxResidual = solveSprux(td, b, xSprux);
 
   cout << "\n=== Grid Topology (10x10) Non-Symmetric ===" << endl;
   cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
        << endl;
   cout << "UMFPACK residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+  cout << "Sprux residual: " << spruxResidual << endl;
 
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
-  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  double solutionDiff = (xSprux - umfResult.solution).norm() / umfResult.solution.norm();
   cout << "Solution difference: " << solutionDiff << endl;
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }
@@ -1321,19 +1321,19 @@ TEST(LUComparison, VsUmfpack_MeridianTopology) {
 
   auto umfResult = solveWithUmfpack(td.colPtr, td.rowIdx, td.val, td.totalSize, b);
 
-  Vector<double> xBaspacho;
-  double baspachoResidual = solveBaSpaCho(td, b, xBaspacho);
+  Vector<double> xSprux;
+  double spruxResidual = solveSprux(td, b, xSprux);
 
   cout << "\n=== Meridian Topology Non-Symmetric ===" << endl;
   cout << "Blocks: " << paramSize.size() << ", Size: " << td.totalSize << "x" << td.totalSize
        << endl;
   cout << "UMFPACK residual: " << umfResult.residual << endl;
-  cout << "BaSpaCho residual: " << baspachoResidual << endl;
+  cout << "Sprux residual: " << spruxResidual << endl;
 
   EXPECT_LT(umfResult.residual, 1e-10) << "UMFPACK residual too large";
-  EXPECT_LT(baspachoResidual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(spruxResidual, 1e-8) << "Sprux residual too large";
 
-  double solutionDiff = (xBaspacho - umfResult.solution).norm() / umfResult.solution.norm();
+  double solutionDiff = (xSprux - umfResult.solution).norm() / umfResult.solution.norm();
   cout << "Solution difference: " << solutionDiff << endl;
   EXPECT_LT(solutionDiff, 1e-6) << "Solutions differ too much";
 }

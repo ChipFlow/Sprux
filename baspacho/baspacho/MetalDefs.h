@@ -109,12 +109,12 @@ class MetalContext {
   // GPU trace capture (for profiling)
   // Set METAL_CAPTURE_ENABLED=1 env var, then call begin/endCapture
   // Writes a .gputrace file that can be opened in Xcode for full GPU timeline
-  bool beginCapture(const char* outputPath = "/tmp/baspacho.gputrace");
+  bool beginCapture(const char* outputPath = "/tmp/sprux.gputrace");
   void endCapture();
 
   // Convenience: begins capture only if SPRUX_GPU_CAPTURE=1 env var is set.
   // Returns true if capture was started. Call endCaptureIfActive() to stop.
-  bool beginCaptureIfRequested(const char* outputPath = "/tmp/baspacho.gputrace");
+  bool beginCaptureIfRequested(const char* outputPath = "/tmp/sprux.gputrace");
   void endCaptureIfActive();
 
  private:

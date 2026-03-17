@@ -533,34 +533,34 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            return retv;
          }},
 #endif  // SPRUX_HAVE_CHOLMOD
-        {"2_BaSpaCho_BLAS_numthreads=16",
+        {"2_Sprux_BLAS_numthreads=16",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolver(prob, {.numThreads = 16}, nRHSs, verbose, collectStats);
          }},  //
 #ifdef SPRUX_USE_CUBLAS
-        {"3_BaSpaCho_CUDA",
+        {"3_Sprux_CUDA",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolver(prob,
                                   {.findSparseEliminationRanges = true, .backend = BackendCuda},
                                   nRHSs, verbose, collectStats);
          }},
-        {"4_BaSpaCho_CUDA_batchsize=4",
+        {"4_Sprux_CUDA_batchsize=4",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatched(
                prob, {.findSparseEliminationRanges = true, .backend = BackendCuda},
                /* batchsize = */ 4, nRHSs, verbose, collectStats);
          }},
-        {"5_BaSpaCho_CUDA_batchsize=8",
+        {"5_Sprux_CUDA_batchsize=8",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatched(
                prob, {.findSparseEliminationRanges = true, .backend = BackendCuda},
                /* batchsize = */ 8, nRHSs, verbose, collectStats);
          }},
-        {"6_BaSpaCho_CUDA_batchsize=16",
+        {"6_Sprux_CUDA_batchsize=16",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatched(
@@ -582,7 +582,7 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
 #endif  // SPRUX_HAVE_CUDSS
 #endif  // SPRUX_USE_CUBLAS
 #ifdef SPRUX_USE_METAL
-        {"3_BaSpaCho_Metal",
+        {"3_Sprux_Metal",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            // Metal only supports float precision
@@ -629,19 +629,19 @@ map<string, function<BenchResults(const SparseProblem&, const vector<int64_t>& n
            retv.solveTimes = solveTimes;
            return retv;
          }},
-        {"4_BaSpaCho_Metal_batchsize=4",
+        {"4_Sprux_Metal_batchsize=4",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 4, nRHSs, verbose,
                                               collectStats);
          }},
-        {"5_BaSpaCho_Metal_batchsize=8",
+        {"5_Sprux_Metal_batchsize=8",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 8, nRHSs, verbose,
                                               collectStats);
          }},
-        {"6_BaSpaCho_Metal_batchsize=16",
+        {"6_Sprux_Metal_batchsize=16",
          [](const SparseProblem& prob, const vector<int64_t>& nRHSs, bool verbose,
             bool collectStats) -> BenchResults {
            return benchmarkSolverBatchedMetal(prob, /* batchSize = */ 16, nRHSs, verbose,

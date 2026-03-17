@@ -57,7 +57,7 @@ void testLUFactorSimple(OpsPtr&& ops) {
   CoalescedBlockMatrixSkel factorSkel(spanStart, lumpToSpan, groupedSs.ptrs, groupedSs.inds);
 
   // Create a non-symmetric test matrix
-  // BaSpaCho stores dense blocks in ROW-MAJOR format
+  // Sprux stores dense blocks in ROW-MAJOR format
   vector<T> data(factorSkel.dataSize());
   int64_t n = 4;
 
@@ -68,7 +68,7 @@ void testLUFactorSimple(OpsPtr&& ops) {
       2, 1, 6, 1,          //
       1, 2, 1, 7;
 
-  // Copy to data buffer (row-major - how BaSpaCho stores blocks)
+  // Copy to data buffer (row-major - how Sprux stores blocks)
   for (int64_t row = 0; row < n; row++) {
     for (int64_t col = 0; col < n; col++) {
       data[row * n + col] = testMat(row, col);
@@ -145,7 +145,7 @@ void testLUSolveSimple(OpsPtr&& ops) {
       2, 1, 6, 1,   //
       1, 2, 1, 7;
 
-  // Copy to data buffer (row-major - how BaSpaCho stores blocks)
+  // Copy to data buffer (row-major - how Sprux stores blocks)
   for (int64_t row = 0; row < n; row++) {
     for (int64_t col = 0; col < n; col++) {
       data[row * n + col] = A(row, col);
@@ -381,7 +381,7 @@ TEST(LUFactor, DISABLED_DebugBlockSparse) {
   vector<int64_t> pivots(solver.skel().order());
   solver.factorLU(data.data(), pivots.data());
 
-  std::cout << "BaSpaCho pivots: ";
+  std::cout << "Sprux pivots: ";
   for (auto p : pivots) std::cout << p << " ";
   std::cout << "\n\n";
 
@@ -398,7 +398,7 @@ TEST(LUFactor, DISABLED_DebugBlockSparse) {
   }
   std::cout << "\n\n";
 
-  // Reconstruct L and U from BaSpaCho format for debugging
+  // Reconstruct L and U from Sprux format for debugging
   // Block 0 (3x3 diagonal): rows 0-2, data offset 0
   std::cout << "Block 0 diagonal (3x3 row-major at offset 0):\n";
   for (int r = 0; r < 3; r++) {
@@ -446,9 +446,9 @@ TEST(LUFactor, DISABLED_DebugBlockSparse) {
   solver.solveLU(data.data(), pivots.data(), x.data(), 5, 1);
 
   std::cout << "Eigen solution: " << xRef.transpose() << "\n";
-  std::cout << "BaSpaCho solution: " << x.transpose() << "\n";
+  std::cout << "Sprux solution: " << x.transpose() << "\n";
   std::cout << "Residual (Eigen): " << (fullMat * xRef - b).norm() << "\n";
-  std::cout << "Residual (BaSpaCho): " << (fullMat * x - b).norm() << "\n";
+  std::cout << "Residual (Sprux): " << (fullMat * x - b).norm() << "\n";
 }
 
 TEST(LUFactor, BlockSparse_Blas_float) {

@@ -185,7 +185,7 @@ TEST(MetalSequenceSolve, RingOscillator) {
     }
 
     // Check CPU float path first (same supernodal fill-in structure).
-    // Some matrices trigger zero pivots in BaSpaCho's float LU due to fill-in
+    // Some matrices trigger zero pivots in Sprux's float LU due to fill-in
     // structure — skip those since the issue is precision, not Metal.
     float cpuResidual;
     try {
@@ -242,7 +242,7 @@ TEST(MetalSequenceSolve, RingOscillator) {
 
     float residual = computeResidualFloat(A, x, b);
 
-    // Metal should be within 100x of CPU BaSpaCho float
+    // Metal should be within 100x of CPU Sprux float
     float threshold = max(cpuResidual * 100.0f, 1e-4f);
     EXPECT_LT(residual, threshold) << "Matrix #" << i << " Metal residual too large: " << residual
                                    << " (CPU: " << cpuResidual << ")";

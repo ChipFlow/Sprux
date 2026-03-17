@@ -148,7 +148,7 @@ TEST(MetalLU, SolveSimple_float) {
 
 // Test LU on 2-block sparse matrix (supports GPU trace capture)
 TEST(MetalLU, BlockSparse_float) {
-  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_lu.gputrace");
+  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/sprux_lu.gputrace");
   vector<set<int64_t>> colBlocks{{0, 1}, {1}};
   SparseStructure ss = columnsToCscStruct(colBlocks).transpose().addFullEliminationFill();
   vector<int64_t> spanStart{0, 3, 5};

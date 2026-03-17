@@ -393,7 +393,7 @@ TEST(Preprocessing, RoundTripWithScaling) {
   // Also verify with Eigen's direct solve
   Eigen::VectorXd xRef = Adense.partialPivLu().solve(b);
   double refResidual = (Adense * xRef - b).norm() / b.norm();
-  cout << "BaSpaCho residual: " << residual << ", Eigen residual: " << refResidual << endl;
+  cout << "Sprux residual: " << residual << ", Eigen residual: " << refResidual << endl;
 }
 
 // ApplyRowPerm preserves matrix data correctly

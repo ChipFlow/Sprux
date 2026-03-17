@@ -261,7 +261,7 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
     const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine, bool verbose) {
   if (matrices.empty()) return {};
 
-  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/baspacho_ffi.gputrace");
+  bool capturing = MetalContext::instance().beginCaptureIfRequested("/tmp/sprux_ffi.gputrace");
 
   const CsrMatrix& A0 = matrices[0].first;
   int64_t n = A0.nRows;
@@ -281,7 +281,7 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
 
   // 2. Compute static pivot threshold from first matrix's equilibrated diagonal.
   // This avoids D→H sync during factorization (needed for single-CB approach):
-  // BaSpaCho's auto threshold (=0) calls maxAbsDiag which does GPU→CPU readback.
+  // Sprux's auto threshold (=0) calls maxAbsDiag which does GPU→CPU readback.
   // Instead, we compute it CPU-side from the equilibrated CSR diagonal.
   double pivotThreshold;
   {
@@ -1061,13 +1061,13 @@ void help() {
        << "  -v             Verbose per-matrix output\n"
        << "  -h             Show this help\n"
        << "\nAvailable solvers:\n"
-       << "  BaSpaCho_LU_CPU\n"
+       << "  Sprux_LU_CPU\n"
 #ifdef SPRUX_USE_METAL
        << "  Metal_Sparse     (GPU sparse elim + CPU BLAS dense + CPU SpMV refinement)\n"
        << "  Metal_Dense      (Accelerate dense LU baseline, no sparsity exploitation)\n"
 #endif
 #ifdef SPRUX_USE_CUBLAS
-       << "  BaSpaCho_LU_CUDA\n"
+       << "  Sprux_LU_CUDA\n"
 #endif
 #ifdef SPRUX_HAVE_CUDSS
        << "  cuDSS_LU\n"
@@ -1256,8 +1256,8 @@ int main(int argc, char* argv[]) {
   }
 
   // CPU solver
-  if (regex_search(string("BaSpaCho_LU_CPU"), selectSolvers)) {
-    if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_CPU..." << endl;
+  if (regex_search(string("Sprux_LU_CPU"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning Sprux_LU_CPU..." << endl;
     auto timings = benchmarkLUCpu(matrices, verbose);
 
     // Strip warmup run in single-matrix mode
@@ -1265,8 +1265,8 @@ int main(int argc, char* argv[]) {
       timings.erase(timings.begin());
     }
 
-    resultToRecords(problemName, "BaSpaCho_LU_CPU", timings, allRecords);
-    if (!jsonOutput) printResults("BaSpaCho_LU_CPU", timings);
+    resultToRecords(problemName, "Sprux_LU_CPU", timings, allRecords);
+    if (!jsonOutput) printResults("Sprux_LU_CPU", timings);
   }
 
 #ifdef SPRUX_USE_METAL
@@ -1293,16 +1293,16 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef SPRUX_USE_CUBLAS
-  if (regex_search(string("BaSpaCho_LU_CUDA"), selectSolvers)) {
-    if (!jsonOutput) cout << "\nRunning BaSpaCho_LU_CUDA..." << endl;
+  if (regex_search(string("Sprux_LU_CUDA"), selectSolvers)) {
+    if (!jsonOutput) cout << "\nRunning Sprux_LU_CUDA..." << endl;
     auto timings = benchmarkLUCuda(matrices, verbose);
 
     if (isWarmup && timings.size() > 1) {
       timings.erase(timings.begin());
     }
 
-    resultToRecords(problemName, "BaSpaCho_LU_CUDA", timings, allRecords);
-    if (!jsonOutput) printResults("BaSpaCho_LU_CUDA", timings);
+    resultToRecords(problemName, "Sprux_LU_CUDA", timings, allRecords);
+    if (!jsonOutput) printResults("Sprux_LU_CUDA", timings);
   }
 #endif
 

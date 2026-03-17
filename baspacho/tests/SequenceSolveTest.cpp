@@ -216,11 +216,11 @@ TEST(SequenceSolve, RingOscillator) {
 // + createSolver + CHOLMOD-based symbolic analysis + LU factorization with static pivoting
 // + iterative refinement on the 25K C6288 circuit Jacobians.
 //
-// Without preprocessing, BaSpaCho's fill-reducing ordering (designed for SPD/Cholesky)
+// Without preprocessing, Sprux's fill-reducing ordering (designed for SPD/Cholesky)
 // creates ~40% zero/near-zero pivots → NaN residuals. Preprocessing applies:
 // 1. BTF max transversal: row permutation Q for zero-free diagonal
 // 2. Row/column equilibration: scaling Dr, Dc so max entries are ~1
-// This eliminates zero pivots. However, BaSpaCho's supernodal LU with symmetric AMD ordering
+// This eliminates zero pivots. However, Sprux's supernodal LU with symmetric AMD ordering
 // and scalar blocks has limited accuracy for large non-symmetric matrices (no inter-block
 // pivoting). Iterative refinement recovers full accuracy: each refinement step requires only
 // a fast triangular solve (~5ms) plus a sparse matrix-vector product.

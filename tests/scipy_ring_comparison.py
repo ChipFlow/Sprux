@@ -10,7 +10,7 @@
 """Compare Sprux ring oscillator solutions against scipy.sparse.linalg.spsolve.
 
 Loads the same MatrixMarket test data used by SequenceSolveTest::RingOscillator,
-solves with scipy, then runs a BaSpaCho test binary with BASPACHO_DUMP_SOLUTIONS=1
+solves with scipy, then runs a Sprux test binary with SPRUX_DUMP_SOLUTIONS=1
 and compares solution vectors element-wise.
 
 Supports CPU, CUDA, and Metal backends via --test-binary flag.
@@ -95,9 +95,9 @@ def solve_with_scipy(data_dir: Path) -> list[dict]:
     return results
 
 
-def run_baspacho(test_bin: Path, gtest_filter: str) -> list[dict]:
-    """Run BaSpaCho test binary and parse SOLUTION_DUMP lines."""
-    env = {**os.environ, "BASPACHO_DUMP_SOLUTIONS": "1"}
+def run_sprux(test_bin: Path, gtest_filter: str) -> list[dict]:
+    """Run Sprux test binary and parse SOLUTION_DUMP lines."""
+    env = {**os.environ, "SPRUX_DUMP_SOLUTIONS": "1"}
 
     log.info("  Running: %s --gtest_filter=%s", test_bin.name, gtest_filter)
     result = subprocess.run(
@@ -109,7 +109,7 @@ def run_baspacho(test_bin: Path, gtest_filter: str) -> list[dict]:
     )
 
     if result.returncode != 0:
-        log.error("BaSpaCho test failed (exit code %d):\n%s\n%s",
+        log.error("Sprux test failed (exit code %d):\n%s\n%s",
                   result.returncode, result.stdout[-2000:], result.stderr[-2000:])
         return []
 
@@ -139,9 +139,9 @@ def find_test_binary(build_dir: Path, name: str) -> Path | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare BaSpaCho vs scipy on ring oscillator")
+        description="Compare Sprux vs scipy on ring oscillator")
     parser.add_argument("--build-dir", type=Path, default=None,
-                        help="BaSpaCho build directory (default: auto-detect)")
+                        help="Sprux build directory (default: auto-detect)")
     parser.add_argument("--test-binary", type=str, default="SequenceSolveTest",
                         choices=list(GTEST_FILTERS.keys()),
                         help="Test binary to run (default: SequenceSolveTest)")
@@ -184,22 +184,22 @@ def main():
     scipy_max_res = max(r["residual"] for r in scipy_solved) if scipy_solved else 0.0
     log.info("  scipy: %d solved, max residual %.2e", len(scipy_solved), scipy_max_res)
 
-    # Phase 2: BaSpaCho solutions
-    log.info("\nPhase 2: Solving with BaSpaCho (%s, %s)...", args.test_binary, precision_label)
-    baspacho_results = run_baspacho(test_bin, gtest_filter)
+    # Phase 2: Sprux solutions
+    log.info("\nPhase 2: Solving with Sprux (%s, %s)...", args.test_binary, precision_label)
+    sprux_results = run_sprux(test_bin, gtest_filter)
 
-    if not baspacho_results:
+    if not sprux_results:
         log.error("No SOLUTION_DUMP output from %s. Check test binary.", args.test_binary)
         return 1
 
-    log.info("  BaSpaCho: %d solutions collected", len(baspacho_results))
+    log.info("  Sprux: %d solutions collected", len(sprux_results))
 
     # Phase 3: Compare solutions
     log.info("\nPhase 3: Comparing solutions...")
-    baspacho_by_idx = {r["index"]: r["solution"] for r in baspacho_results}
+    sprux_by_idx = {r["index"]: r["solution"] for r in sprux_results}
 
     print(f"\nBackend: {args.test_binary} ({precision_label}), threshold: {threshold:.0e}")
-    print(f"{'Index':>5}  {'scipy res':>12}  {'||x_scipy-x_bsp||/||x||':>25}  {'Match':>6}")
+    print(f"{'Index':>5}  {'scipy res':>12}  {'||x_scipy-x_sprux||/||x||':>25}  {'Match':>6}")
     print("-" * 60)
 
     max_diff = 0.0
@@ -209,16 +209,16 @@ def main():
         idx = r["index"]
         x_scipy = r["solution"]
 
-        if idx not in baspacho_by_idx:
+        if idx not in sprux_by_idx:
             print(f"{idx:>5}  {r['residual']:>12.2e}  {'N/A':>25}  {'SKIP':>6}")
             continue
 
-        x_bsp = baspacho_by_idx[idx]
+        x_sprux = sprux_by_idx[idx]
         x_norm = np.linalg.norm(x_scipy)
         if x_norm < 1e-30:
-            diff = np.linalg.norm(x_scipy - x_bsp)
+            diff = np.linalg.norm(x_scipy - x_sprux)
         else:
-            diff = np.linalg.norm(x_scipy - x_bsp) / x_norm
+            diff = np.linalg.norm(x_scipy - x_sprux) / x_norm
 
         max_diff = max(max_diff, diff)
         compared += 1

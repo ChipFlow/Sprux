@@ -1,10 +1,10 @@
 #!/bin/bash
-# BaSpaCho GPU Test Runner for Cloud Run
+# Sprux GPU Test Runner for Cloud Run
 # This script is executed inside the Cloud Run container
 
 set -euo pipefail
 
-echo "=== BaSpaCho GPU Test Runner ==="
+echo "=== Sprux GPU Test Runner ==="
 echo "Date: $(date)"
 echo "Commit: ${GITHUB_SHA:-unknown}"
 echo ""
@@ -44,11 +44,11 @@ echo "=== Configuring CMake ==="
 cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
-    -DBASPACHO_USE_CUBLAS=ON \
-    -DBASPACHO_USE_METAL=OFF \
-    -DBASPACHO_USE_OPENCL=OFF \
-    -DBASPACHO_BUILD_TESTS=ON \
-    -DBASPACHO_BUILD_EXAMPLES=ON
+    -DSPRUX_USE_CUBLAS=ON \
+    -DSPRUX_USE_METAL=OFF \
+    -DSPRUX_USE_OPENCL=OFF \
+    -DSPRUX_BUILD_TESTS=ON \
+    -DSPRUX_BUILD_EXAMPLES=ON
 
 echo ""
 echo "=== Building ==="

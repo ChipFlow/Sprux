@@ -113,7 +113,7 @@ void testLDLTSingleLump(BackendType backend) {
   vector<int64_t> paramSize(n, 1);  // n scalar parameters
 
   // Fully connected lower triangular structure -> single lump after ordering
-  // BaSpaCho expects CSR lower triangular (row i has columns 0..i)
+  // Sprux expects CSR lower triangular (row i has columns 0..i)
   vector<int64_t> ptrs(n + 1);
   vector<int64_t> inds;
   for (int i = 0; i < n; i++) {
@@ -322,7 +322,7 @@ void testLDLTSolve(const std::function<OpsPtr()>& genOps) {
     Vector<T> b = Vector<T>::Random(n);
     Vector<T> x_ref = A.ldlt().solve(b);
 
-    // Factor and solve with BaSpaCho
+    // Factor and solve with Sprux
     Solver solver(CoalescedBlockMatrixSkel(factorSkel), {}, {}, genOps());
     solver.factorLDLT(data.data());
 

@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// cuDSS vs BaSpaCho profiling benchmark.
+// cuDSS vs Sprux profiling benchmark.
 // Loads c6288 Jacobian (Matrix Market) and solves with both solvers.
 // Run under `nsys profile` to compare GPU execution patterns.
 
@@ -130,10 +130,10 @@ CscMatrix csrToCsc(const CsrMatrix& csr) {
   } while (0)
 
 // ============================================================================
-// BaSpaCho CUDA LU test: load c6288 Jacobian, solve on GPU
+// Sprux CUDA LU test: load c6288 Jacobian, solve on GPU
 // ============================================================================
 
-TEST(CudssBenchmark, BaSpaCho_LU) {
+TEST(CudssBenchmark, Sprux_LU) {
   string mtxDir = getMtxDir();
   cout << "Loading matrix from: " << mtxDir << endl;
 
@@ -146,7 +146,7 @@ TEST(CudssBenchmark, BaSpaCho_LU) {
 
   int64_t n = A.nRows;
 
-  nvtxRangePush("BaSpaCho_Analysis");
+  nvtxRangePush("Sprux_Analysis");
 
   // Build CSR lower-triangle SparseStructure from CSR (ensure diagonal present)
   vector<set<int64_t>> colBlocks(n);
@@ -171,12 +171,12 @@ TEST(CudssBenchmark, BaSpaCho_LU) {
   solver->loadFromCsr(A.rowPtr.data(), A.colInd.data(), blockSizes.data(), A.values.data(),
                       data.data());
 
-  nvtxRangePop();  // BaSpaCho_Analysis
+  nvtxRangePop();  // Sprux_Analysis
 
   vector<int64_t> pivots(n);
   const auto& perm = solver->paramToSpan();
 
-  nvtxRangePush("BaSpaCho_Factor");
+  nvtxRangePush("Sprux_Factor");
   auto factorStart = hrc::now();
   solver->factorLU(data.data(), pivots.data());
   double factorMs = tdelta(hrc::now() - factorStart).count() * 1000;
@@ -186,7 +186,7 @@ TEST(CudssBenchmark, BaSpaCho_LU) {
   Vector<double> bp(n);
   for (int64_t i = 0; i < n; i++) bp(perm[i]) = b(i);
 
-  nvtxRangePush("BaSpaCho_Solve");
+  nvtxRangePush("Sprux_Solve");
   auto solveStart = hrc::now();
   solver->solveLU(data.data(), pivots.data(), bp.data(), n, 1);
   double solveMs = tdelta(hrc::now() - solveStart).count() * 1000;
@@ -197,12 +197,12 @@ TEST(CudssBenchmark, BaSpaCho_LU) {
 
   double residual = computeResidual(A, x, b);
 
-  cout << "\n=== BaSpaCho CUDA LU ===" << endl;
+  cout << "\n=== Sprux CUDA LU ===" << endl;
   cout << "  Factor: " << fixed << setprecision(2) << factorMs << " ms" << endl;
   cout << "  Solve:  " << solveMs << " ms" << endl;
   cout << "  Residual: " << scientific << setprecision(4) << residual << endl;
 
-  EXPECT_LT(residual, 1e-8) << "BaSpaCho residual too large";
+  EXPECT_LT(residual, 1e-8) << "Sprux residual too large";
 }
 
 // ============================================================================

@@ -23,7 +23,7 @@ UmfpackBenchResults benchmarkUmfpackSolve(const vector<int64_t>& paramSize,
                                            const SparseStructure& ssOrig,
                                            const vector<int64_t>& nRHSs, int verbose,
                                            bool symmetric) {
-  // Apply fill-reducing ordering (same as BaSpaCho would do)
+  // Apply fill-reducing ordering (same as Sprux would do)
   SparseStructure ss;
   vector<int64_t> permutation = ssOrig.fillReducingPermutation();
   vector<int64_t> invPerm = inversePermutation(permutation);

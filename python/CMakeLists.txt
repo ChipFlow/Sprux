@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.18)
 find_package(pybind11 REQUIRED)
 
 # Create the Python module
-pybind11_add_module(sprux_py baspacho_bindings.cpp)
+pybind11_add_module(sprux_py sprux_bindings.cpp)
 
 # Link against Sprux library
 target_link_libraries(sprux_py PRIVATE ${SPRUX_LIBRARY})

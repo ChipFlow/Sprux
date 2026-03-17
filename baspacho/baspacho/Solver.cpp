@@ -22,17 +22,17 @@
 
 #ifdef __APPLE__
 #include <os/signpost.h>
-static os_log_t baspachoSignpostLog() {
+static os_log_t spruxSignpostLog() {
   // OS_LOG_CATEGORY_POINTS_OF_INTEREST makes signposts appear in the
   // "Points of Interest" track in Instruments without a custom template.
   static os_log_t log =
-      os_log_create("com.baspacho.solver", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+      os_log_create("com.sprux.solver", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
   return log;
 }
 #define SPRUX_SIGNPOST_BEGIN(name) \
-  os_signpost_interval_begin(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+  os_signpost_interval_begin(spruxSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
 #define SPRUX_SIGNPOST_END(name) \
-  os_signpost_interval_end(baspachoSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+  os_signpost_interval_end(spruxSignpostLog(), OS_SIGNPOST_ID_EXCLUSIVE, name)
 #else
 #define SPRUX_SIGNPOST_BEGIN(name) ((void)0)
 #define SPRUX_SIGNPOST_END(name) ((void)0)

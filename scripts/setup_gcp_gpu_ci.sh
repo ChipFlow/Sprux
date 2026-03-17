@@ -1,5 +1,5 @@
 #!/bin/bash
-# BaSpaCho GCP GPU CI Infrastructure Setup
+# Sprux GCP GPU CI Infrastructure Setup
 # This script sets up the GCP resources needed for GPU testing via Cloud Run
 #
 # Prerequisites:
@@ -11,7 +11,7 @@
 #   ./setup_gcp_gpu_ci.sh [OPTIONS]
 #
 # Options:
-#   --project PROJECT_ID    GCP project ID (default: baspacho-gpu-ci)
+#   --project PROJECT_ID    GCP project ID (default: sprux-gpu-ci)
 #   --region REGION         GCP region (default: us-central1)
 #   --github-repo OWNER/REPO  GitHub repository (default: detected from git origin)
 #   --billing-account ID    Billing account ID (required if creating new project)
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 # Default configuration
-PROJECT_ID="${GCP_PROJECT:-baspacho-gpu-ci}"
+PROJECT_ID="${GCP_PROJECT:-sprux-gpu-ci}"
 REGION="${GCP_REGION:-us-central1}"
 GITHUB_REPO="${GITHUB_REPO:-}"
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-}"
@@ -80,7 +80,7 @@ if [ -z "$GITHUB_REPO" ]; then
     fi
 fi
 
-echo "=== BaSpaCho GCP GPU CI Setup ==="
+echo "=== Sprux GCP GPU CI Setup ==="
 echo "Project: $PROJECT_ID"
 echo "Region: $REGION"
 echo "GitHub Repo: $GITHUB_REPO"
@@ -121,7 +121,7 @@ else
     fi
 
     # Create the project
-    gcloud projects create "$PROJECT_ID" --name="BaSpaCho GPU CI" --quiet
+    gcloud projects create "$PROJECT_ID" --name="Sprux GPU CI" --quiet
 
     # Link billing account
     log_info "Linking billing account..."
@@ -224,7 +224,7 @@ echo ""
 # sccache GCS Bucket Setup
 # ============================================================================
 echo "=== Setting up sccache GCS Bucket ==="
-SCCACHE_BUCKET="baspacho-sccache"
+SCCACHE_BUCKET="sprux-sccache"
 
 if gsutil ls -b "gs://$SCCACHE_BUCKET" > /dev/null 2>&1; then
     log_info "sccache bucket already exists: $SCCACHE_BUCKET"

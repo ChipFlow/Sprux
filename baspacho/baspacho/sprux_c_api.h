@@ -18,7 +18,7 @@ typedef struct sprux_solver* sprux_solver_t;
 
 /**
  * Backend selection for solver creation.
- * Maps to BaSpaCho::BackendType enum values.
+ * Maps to BaSpaCho::BackendType (Sprux C++ namespace) enum values.
  */
 enum sprux_backend {
   SPRUX_BACKEND_CPU = 0,    /* CPU with BLAS */

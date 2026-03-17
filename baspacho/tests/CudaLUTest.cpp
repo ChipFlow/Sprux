@@ -45,7 +45,7 @@ struct Epsilon<float> {
   static constexpr float value2 = 5e-3;
 };
 
-// Helper: fill BaSpaCho block data from dense matrix (lower + upper triangle)
+// Helper: fill Sprux block data from dense matrix (lower + upper triangle)
 template <typename T>
 void fillBlockData(const CoalescedBlockMatrixSkel& skel, T* data, const Matrix<T>& fullMat) {
   int64_t numLumps = skel.numLumps();

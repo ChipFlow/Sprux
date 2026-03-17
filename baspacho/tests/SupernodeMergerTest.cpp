@@ -385,7 +385,7 @@ void testSolverWithMerging(int seed) {
   Matrix<T> verifyMat = solverMerged->skel().densify(data);
   Eigen::LLT<Eigen::Ref<Matrix<T>>> llt(verifyMat);
 
-  // Factor with BaSpaCho
+  // Factor with Sprux
   solverMerged->factor(data.data());
 
   // Compare: densify the factored result and check vs Eigen
