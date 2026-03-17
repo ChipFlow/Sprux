@@ -213,7 +213,7 @@ struct UmfpackSolveResult {
 };
 
 // Helper struct to hold Sprux solve results
-struct BaspachoSolveResult {
+struct SpruxSolveResult {
   double analysisTime;
   double factorTime;
   double solveTime;

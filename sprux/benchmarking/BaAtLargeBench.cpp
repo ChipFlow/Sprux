@@ -66,7 +66,7 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
 
   if (1) {
     cout << "===========================================" << endl;
-    cout << "Testing Baspacho/BLAS nThreads=16 (on full Points+Cameras "
+    cout << "Testing Sprux/BLAS nThreads=16 (on full Points+Cameras "
             "system)"
          << endl;
     auto startAnalysis = hrc::now();
@@ -98,7 +98,7 @@ void testSolvers(Data& data, int nPointParams, int nCameraParams) {
 
   if (1) {
     cout << "===========================================" << endl;
-    cout << "Testing Baspacho/BLAS nThreads=1 (on full Points+Cameras "
+    cout << "Testing Sprux/BLAS nThreads=1 (on full Points+Cameras "
             "system)"
          << endl;
     auto startAnalysis = hrc::now();

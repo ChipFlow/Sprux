@@ -2039,25 +2039,25 @@ OpsPtr getBackend(const Settings& settings) {
 #ifdef SPRUX_USE_CUBLAS
     return cudaOps();
 #else
-    std::cerr << "Baspacho: CUDA not enabled at compile time" << std::endl;
+    std::cerr << "Sprux: CUDA not enabled at compile time" << std::endl;
     abort();
 #endif
   } else if (backend == BackendMetal) {
 #ifdef SPRUX_USE_METAL
     return metalOps();
 #else
-    std::cerr << "Baspacho: Metal not enabled at compile time" << std::endl;
+    std::cerr << "Sprux: Metal not enabled at compile time" << std::endl;
     abort();
 #endif
   } else if (backend == BackendOpenCL) {
 #ifdef SPRUX_USE_OPENCL
     return openclOps();
 #else
-    std::cerr << "Baspacho: OpenCL not enabled at compile time" << std::endl;
+    std::cerr << "Sprux: OpenCL not enabled at compile time" << std::endl;
     abort();
 #endif
   }
-  std::cerr << "Baspacho: unknown backend type " << backend << std::endl;
+  std::cerr << "Sprux: unknown backend type " << backend << std::endl;
   abort();
 }
 

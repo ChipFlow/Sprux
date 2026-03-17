@@ -255,7 +255,7 @@ static vector<LUTimingResult> benchmarkLUCpu(
 
 #ifdef SPRUX_USE_METAL
 // Metal LU benchmark (Metal_Sparse): GPU sparse elimination + CPU BLAS dense + CPU SpMV refinement.
-// Mirrors the spineax BaspachoGpuInstantiate/Execute FFI code path.
+// Mirrors the spineax SpruxGpuInstantiate/Execute FFI code path.
 // Uses persistent contexts, device-resident pivots, recording pass, and external encoder.
 static vector<LUTimingResult> benchmarkLUMetalFFI(
     const vector<pair<CsrMatrix, Eigen::VectorXd>>& matrices, int maxRefine, bool verbose) {

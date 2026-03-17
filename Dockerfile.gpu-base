@@ -1,4 +1,4 @@
-# BaSpaCho GPU CI Base Image
+# Sprux GPU CI Base Image
 # Multi-stage build for CUDA-enabled testing on Cloud Run
 
 FROM nvidia/cuda:12.2.2-devel-ubuntu22.04 AS base
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends google-cloud-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CMake 3.28+ (required by BaSpaCho)
+# Install CMake 3.28+ (required by Sprux)
 RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz \
     | tar -xz -C /usr/local --strip-components=1
 
