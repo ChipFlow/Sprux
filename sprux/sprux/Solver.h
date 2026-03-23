@@ -57,14 +57,6 @@ class Solver {
          LevelSetSchedule&& levelSetSchedule = {}, double staticPivotThreshold = -1.0);
 
   // return a (permuted) accessor to access factor's block (re-ordering is auto-applied)
-  PermutedCoalescedAccessor accessor() const {
-    PermutedCoalescedAccessor retv;
-    retv.init(factorSkel.accessor(), permutation.data());
-    return retv;
-  }
-
-  // return an accessor to be used by an on-device kernel (if supported by backend)
-  PermutedCoalescedAccessor deviceAccessor() const { return symCtx->deviceAccessor(); }
 
   // Set the CUDA stream for all GPU operations (cuBLAS, cuSOLVER, kernels).
   // Must be called before factorLU/solveLU when using a non-default stream
@@ -442,42 +434,19 @@ class Solver {
   // return the matrix type (SPD, SYMMETRIC, or GENERAL)
   MatrixType matrixType() const { return factorSkel.matrixType; }
 
-  // returns the upper span index limit for proper factorization (if the factor doesn't have fill
-  // for full factorization this might not include all parameters)
   int64_t canFactorUpToSpan() const { return canFactorUpTo; }
-
-  // offset of span vector data
-  int64_t spanVectorOffset(int64_t spanIndex) const {
-    return factorSkel.spanVectorOffset(spanIndex);
-  }
-
-  // offset of span matrix data
-  int64_t spanMatrixOffset(int64_t spanIndex) const {
-    return factorSkel.spanMatrixOffset(spanIndex);
-  }
-
-  // return sparse structure of the factor
-  const CoalescedBlockMatrixSkel& skel() const { return factorSkel; }
-
-  // return the (span/lump) ranges set to undergo sparse elimination
-  const std::vector<int64_t>& sparseEliminationRanges() const { return sparseElimRanges; }
-
-  // return the reordering applied to parameters (i's position is perm[i] in the factor)
-  const std::vector<int64_t>& paramToSpan() const { return permutation; }
-
-  // return the level-set schedule for parallel factorization
-  const LevelSetSchedule& levelSetSchedule() const { return levelSetSchedule_; }
 
   // return the count of diagonal elements perturbed during the last factorLU call
   int64_t staticPivotPerturbCount() const { return staticPivotPerturbCount_; }
 
-  // TESTING: return the internal symbolic context for advanced use cases
-  SymbolicCtx& internalSymbolicContext() { return *symCtx; }
+  // return the reordering applied to parameters (i's position is perm[i] in the factor)
+  const std::vector<int64_t>& paramToSpan() const { return permutation; }
 
-  SymElimCtx& internalGetElimCtx(size_t i) {
-    SPRUX_CHECK_LT(i, elimCtxs.size());
-    return *elimCtxs[i];
-  }
+  // return sparse structure of the factor
+  const CoalescedBlockMatrixSkel& skel() const { return factorSkel; }
+
+
+  // TESTING: return the internal symbolic context for advanced use cases
 
   /**
    * Load values from CSR format into internal data buffer.
@@ -510,6 +479,46 @@ class Solver {
   template <typename T>
   void extractToCsr(const int64_t* csrRowStart, const int64_t* csrColInds,
                     const int64_t* blockSizes, const T* data, T* csrValues) const;
+
+
+  // ─── Internal symbolic accessors (for advanced/testing use) ──────────────────
+  // return a (permuted) accessor to access factor's block (re-ordering is auto-applied)
+  PermutedCoalescedAccessor accessor() const {
+    PermutedCoalescedAccessor retv;
+    retv.init(factorSkel.accessor(), permutation.data());
+    return retv;
+  }
+
+  // return an accessor to be used by an on-device kernel (if supported by backend)
+  PermutedCoalescedAccessor deviceAccessor() const { return symCtx->deviceAccessor(); }
+
+  // offset of span vector data
+  int64_t spanVectorOffset(int64_t spanIndex) const {
+    return factorSkel.spanVectorOffset(spanIndex);
+  }
+
+  // offset of span matrix data
+  int64_t spanMatrixOffset(int64_t spanIndex) const {
+    return factorSkel.spanMatrixOffset(spanIndex);
+  }
+
+  // returns the upper span index limit for proper factorization
+  const std::vector<int64_t>& sparseEliminationRanges() const { return sparseElimRanges; }
+
+  // return the (span/lump) ranges set to undergo sparse elimination
+
+  // return the level-set schedule for parallel factorization
+  const LevelSetSchedule& levelSetSchedule() const { return levelSetSchedule_; }
+
+  // TESTING: return the internal symbolic context for advanced use cases
+  SymbolicCtx& internalSymbolicContext() { return *symCtx; }
+
+  SymElimCtx& internalGetElimCtx(size_t i) {
+    SPRUX_CHECK_LT(i, elimCtxs.size());
+    return *elimCtxs[i];
+  }
+
+
 
  private:
   void initElimination();
