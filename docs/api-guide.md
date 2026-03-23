@@ -1,6 +1,6 @@
 # Sprux API Guide
 
-Sprux (formerly Sprux) provides a C++ API for sparse direct solving. This guide
+Sprux (formerly BaSpaCho) provides a C++ API for sparse direct solving. This guide
 covers common usage patterns for each decomposition type and backend.
 
 ## Input Format
@@ -264,21 +264,74 @@ solver->factorLU(dataGpu.ptr(), pivots.data());
 
 ## Python Bindings
 
-```python
-import sprux
+The Python module is built via `-DSPRUX_BUILD_PYTHON=ON` and provides
+a numpy-based interface to all solver operations.
 
-# Create solver from CSR matrix
+```python
+import sprux_py as sprux
+import numpy as np
+
+# Create solver from block-CSR sparsity pattern
+# param_sizes: size of each parameter block
+# row_ptrs: CSR row pointers [num_blocks + 1]
+# col_inds: CSR column indices of nonzero blocks
 solver = sprux.create_solver(
-    param_sizes=[1] * n,  # scalar blocks
-    row_ptrs=row_ptr,
-    col_inds=col_ind,
-    matrix_type="general",
-    backend="metal"  # or "cuda", "cpu"
+    param_sizes=[1, 1, 1, 1],          # scalar blocks
+    row_ptrs=np.array([0, 2, 4, 7, 9], dtype=np.int64),
+    col_inds=np.array([0, 2, 1, 3, 0, 2, 3, 1, 3], dtype=np.int64),
+    matrix_type="general",              # "spd" or "general"
+    backend="auto",                     # "cpu", "cuda", "metal", "opencl", "auto"
+    static_pivot_threshold=-1.0         # <0 disabled, 0 auto, >0 manual
 )
 
-# Factor and solve
-solver.factor_lu(data, pivots)
+# Query properties
+print(f"Order: {solver.order}")
+print(f"Data size: {solver.data_size}")
+print(f"Num spans: {solver.num_spans}")
+print(f"Best backend: {sprux.detect_best_backend()}")
+
+# Allocate buffers (numpy arrays, contiguous C order)
+data = np.zeros(solver.total_data_size, dtype=np.float64)
+pivots = np.zeros(solver.num_spans, dtype=np.int64)
+
+# Fill data via CSR loader or direct indexing...
+# solver.load_from_csr(csr_row_ptrs, csr_col_inds, block_sizes, csr_values, data)
+
+# LU factorization (A = P * L * U) — modifies data in place
+solver.factor_lu(data, pivots, verbose=True)
+
+# Solve — re-use pivots with different RHS vectors
+rhs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
 solver.solve_lu(data, pivots, rhs)
+# rhs now contains the solution
+
+# Statistics
+solver.enable_stats()
+solver.factor_lu(data, pivots)
+solver.print_stats()
+solver.reset_stats()
+```
+
+### Cholesky (SPD matrices)
+
+```python
+solver = sprux.create_solver(param_sizes, row_ptrs, col_inds,
+                              matrix_type="spd", backend="cpu")
+data = np.zeros(solver.data_size, dtype=np.float64)
+solver.factor(data)
+rhs = np.array([...], dtype=np.float64)
+solver.solve(data, rhs)
+```
+
+### LDL^T (symmetric indefinite)
+
+```python
+solver = sprux.create_solver(param_sizes, row_ptrs, col_inds,
+                              matrix_type="spd", backend="cpu")
+data = np.zeros(solver.data_size, dtype=np.float64)
+solver.factor_ldlt(data, verbose=True)
+rhs = np.array([...], dtype=np.float64)
+solver.solve_ldlt(data, rhs)
 ```
 
 ## Matrix-Vector Multiplication
@@ -302,3 +355,11 @@ All errors throw `std::runtime_error` with descriptive messages. Common errors:
 
 Assertion macros (`SPRUX_CHECK`, `SPRUX_CHECK_GE`, etc.) throw `std::runtime_error`
 in both debug and release builds.
+
+### Python errors
+
+Python bindings raise `ValueError` or `RuntimeError` corresponding to the above
+C++ errors. Additional errors:
+
+- **`ValueError`**: Unknown `backend` or `matrix_type` string, or buffer too small
+- **`RuntimeError`**: Backend not available at compile time (e.g., CUDA not enabled)

@@ -439,6 +439,38 @@ else()
   set(SPRUX_LIBRARY Sprux_static)
 endif()
 
+# Python bindings
+set(SPRUX_BUILD_PYTHON OFF CACHE BOOL "If on, Python bindings (pybind11) are built")
+
+if(SPRUX_BUILD_PYTHON)
+  message("${Cyan}============================[ Python ]=================================${ColourReset}")
+
+  # FetchContent downloads and builds pybind11
+  # Note: pybind11 itself defines the pybind11::pybind11 target, so we
+  # only need to FetchContent if the target doesn't already exist.
+  if(NOT TARGET pybind11::pybind11)
+    FetchContent_Declare(
+      pybind11_fetch
+      URL https://github.com/pybind/pybind11/archive/refs/tags/v2.13.1.zip
+    )
+    FetchContent_MakeAvailable(pybind11_fetch)
+  endif()
+
+  # Propagate backend compile definitions to the Python module
+  set(_SPRUX_PY_DEFS "")
+  if(SPRUX_USE_METAL)
+    list(APPEND _SPRUX_PY_DEFS SPRUX_USE_METAL)
+  endif()
+  if(SPRUX_USE_CUBLAS)
+    list(APPEND _SPRUX_PY_DEFS SPRUX_USE_CUDA)
+  endif()
+  if(SPRUX_USE_OPENCL)
+    list(APPEND _SPRUX_PY_DEFS SPRUX_USE_OPENCL)
+  endif()
+
+  add_subdirectory(python)
+endif()
+
 # unit tests
 if(SPRUX_BUILD_TESTS)
   enable_testing()

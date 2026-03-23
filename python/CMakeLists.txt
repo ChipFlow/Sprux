@@ -4,14 +4,9 @@
 # Sprux Python Bindings
 #
 # This builds a Python extension module using pybind11 that provides
-# access to Sprux's sparse LU solver from Python.
+# access to Sprux's sparse direct solver from Python.
 
-cmake_minimum_required(VERSION 3.18)
-
-# Find pybind11
-find_package(pybind11 REQUIRED)
-
-# Create the Python module
+# Create the Python module (pybind11::pybind11 is provided by parent CMakeLists.txt)
 pybind11_add_module(sprux_py sprux_bindings.cpp)
 
 # Link against Sprux library
@@ -23,17 +18,9 @@ target_include_directories(sprux_py PRIVATE
     ${CMAKE_SOURCE_DIR}/sprux
 )
 
-# Propagate backend definitions
-if(SPRUX_USE_METAL)
-    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_METAL)
-endif()
-
-if(SPRUX_USE_CUDA)
-    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_CUDA)
-endif()
-
-if(SPRUX_USE_OPENCL)
-    target_compile_definitions(sprux_py PRIVATE SPRUX_USE_OPENCL)
+# Propagate backend compile definitions (passed from parent CMakeLists.txt)
+if(_SPRUX_PY_DEFS)
+    target_compile_definitions(sprux_py PRIVATE ${_SPRUX_PY_DEFS})
 endif()
 
 # Install the module

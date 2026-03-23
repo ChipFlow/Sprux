@@ -21,40 +21,69 @@ constexpr int64_t kInvalid = -1;
 template <typename T>
 using MatRMaj = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
-/*
-    Notation for (symmetric) block matrix with coalesced columns:
-    Linear data:
-    * a `span` is the basic grouping of data (at creation)
-    * an `lump` is formed by a few consecutive params
-    Block data:
-    * a `block` is `span rows` x `span cols`
-    * a `chain` is `span rows` x `lump cols`
-    * a `board` is (non-empty) and formed by:
-      `all the spans belonging to an lump of rows` x `lump cols`
-
-    Note that numeric data in a column of chains are a row-major
-    matrix. In this way we can refer to the chain sub-matrix,
-    or to the whole set of columns as the chain data are consecutive.
-*/
+/**
+ * @brief Skeleton (sparsity pattern + layout) for a coalesced block matrix.
+ *
+ * ## Terminology
+ *
+ * - **span**: The basic parameter block grouping. Each span has a size
+ *   (number of scalar rows/columns) defined by `spanStart`.
+ * - **lump**: A supernode formed by merging consecutive spans. Lumps are
+ *   the unit of dense BLAS operations during factorization.
+ * - **block**: A `span_rows x span_cols` sub-matrix.
+ * - **chain**: A `span_rows x lump_cols` sub-matrix (a column of blocks
+ *   within one lump's columns).
+ * - **board**: All spans belonging to one lump of rows, times one lump of
+ *   columns. Boards are the unit of elimination.
+ *
+ * Numeric data within a column of chains is stored row-major, so an entire
+ * chain column can be passed to BLAS as a single dense matrix.
+ *
+ * For LU factorization (`matrixType == MTYPE_GENERAL`), upper triangle
+ * storage is initialised via initUpperTriangle().
+ */
 struct CoalescedBlockMatrixSkel {
+  /**
+   * @brief Construct skeleton from block-level structure.
+   *
+   * @param spanStart  Span boundary offsets (size = numSpans + 1). `spanStart[i]` is the
+   *                   first scalar row/column of span `i`; `spanStart.back()` is the matrix order.
+   * @param lumpToSpan Lump-to-span mapping (size = numLumps + 1). Lump `j` contains
+   *                   spans `[lumpToSpan[j], lumpToSpan[j+1])`.
+   * @param colPtr     Column pointers for chain structure (CSC-like, size = numLumps + 1).
+   * @param rowInd     Row span indices for each chain entry.
+   */
   CoalescedBlockMatrixSkel(const std::vector<int64_t>& spanStart,
                            const std::vector<int64_t>& lumpToSpan,
                            const std::vector<int64_t>& colPtr, const std::vector<int64_t>& rowInd);
 
-  /* densify the data pointed to by `data`.
-     by default only lower half is filled, unless `fillUpperHalf` is true
-     if startSpanIndex is set it must be on supernode boundary, and then only the
-     bottom right corner will be returned.
+  /**
+   * @brief Convert internal sparse storage to a dense matrix.
+   *
+   * @param dense          Output dense matrix (resized internally).
+   * @param data           Numeric data buffer.
+   * @param fillUpperHalf  If true, fill both halves (for visualisation). Default: lower only.
+   * @param startSpanIndex If nonzero, return only the bottom-right corner starting from
+   *                       this span (must be on a supernode boundary).
    */
   template <typename T>
   void densify(Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>& dense, const T* data,
                bool fillUpperHalf = false, int64_t startSpanIndex = 0) const;
 
-  /* convenience overload */
+  /// Convenience overload that returns the dense matrix directly.
   template <typename T>
   Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> densify(const std::vector<T>& data,
                                                            bool fillUpperHalf = false) const;
 
+  /**
+   * @brief Apply diagonal damping: `diag(data) = alpha * diag(data) + beta`.
+   *
+   * Useful for Levenberg-Marquardt or trust-region damping.
+   *
+   * @param data  Numeric data buffer (modified in place).
+   * @param alpha Multiplicative factor for existing diagonal.
+   * @param beta  Additive constant.
+   */
   template <typename T>
   void damp(std::vector<T>& data, T alpha, T beta) const;
 

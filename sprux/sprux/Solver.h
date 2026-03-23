@@ -19,8 +19,18 @@
 
 namespace Sprux {
 
-// Where pivot data resides (host or device memory).
-// Used by persistent-context factorLU/solveLU overloads to avoid D2H→H2D roundtrips.
+/**
+ * @brief Where pivot data resides (host or device memory).
+ *
+ * Used by persistent-context factorLU/solveLU overloads to control whether
+ * pivot data is copied between host and device memory.
+ *
+ * - **Host**: pivots are in host (CPU) memory. Standard behavior — the GPU
+ *   backend copies pivots to host after factorization and uploads them before solve.
+ * - **Device**: pivots remain in device (GPU) memory throughout. Eliminates
+ *   D2H→H2D roundtrips when the caller doesn't need to inspect pivots on CPU.
+ *   `devPivots` must be device-allocated with at least `numSpans()` int64_t elements.
+ */
 enum class PivotLocation { Host, Device };
 
 /**
@@ -70,23 +80,60 @@ class Solver {
   // reset statistics
   void resetStats();
 
-  // factor the data stored in the factor (Cholesky for SPD, LU for general)
+  /**
+   * @brief Cholesky factorization for SPD matrices (A = L * L^T).
+   *
+   * Computes the Cholesky factor L in place. The solver must have been created
+   * with `settings.matrixType = MTYPE_SPD` (the default).
+   *
+   * @param matData  Factor data buffer (modified in place). Must be sized to dataSize().
+   *                 Must contain the lower triangle in internal ordering.
+   * @param verbose  If true, prints timing information to stdout.
+   */
   template <typename T>
-  void factor(T* data, bool verbose = false) const;
+  void factor(T* matData, bool verbose = false) const;
 
-  // factor using LU decomposition with partial pivoting (for MTYPE_GENERAL)
-  // pivots array must be sized to numSpans()
+  /**
+   * @brief LU factorization with partial pivoting for general (non-symmetric) matrices.
+   *
+   * Computes A = P * L * U in place. The solver must have been created
+   * with `settings.matrixType = MTYPE_GENERAL`.
+   *
+   * @param data    Factor data buffer (modified in place). Must be sized to totalDataSize()
+   *                and contain both lower and upper triangle data.
+   * @param pivots  Pivot permutation output array. Must be sized to numSpans().
+   * @param verbose If true, prints timing information to stdout.
+   */
   template <typename T>
   void factorLU(T* data, int64_t* pivots, bool verbose = false) const;
 
-  // Persistent-context overload: caller provides a pre-existing NumericCtx
-  // that is reset() and reused across calls (NOT created/destroyed each time).
-  // This eliminates per-call cudaMalloc/cudaFreeHost overhead on GPU backends.
+  /**
+   * @brief LU factorization with persistent numeric context (avoids per-call allocation).
+   *
+   * Same as factorLU() but reuses a caller-provided NumericCtx across calls,
+   * eliminating per-call cudaMalloc/cudaFreeHost overhead on GPU backends.
+   * Create the context via `solver->internalSymbolicContext().createNumericCtx<T>(...)`.
+   *
+   * @param data    Factor data buffer (modified in place). Must be sized to totalDataSize().
+   * @param pivots  Pivot permutation output array. Must be sized to numSpans().
+   * @param ctx     Numeric context to reuse. Reset internally on each call.
+   * @param verbose If true, prints timing information to stdout.
+   */
   template <typename T>
   void factorLU(T* data, int64_t* pivots, NumericCtx<T>& ctx, bool verbose = false) const;
 
-  // Device-pivot overload: pivots stay on device (no D2H copy in flush).
-  // devPivots must be device-allocated with at least numSpans() int64_t elements.
+  /**
+   * @brief LU factorization with device-resident pivots (avoids D2H pivot copy).
+   *
+   * Same as the persistent-context overload but keeps pivots in device (GPU) memory,
+   * avoiding the device-to-host copy at the end of factorization.
+   *
+   * @param data      Factor data buffer (modified in place). Must be sized to totalDataSize().
+   * @param devPivots Device-allocated pivot array. Must have at least numSpans() int64_t elements.
+   * @param ctx       Numeric context to reuse.
+   * @param pivLoc    Must be PivotLocation::Device.
+   * @param verbose   If true, prints timing information to stdout.
+   */
   template <typename T>
   void factorLU(T* data, int64_t* devPivots, NumericCtx<T>& ctx, PivotLocation pivLoc,
                 bool verbose = false) const;
@@ -123,30 +170,96 @@ class Solver {
   template <typename T>
   void finishFactorLU(T* data, int64_t* pivots, bool verbose = false) const;
 
-  // solve in place with LLt (vector must be permuted)
+  /**
+   * @brief Solve A*x = b using Cholesky factorization (L * L^T).
+   *
+   * Solves in place: forward substitution with L, then backward substitution with L^T.
+   * The vector must already be permuted to internal ordering.
+   *
+   * @param matData Factored matrix data (from factor())
+   * @param vecData Right-hand side vector(s), overwritten with solution. Must be in permuted ordering.
+   * @param stride  Leading dimension of vecData (must be >= order())
+   * @param nRHS    Number of right-hand side vectors (columns)
+   */
   template <typename T>
   void solve(const T* matData, T* vecData, int64_t stride, int nRHS) const;
 
-  // solve in place with L (vector must be permuted)
+  /**
+   * @brief Solve L*x = b (forward substitution only).
+   *
+   * Applies only the lower-triangular solve. The vector must be in permuted ordering.
+   * Useful for partial solves in domain decomposition or preconditioning.
+   *
+   * @param matData Factored matrix data (from factor())
+   * @param vecData Right-hand side vector(s), overwritten with solution
+   * @param stride  Leading dimension of vecData (must be >= order())
+   * @param nRHS    Number of right-hand side vectors
+   */
   template <typename T>
   void solveL(const T* matData, T* vecData, int64_t stride, int nRHS) const;
 
-  // solve in place with Lt (vector must be permuted)
+  /**
+   * @brief Solve L^T * x = b (backward substitution only).
+   *
+   * Applies only the upper-triangular (transpose of L) solve. The vector must be
+   * in permuted ordering. Useful for partial solves in domain decomposition.
+   *
+   * @param matData Factored matrix data (from factor())
+   * @param vecData Right-hand side vector(s), overwritten with solution
+   * @param stride  Leading dimension of vecData (must be >= order())
+   * @param nRHS    Number of right-hand side vectors
+   */
   template <typename T>
   void solveLt(const T* matData, T* vecData, int64_t stride, int nRHS) const;
 
-  // solve in place with LU factorization (applies P, then solves L, then U)
-  // pivots array must match the one used in factorLU
+  /**
+   * @brief Solve A*x = b using LU factorization with partial pivoting.
+   *
+   * Applies the pivot permutation P, then forward substitution with L (unit lower
+   * triangular), then backward substitution with U. The pivots array must be the
+   * same one produced by factorLU().
+   *
+   * @param matData  Factored matrix data (from factorLU())
+   * @param pivots   Pivot permutation array (from factorLU()). Must have numSpans() elements.
+   * @param vecData  Right-hand side vector(s), overwritten with solution
+   * @param stride   Leading dimension of vecData (must be >= order())
+   * @param nRHS     Number of right-hand side vectors
+   */
   template <typename T>
   void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS) const;
 
-  // Persistent-context overload: caller provides a pre-existing SolveCtx
-  // that is reset() and reused across calls (NOT created/destroyed each time).
+  /**
+   * @brief Solve with LU factorization using a persistent solve context.
+   *
+   * Same as solveLU() but reuses a caller-provided SolveCtx across calls,
+   * eliminating per-call temporary allocation overhead on GPU backends.
+   * Create the context via `solver->internalSymbolicContext().createSolveCtx<T>(...)`.
+   *
+   * @param matData  Factored matrix data (from factorLU())
+   * @param pivots   Pivot permutation array (from factorLU())
+   * @param vecData  Right-hand side vector(s), overwritten with solution
+   * @param stride   Leading dimension of vecData (must be >= order())
+   * @param nRHS     Number of right-hand side vectors
+   * @param ctx      Solve context to reuse across calls
+   */
   template <typename T>
   void solveLU(const T* matData, const int64_t* pivots, T* vecData, int64_t stride, int nRHS,
                SolveCtx<T>& ctx) const;
 
-  // Device-pivot overload: pivots are already on device (no H2D upload needed).
+  /**
+   * @brief Solve with LU factorization using device-resident pivots.
+   *
+   * Same as the persistent-context overload but reads pivots from device (GPU) memory,
+   * avoiding the host-to-device pivot upload at the start of each solve.
+   *
+   * @param matData    Factored matrix data (from factorLU())
+   * @param devPivots  Device-allocated pivot array (from factorLU with PivotLocation::Device)
+   * @param vecData    Right-hand side vector(s), overwritten with solution
+   * @param stride     Leading dimension of vecData (must be >= order())
+   * @param nRHS       Number of right-hand side vectors
+   * @param ctx        Solve context to reuse across calls
+   * @param pivLoc     Must be PivotLocation::Device
+   */
   template <typename T>
   void solveLU(const T* matData, const int64_t* devPivots, T* vecData, int64_t stride, int nRHS,
                SolveCtx<T>& ctx, PivotLocation pivLoc) const;
@@ -195,45 +308,129 @@ class Solver {
   template <typename T>
   void solveLDLT(const T* matData, T* vecData, int64_t stride, int nRHS) const;
 
-  // apply partial factor, up to a given span
+  /**
+   * @brief Partial Cholesky factorization up to a given span index.
+   *
+   * Factors only spans [0, spanIndex). Useful for incremental/partial factorization
+   * in domain decomposition or Schur complement methods.
+   *
+   * @param data      Factor data buffer (modified in place)
+   * @param spanIndex Upper bound span index (exclusive)
+   * @param verbose   If true, prints timing information
+   */
   template <typename T>
   void factorUpTo(T* data, int64_t spanIndex, bool verbose = false) const;
 
-  // apply partial solve (lower triangular), up to a given span
+  /**
+   * @brief Partial forward substitution (L solve) up to a given span index.
+   *
+   * Solves L*x = b for spans [0, spanIndex) only.
+   *
+   * @param data      Factored matrix data
+   * @param spanIndex Upper bound span index (exclusive)
+   * @param vecData   Right-hand side vector(s), overwritten with partial solution
+   * @param stride    Leading dimension of vecData
+   * @param nRHS      Number of right-hand side vectors
+   */
   template <typename T>
   void solveLUpTo(const T* data, int64_t spanIndex, T* vecData, int64_t stride, int nRHS) const;
 
-  // apply partial solve (lower triangular), up to a given span
+  /**
+   * @brief Partial backward substitution (L^T solve) up to a given span index.
+   *
+   * Solves L^T * x = b for spans [0, spanIndex) only.
+   *
+   * @param data      Factored matrix data
+   * @param spanIndex Upper bound span index (exclusive)
+   * @param vecData   Right-hand side vector(s), overwritten with partial solution
+   * @param stride    Leading dimension of vecData
+   * @param nRHS      Number of right-hand side vectors
+   */
   template <typename T>
   void solveLtUpTo(const T* data, int64_t spanIndex, T* vecData, int64_t stride, int nRHS) const;
 
-  // outVec += M * inVec, applying M's bottom right corner from `spanIndex`
+  /**
+   * @brief Sparse matrix-vector multiply: outVec += alpha * M * inVec, from a given span.
+   *
+   * Applies only the bottom-right corner of the matrix starting from `spanIndex`.
+   * Used in domain decomposition for computing Schur complement contributions.
+   *
+   * @param matData    Factor data
+   * @param spanIndex  Starting span index
+   * @param inVecData  Input vector
+   * @param inStride   Leading dimension of input vector
+   * @param outVecData Output vector (accumulated into)
+   * @param outStride  Leading dimension of output vector
+   * @param nRHS       Number of right-hand side vectors
+   * @param alpha      Scalar multiplier (default 1.0)
+   */
   template <typename T>
   void addMvFrom(const T* matData, int64_t spanIndex, const T* inVecData, int64_t inStride,
                  T* outVecData, int64_t outStride, int nRHS, BaseType<T> alpha = 1.0) const;
 
-  // apply pseudo-factor ( /= diagBlockLt where diagBlockLt has Lt factors of diagonal blocks)
+  /**
+   * @brief Pseudo-factorization from a given span index.
+   *
+   * Divides off-diagonal blocks by the L^T factors of the corresponding diagonal blocks.
+   * Used as a preprocessing step in domain decomposition.
+   *
+   * @param data      Factor data (modified in place)
+   * @param spanIndex Starting span index
+   * @param verbose   If true, prints timing information
+   */
   template <typename T>
   void pseudoFactorFrom(T* data, int64_t spanIndex, bool verbose = false) const;
 
-  // factor from given spanIndex, only uses factor data from spanMatrixOffset(spanInedex)
+  /**
+   * @brief Factor from a given span index onwards.
+   *
+   * Only processes spans [spanIndex, end). Uses factor data starting from
+   * spanMatrixOffset(spanIndex).
+   *
+   * @param data      Factor data (modified in place)
+   * @param spanIndex Starting span index
+   * @param verbose   If true, prints timing information
+   */
   template <typename T>
   void factorFrom(T* data, int64_t spanIndex, bool verbose = false) const;
 
-  // factor from given spanIndex, only uses factor data from spanMatrixOffset(spanInedex), and
-  // vector data from spanVectorOffset(spanIndex)
+  /**
+   * @brief Forward substitution (L solve) from a given span index onwards.
+   *
+   * Only processes spans [spanIndex, end). Uses factor data from
+   * spanMatrixOffset(spanIndex) and vector data from spanVectorOffset(spanIndex).
+   *
+   * @param data      Factored matrix data
+   * @param spanIndex Starting span index
+   * @param vecData   Right-hand side vector(s), overwritten with partial solution
+   * @param stride    Leading dimension of vecData
+   * @param nRHS      Number of right-hand side vectors
+   */
   template <typename T>
   void solveLFrom(const T* data, int64_t spanIndex, T* vecData, int64_t stride, int nRHS) const;
 
-  // factor from given spanIndex, only uses factor data from spanMatrixOffset(spanInedex), and
-  // vector data from spanVectorOffset(spanIndex)
+  /**
+   * @brief Backward substitution (L^T solve) from a given span index onwards.
+   *
+   * Only processes spans [spanIndex, end). Uses factor data from
+   * spanMatrixOffset(spanIndex) and vector data from spanVectorOffset(spanIndex).
+   *
+   * @param data      Factored matrix data
+   * @param spanIndex Starting span index
+   * @param vecData   Right-hand side vector(s), overwritten with partial solution
+   * @param stride    Leading dimension of vecData
+   * @param nRHS      Number of right-hand side vectors
+   */
   template <typename T>
   void solveLtFrom(const T* data, int64_t spanIndex, T* vecData, int64_t stride, int nRHS) const;
+
+  /// Number of spans (parameter blocks after reordering). Pivot arrays must be this size.
+  int64_t numSpans() const { return factorSkel.numSpans(); }
 
   // order of the factor
   int64_t order() const { return factorSkel.order(); }
 
-  // storge data size (lower triangle / L factor)
+  // storage data size (lower triangle / L factor)
   int64_t dataSize() const { return factorSkel.dataSize(); }
 
   // storage data size for upper triangle / U factor (0 for symmetric matrices)
@@ -274,7 +471,7 @@ class Solver {
   // return the count of diagonal elements perturbed during the last factorLU call
   int64_t staticPivotPerturbCount() const { return staticPivotPerturbCount_; }
 
-  // TESTING: return
+  // TESTING: return the internal symbolic context for advanced use cases
   SymbolicCtx& internalSymbolicContext() { return *symCtx; }
 
   SymElimCtx& internalGetElimCtx(size_t i) {
@@ -439,14 +636,29 @@ enum BackendType {
 BackendType detectBestBackend();
 
 /**
- * Policy on fill adding to sparse matrix structure. Note that this controls the factor's sparse
- * structure, and therefore if the solver will support total/partial factor
- **/
+ * @brief Policy controlling how fill is added to the sparse structure during symbolic analysis.
+ *
+ * Fill entries are additional nonzeros that arise during factorization. This policy
+ * controls whether createSolver() computes and adds them, which determines whether
+ * the solver can perform complete or only partial factorization.
+ */
 enum AddFillPolicy {
-  AddFillComplete,       // add fill for complete factoring, reorder
-  AddFillForAutoElims,   // add fill for give+auto elim-ranges, reorder
-  AddFillForGivenElims,  // fill for elimination of elim ranges, no reorder
-  AddFillNone,           // no fill added, no reorder
+  /// Compute fill-reducing ordering and add all fill needed for complete factorization.
+  /// Required if using elimLastIds in createSolver().
+  AddFillComplete,
+
+  /// Add fill for both user-specified and auto-detected sparse elimination ranges.
+  /// Includes fill-reducing reordering. Supports partial factorization up to the
+  /// end of the elimination ranges.
+  AddFillForAutoElims,
+
+  /// Add fill only for user-specified elimination ranges. No reordering.
+  /// Supports partial factorization up to the end of the given ranges.
+  AddFillForGivenElims,
+
+  /// No fill added, no reordering. Use when the sparsity pattern already
+  /// includes all necessary fill (e.g., from an external symbolic analysis).
+  AddFillNone,
 };
 
 // forward def, represent the computation model to tune for
