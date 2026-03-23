@@ -15,7 +15,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "baspacho/baspacho/Solver.h"
+#include "sprux/sprux/Solver.h"
 
 namespace py = pybind11;
 
@@ -119,6 +119,7 @@ public:
     }
 
     /// Solve using Cholesky factor: L * L^T * x = b. Modifies rhs in place.
+    /// Permutes rhs to internal order before solving, and back after.
     void solve(
         py::array_t<double, py::array::c_style> data,
         py::array_t<double, py::array::c_style> rhs,
@@ -127,10 +128,24 @@ public:
         auto data_buf = data.request();
         auto rhs_buf = rhs.request();
         int64_t stride = solver_->order();
+
+        // Permute RHS to internal order
+        const auto& perm = solver_->paramToSpan();
+        std::vector<double> rhs_internal(rhs_buf.size);
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            rhs_internal[perm[i]] = static_cast<double*>(rhs_buf.ptr)[i];
+        }
+
+        // Solve in-place on internal vector
         solver_->solve(
             static_cast<const double*>(data_buf.ptr),
-            static_cast<double*>(rhs_buf.ptr),
+            rhs_internal.data(),
             stride, nrhs);
+
+        // Permute back to original order
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            static_cast<double*>(rhs_buf.ptr)[i] = rhs_internal[perm[i]];
+        }
     }
 
     // -- LU --
@@ -152,6 +167,7 @@ public:
     }
 
     /// Solve using LU factor: P * L * U * x = b. Modifies rhs in place.
+    /// Permutes rhs to internal order before solving, and back after.
     void solve_lu(
         py::array_t<double, py::array::c_style> data,
         py::array_t<int64_t, py::array::c_style> pivots,
@@ -162,11 +178,25 @@ public:
         auto piv_buf = pivots.request();
         auto rhs_buf = rhs.request();
         int64_t stride = solver_->order();
+
+        // Permute RHS to internal order
+        const auto& perm = solver_->paramToSpan();
+        std::vector<double> rhs_internal(rhs_buf.size);
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            rhs_internal[perm[i]] = static_cast<double*>(rhs_buf.ptr)[i];
+        }
+
+        // Solve in-place on internal vector
         solver_->solveLU(
             static_cast<const double*>(data_buf.ptr),
             static_cast<const int64_t*>(piv_buf.ptr),
-            static_cast<double*>(rhs_buf.ptr),
+            rhs_internal.data(),
             stride, nrhs);
+
+        // Permute back to original order
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            static_cast<double*>(rhs_buf.ptr)[i] = rhs_internal[perm[i]];
+        }
     }
 
     // -- LDL^T --
@@ -179,6 +209,7 @@ public:
     }
 
     /// Solve using LDL^T factor. Modifies rhs in place.
+    /// Permutes rhs to internal order before solving, and back after.
     void solve_ldlt(
         py::array_t<double, py::array::c_style> data,
         py::array_t<double, py::array::c_style> rhs,
@@ -187,10 +218,24 @@ public:
         auto data_buf = data.request();
         auto rhs_buf = rhs.request();
         int64_t stride = solver_->order();
+
+        // Permute RHS to internal order
+        const auto& perm = solver_->paramToSpan();
+        std::vector<double> rhs_internal(rhs_buf.size);
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            rhs_internal[perm[i]] = static_cast<double*>(rhs_buf.ptr)[i];
+        }
+
+        // Solve in-place on internal vector
         solver_->solveLDLT(
             static_cast<const double*>(data_buf.ptr),
-            static_cast<double*>(rhs_buf.ptr),
+            rhs_internal.data(),
             stride, nrhs);
+
+        // Permute back to original order
+        for (int64_t i = 0; i < solver_->order(); i++) {
+            static_cast<double*>(rhs_buf.ptr)[i] = rhs_internal[perm[i]];
+        }
     }
 
     // -- CSR load/extract (for populating internal format from standard CSR) --
