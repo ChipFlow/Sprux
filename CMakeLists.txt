@@ -36,7 +36,7 @@ if(NOT WIN32)
 endif()
 
 # CUDA
-set(SPRUX_USE_CUBLAS ON CACHE BOOL "If on, CUDA support is enabled")
+set(SPRUX_USE_CUBLAS OFF CACHE BOOL "If on, CUDA support is enabled")
 set(SPRUX_CUDA_ARCHS "detect" CACHE STRING "List of cuda architecture (eg '60;62;75'), or 'detect', or 'torch'")
 
 if(SPRUX_USE_CUBLAS)

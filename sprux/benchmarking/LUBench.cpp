@@ -337,12 +337,12 @@ static vector<LUTimingResult> benchmarkLUMetalFFI(
 
   // 5. Create persistent contexts (like FFI: one-time allocation, reused via reset)
   auto numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
+  numCtx->beginRecording();
   numCtx->preAllocateForLU(1, n);
   auto solveCtx = symCtx.createSolveCtx<float>(1, static_cast<float*>(nullptr));
 
   // 6. Recording pass: capture GemmWorkItem schedule (like FFI)
   {
-    numCtx->beginRecording();
     solver->factorLU(dataGpu.ptr(), devPivots.ptr(), *numCtx, PivotLocation::Device);
     numCtx->endRecording();
   }

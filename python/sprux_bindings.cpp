@@ -15,7 +15,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "sprux/sprux/Solver.h"
+#include "baspacho/baspacho/Solver.h"
 
 namespace py = pybind11;
 
