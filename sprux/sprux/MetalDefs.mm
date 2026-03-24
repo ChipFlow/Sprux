@@ -43,20 +43,33 @@ class MetalContextImpl {
       asyncQueue = [device newCommandQueue];
       mtlCHECK(asyncQueue != nil, "Failed to create Metal async command queue");
 
-      // Load the compiled shader library
-#ifdef SPRUX_METAL_LIBRARY_PATH
+      // Load the compiled shader library.
+      // Priority: SPRUX_METALLIB_PATH env var > compiled-in path > default library.
       NSError* error = nil;
-      NSString* libraryPath = @SPRUX_METAL_LIBRARY_PATH;
-      NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
-      library = [device newLibraryWithURL:libraryURL error:&error];
-      if (error != nil) {
-        NSLog(@"Failed to load Metal library from %@: %@", libraryPath, error);
-        // Try loading default library as fallback
+      const char* envPath = getenv("SPRUX_METALLIB_PATH");
+      if (envPath) {
+        NSString* libraryPath = [NSString stringWithUTF8String:envPath];
+        NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
+        library = [device newLibraryWithURL:libraryURL error:&error];
+        if (error != nil) {
+          NSLog(@"Failed to load Metal library from env SPRUX_METALLIB_PATH=%@: %@",
+                libraryPath, error);
+        }
+      }
+#ifdef SPRUX_METAL_LIBRARY_PATH
+      if (library == nil) {
+        error = nil;
+        NSString* libraryPath = @SPRUX_METAL_LIBRARY_PATH;
+        NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
+        library = [device newLibraryWithURL:libraryURL error:&error];
+        if (error != nil) {
+          NSLog(@"Failed to load Metal library from %@: %@", libraryPath, error);
+        }
+      }
+#endif
+      if (library == nil) {
         library = [device newDefaultLibrary];
       }
-#else
-      library = [device newDefaultLibrary];
-#endif
       mtlCHECK(library != nil, "Failed to load Metal shader library");
 
       NSLog(@"Metal initialized: %@", device.name);
