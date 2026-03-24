@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "sprux/sprux/Solver.h"
+#include "sprux/sprux/SpruxFFISolver.h"
 
 using namespace Sprux;
 
@@ -141,6 +142,51 @@ int sprux_solve_lu_f32(sprux_solver_t h, const float* data, const int64_t* pivot
                        int64_t stride, int nrhs) {
   try {
     h->solver->solveLU(data, pivots, rhs, stride, nrhs);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// =========================================================================
+// FFI Solver API
+// =========================================================================
+
+struct sprux_ffi_solver {
+  std::unique_ptr<SpruxFFISolver> solver;
+};
+
+sprux_ffi_solver_t sprux_ffi_create(int32_t n, int32_t nnz, const int32_t* csr_indptr,
+                                    const int32_t* csr_indices, const double* csr_data_init,
+                                    int max_refine_steps) {
+  try {
+    auto h = new sprux_ffi_solver();
+    h->solver =
+        std::make_unique<SpruxFFISolver>(n, nnz, csr_indptr, csr_indices, csr_data_init,
+                                        max_refine_steps);
+    return h;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+void sprux_ffi_destroy(sprux_ffi_solver_t h) {
+  delete h;
+}
+
+int sprux_ffi_solve(sprux_ffi_solver_t h, const double* csr_data, const double* rhs,
+                    double* x_out) {
+  try {
+    h->solver->solve(csr_data, rhs, x_out);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x, double* b_out) {
+  try {
+    h->solver->dot(csr_data, x, b_out);
     return 0;
   } catch (...) {
     return -1;

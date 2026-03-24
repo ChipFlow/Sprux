@@ -43,6 +43,9 @@ add_sprux_test(MetalSequenceSolveTest MetalSequenceSolveTest.cpp)
 # add_sprux_test(MetalPartialTest MetalPartialTest.cpp)
 endif()
 
+# FFI Solver test (works with any backend — uses Metal when available, CPU otherwise)
+add_sprux_test(SpruxFFISolverTest SpruxFFISolverTest.cpp)
+
 if(HAVE_CUDSS)
 add_executable(CudssBenchmarkTest CudssBenchmarkTest.cpp)
 target_link_libraries(CudssBenchmarkTest

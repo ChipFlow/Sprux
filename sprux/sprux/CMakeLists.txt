@@ -9,6 +9,7 @@ set(Sprux_sources
     Preprocessing.cpp
     Solver.cpp
     SparseStructure.cpp
+    SpruxFFISolver.cpp
     SupernodeMerger.cpp
     Utils.cpp
     sprux_c_api.cpp)

@@ -134,6 +134,69 @@ int sprux_finish_factor_lu_f32(sprux_solver_t h, float* data, int64_t* pivots);
 int sprux_solve_lu_f32(sprux_solver_t h, const float* data, const int64_t* pivots, float* rhs,
                        int64_t stride, int nrhs);
 
+/* =========================================================================
+ * FFI Solver: encapsulated Metal LU with preprocessing + iterative refinement
+ *
+ * High-level API for circuit simulation (SPICE-like NR loops).
+ * Caller provides f64 CSR matrix + f64 RHS, gets f64 solution.
+ * Internally: BTF preprocessing, equilibration, f32 GPU factor/solve,
+ * CPU f64 iterative refinement. Sparsity pattern is fixed at creation.
+ * ========================================================================= */
+
+typedef struct sprux_ffi_solver* sprux_ffi_solver_t;
+
+/**
+ * Create an FFI solver for a given sparsity pattern.
+ *
+ * Performs one-time setup: BTF max transversal, symmetric structure,
+ * solver creation with auto-computed pivot threshold, recording pass,
+ * and MPS shader warmup (Metal) or CPU BLAS setup.
+ *
+ * @param n               Matrix dimension (n x n)
+ * @param nnz             Number of non-zeros
+ * @param csr_indptr      CSR row pointers [n+1], int32
+ * @param csr_indices     CSR column indices [nnz], int32
+ * @param csr_data_init   First matrix values [nnz], f64 (for pivot threshold)
+ * @param max_refine_steps Number of iterative refinement steps (typically 1)
+ * @return Solver handle, or NULL on error
+ */
+sprux_ffi_solver_t sprux_ffi_create(int32_t n, int32_t nnz, const int32_t* csr_indptr,
+                                    const int32_t* csr_indices, const double* csr_data_init,
+                                    int max_refine_steps);
+
+/**
+ * Destroy an FFI solver and free all associated resources.
+ */
+void sprux_ffi_destroy(sprux_ffi_solver_t h);
+
+/**
+ * Solve Ax = b with Metal-accelerated LU and iterative refinement.
+ *
+ * Equilibrates, factors in f32 on GPU, refines in f64 on CPU.
+ * Returns near-f64 accuracy despite f32 factorization.
+ *
+ * @param h         Solver handle
+ * @param csr_data  CSR non-zero values [nnz], f64
+ * @param rhs       Right-hand side vector [n], f64
+ * @param x_out     Solution vector [n], f64 (output)
+ * @return 0 on success, -1 on error
+ */
+int sprux_ffi_solve(sprux_ffi_solver_t h, const double* csr_data, const double* rhs,
+                    double* x_out);
+
+/**
+ * Sparse matrix-vector multiply: b_out = A @ x (CPU, f64).
+ *
+ * Uses the original CSR structure (no permutation).
+ *
+ * @param h         Solver handle
+ * @param csr_data  CSR non-zero values [nnz], f64
+ * @param x         Input vector [n], f64
+ * @param b_out     Output vector [n], f64
+ * @return 0 on success, -1 on error
+ */
+int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x, double* b_out);
+
 #ifdef __cplusplus
 }
 #endif
