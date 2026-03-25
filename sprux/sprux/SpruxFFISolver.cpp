@@ -194,7 +194,9 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
   settings.matrixType = MTYPE_GENERAL;
   settings.numThreads = 1;
   settings.staticPivotThreshold = pivotThreshold;
-  settings.findSparseEliminationRanges = true;
+  // Sparse elimination only for GPU backends — CPU SolveCtx doesn't implement
+  // sparseElimSolveLUnit/sparseElimSolveU for LU.
+  settings.findSparseEliminationRanges = d.useMetal;
 
   std::vector<int64_t> paramSizes(n, 1);
   d.solver = createSolver(settings, paramSizes, ss);
