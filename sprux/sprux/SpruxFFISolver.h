@@ -38,8 +38,7 @@ class SpruxFFISolver {
    *  3. Build symmetric SparseStructure for AMD ordering
    *  4. Compute static pivot threshold from equilibrated first matrix
    *  5. Create Solver with Metal backend, persistent contexts
-   *  6. Recording pass (captures GemmWorkItem schedule)
-   *  7. MPS warmup (forces shader JIT compilation)
+   *  6. MPS warmup (forces shader JIT compilation)
    *
    * @param n            Matrix dimension (n x n)
    * @param nnz          Number of non-zeros
@@ -63,20 +62,9 @@ class SpruxFFISolver {
   /**
    * Solve Ax = b with Metal-accelerated LU and iterative refinement.
    *
-   * Per-call workflow:
-   *  1. Equilibrate CSR values (row/column scaling to O(1))
-   *  2. Load equilibrated f32 values into solver's coalesced format
-   *  3. Permute RHS by BTF row perm + AMD ordering + equilibration
-   *  4. GPU: factorLU + solveLU (Metal command buffer)
-   *  5. CPU: f64 SpMV residual with original matrix values
-   *  6. GPU: solveLU on correction (refinement)
-   *  7. Accumulate, unpermute, write f64 result
-   *
    * @param csr_data  CSR non-zero values [nnz], f64
    * @param rhs       Right-hand side vector [n], f64
    * @param x_out     Solution vector [n], f64 (output)
-   */
-  /**
    * @return Number of refinement iterations actually performed (may be less than
    *         max_refine_steps if early termination triggered).
    */
