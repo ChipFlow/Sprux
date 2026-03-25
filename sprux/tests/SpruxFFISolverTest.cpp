@@ -150,6 +150,44 @@ TEST(SpruxFFISolver, C6288Sequence) {
   }
 }
 
+// Test: Profile convergence rate per refinement iteration
+TEST(SpruxFFISolver, ConvergenceProfile) {
+  string dir = findTestDataDir("c6288_sequence");
+  if (dir.empty()) {
+    GTEST_SKIP() << "c6288_sequence test data not found";
+  }
+
+  auto matrices = loadSequence(dir, 5);
+  ASSERT_GE(matrices.size(), 2u);
+
+  const CsrMatrix& A0 = matrices[0].first;
+  int64_t n = A0.nRows;
+  int32_t n32 = static_cast<int32_t>(n);
+  int32_t nnz32 = static_cast<int32_t>(A0.nnz);
+  vector<int32_t> indptr32(A0.rowPtr.begin(), A0.rowPtr.end());
+  vector<int32_t> indices32(A0.colInd.begin(), A0.colInd.end());
+
+  cout << "\n  Convergence profile (residual vs refine steps):\n";
+  cout << "  refine";
+  for (size_t mi = 0; mi < matrices.size(); mi++) cout << "    matrix_" << mi;
+  cout << endl;
+
+  for (int refine = 0; refine <= 10; refine++) {
+    SpruxFFISolver solver(n32, nnz32, indptr32.data(), indices32.data(),
+                          A0.values.data(), refine);
+    cout << "  " << setw(6) << refine;
+    for (size_t mi = 0; mi < matrices.size(); mi++) {
+      const CsrMatrix& A = matrices[mi].first;
+      const Eigen::VectorXd& b = matrices[mi].second;
+      vector<double> x(n);
+      solver.solve(A.values.data(), b.data(), x.data());
+      double relRes = computeRelativeResidual(A, x.data(), b.data(), n);
+      cout << "  " << scientific << setprecision(1) << setw(10) << relRes;
+    }
+    cout << endl;
+  }
+}
+
 // Test: Small known matrix to verify the full solve pipeline
 TEST(SpruxFFISolver, SmallMatrix) {
   // 3x3 matrix: A = [[4, 1, 0], [1, 3, 1], [0, 1, 4]]

@@ -46,10 +46,13 @@ class SpruxFFISolver {
    * @param csr_indptr   CSR row pointers [n+1], int32
    * @param csr_indices  CSR column indices [nnz], int32
    * @param csr_data_init First matrix values [nnz], f64 — used for pivot threshold
-   * @param max_refine_steps Number of iterative refinement steps (default 1)
+   * @param max_refine_steps Max iterative refinement steps (default 1)
+   * @param refine_tol Early termination tolerance for relative residual (default 1e-12).
+   *                   Set to 0 to disable early termination and always run max steps.
    */
   SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr, const int32_t* csr_indices,
-                 const double* csr_data_init, int max_refine_steps = 1);
+                 const double* csr_data_init, int max_refine_steps = 1,
+                 double refine_tol = 1e-12);
 
   ~SpruxFFISolver();
 
@@ -73,7 +76,11 @@ class SpruxFFISolver {
    * @param rhs       Right-hand side vector [n], f64
    * @param x_out     Solution vector [n], f64 (output)
    */
-  void solve(const double* csr_data, const double* rhs, double* x_out);
+  /**
+   * @return Number of refinement iterations actually performed (may be less than
+   *         max_refine_steps if early termination triggered).
+   */
+  int solve(const double* csr_data, const double* rhs, double* x_out);
 
   /**
    * Sparse matrix-vector multiply: b_out = A @ x (CPU, f64).

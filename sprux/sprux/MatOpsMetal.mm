@@ -1707,70 +1707,73 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // complement updates are dispatched before factorization of this lump.
       flushPendingGemms();
 
-#ifdef SPRUX_USE_BLAS
-      // CPU BLAS path for larger lumps: multi-threaded LAPACK sgetrf (~10-50μs)
-      // is much faster than single-threadgroup GPU kernel (~1ms for n≥64).
-      // In external encoder mode, we cycle the encoder (end→commit→wait→CPU→
-      // re-create) since unified memory means CPU BLAS works on the same data.
-      if (minMN >= 64) {
-        if (sym.usingExternalEncoder) {
-          // End current encoder and commit the command buffer
+      // CPU path: row-major LU with partial pivoting, ported directly from the
+      // lu_getrf_kernel_float GPU kernel. Same layout and 0-based pivot convention.
+      if (minMN >= 4) {
+        if (sym.usingExternalEncoder && sym.externalEncoder) {
           [sym.externalEncoder endEncoding];
           sym.externalEncoder = nil;
-          [sym.externalCmdBuf commit];
-          [sym.externalCmdBuf waitUntilCompleted];
-          sym.externalCmdBuf = nil;
-        } else {
+          if (sym.externalCmdBuf) {
+            [sym.externalCmdBuf commit];
+            [sym.externalCmdBuf waitUntilCompleted];
+            sym.externalCmdBuf = nil;
+          }
+        } else if (!sym.usingExternalEncoder) {
           commitPending();
           waitForGpu();
         }
         float* A = data + offA;
 
-        // Sprux stores row-major; LAPACK expects col-major.
-        // Transpose before + after gives correct row-major L*U result.
-        if (m == n) {
-          for (int64_t i = 0; i < n; i++)
-            for (int64_t j = i + 1; j < n; j++)
-              std::swap(A[i * n + j], A[j * n + i]);
+        for (int64_t k = 0; k < minMN; k++) {
+          // Find pivot row: max |A[i,k]| for i in [k, m)
+          int64_t pivotRow = k;
+          float maxVal = std::abs(A[k * n + k]);
+          for (int64_t i = k + 1; i < m; i++) {
+            float val = std::abs(A[i * n + k]);
+            if (val > maxVal) { maxVal = val; pivotRow = i; }
+          }
+          pivots[k] = pivotRow;
+
+          // Swap rows k and pivotRow
+          if (pivotRow != k) {
+            for (int64_t j = 0; j < n; j++)
+              std::swap(A[k * n + j], A[pivotRow * n + j]);
+          }
+
+          // Scale column k below diagonal
+          float diagVal = A[k * n + k];
+          if (diagVal != 0.0f) {
+            float inv = 1.0f / diagVal;
+            for (int64_t i = k + 1; i < m; i++)
+              A[i * n + k] *= inv;
+          }
+
+          // Rank-1 update of trailing matrix
+          for (int64_t i = k + 1; i < m; i++) {
+            float lik = A[i * n + k];
+            for (int64_t j = k + 1; j < n; j++)
+              A[i * n + j] -= lik * A[k * n + j];
+          }
         }
 
-        std::vector<BLAS_INT> ipiv(minMN);
-        int info = LAPACKE_sgetrf(0 /*col-major*/, (BLAS_INT)m, (BLAS_INT)n, A,
-                                  (BLAS_INT)m, ipiv.data());
-
-        if (m == n) {
-          for (int64_t i = 0; i < n; i++)
-            for (int64_t j = i + 1; j < n; j++)
-              std::swap(A[i * n + j], A[j * n + i]);
-        }
-
-        // Write pivots to devAllPivots (shared memory, GPU-accessible) so that
-        // downstream GPU kernels (applyRowPerm) can read them.
+        // Write pivots to devAllPivots (shared memory) for GPU-accessible reads
         if (devAllPivots.buffer()) {
           if (!allPivotsCpuBase_) allPivotsCpuBase_ = pivots;
           int64_t pivotOffset = pivots - allPivotsCpuBase_;
           allPivotsCount_ = std::max(allPivotsCount_, pivotOffset + minMN);
           int64_t* gpuPivots = devAllPivots.ptr() + pivotOffset;
-          for (int64_t i = 0; i < minMN; i++) {
-            gpuPivots[i] = ipiv[i] - 1;  // LAPACK is 1-based
-          }
+          for (int64_t i = 0; i < minMN; i++)
+            gpuPivots[i] = pivots[i];
           pivotsOnGpu_ = true;
         }
 
-        // Also write to host pivots array
-        for (int64_t i = 0; i < minMN; i++) {
-          pivots[i] = ipiv[i] - 1;
-        }
-
-        // Re-create external encoder for subsequent GPU dispatches
         if (sym.usingExternalEncoder) {
           sym.externalCmdBuf = [sym.commandQueue commandBuffer];
           sym.externalEncoder = [sym.externalCmdBuf computeCommandEncoder];
         }
 
-        return info;
+        return 0;
       }
-#endif
 
       // GPU path: single-threadgroup Metal kernel (efficient for small lumps)
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
@@ -1952,6 +1955,27 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
+      // CPU path: direct GEMM on unified memory when no pending GPU work.
+      // For small dense lumps, CPU avoids GPU dispatch overhead.
+      if (!pendingEncoder_ && !pendingCmdBuf_
+          && recordState_ != RecordState::Recording
+          && recordState_ != RecordState::Ready) {
+        const float* Lp = L + offL;
+        const float* Up = U + offU;
+        float* Cp = C + offC;
+        // C -= L * U (row-major: C[i,j] -= sum_k L[i,k] * U[k,j])
+        for (int64_t i = 0; i < m; i++) {
+          for (int64_t j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int64_t p = 0; p < k; p++) {
+              sum += Lp[i * ldL + p] * Up[p * ldU + j];
+            }
+            Cp[i * ldC + j] -= sum;
+          }
+        }
+        return;
+      }
+
       // Batched GPU path: buffer work items, flush later in flushPendingGemms()
       // On first call, cache the data buffer info (L, U, C all share the same buffer)
       if (!cachedDataBuffer_) {
@@ -2013,10 +2037,25 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
   virtual void applyRowPerm(int64_t* pivots, int64_t n, float* data, int64_t offData, int64_t ld,
                              int64_t numCols) override {
     if (explicitRecording_) return;
-    @autoreleasepool {
-      if (n <= 0 || numCols <= 0) return;
+    if (n <= 0 || numCols <= 0) return;
 
-      // GPU kernel for all sizes
+    // CPU path: LAPACK-style pivot row swaps directly on unified memory.
+    // Faster than GPU dispatch for small lumps (avoids dispatch + barrier overhead).
+    // Note: data is column-major (d[row + col * ld]), matching the GPU kernel.
+    if (!pendingEncoder_ && !pendingCmdBuf_) {
+      float* A = data + offData;
+      for (int64_t i = 0; i < n; i++) {
+        int64_t swapRow = pivots[i];
+        if (swapRow != i) {
+          for (int64_t c = 0; c < numCols; c++) {
+            std::swap(A[i + c * ld], A[swapRow + c * ld]);
+          }
+        }
+      }
+      return;
+    }
+
+    @autoreleasepool {
       auto bufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       if (!bufferInfo.first) {
         throw std::runtime_error("MetalNumericCtx<float>::applyRowPerm: data buffer not found");
@@ -2027,9 +2066,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       id<MTLComputePipelineState> pipeline = getPipeline(
               "lu_applyRowPerm_kernel_float");
 
-      // Determine pivot buffer and offset.
-      // If pivots are GPU-resident (from getrf deferred path), use devAllPivots
-      // at the correct offset. Otherwise, copy from CPU to devPivots.
       id<MTLBuffer> pivotBuffer;
       size_t pivotByteOffset = 0;
       if (pivotsOnGpu_ && allPivotsCpuBase_) {
@@ -2043,8 +2079,6 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
         pivotByteOffset = 0;
       }
 
-      // Dispatch as single threadgroup with min(256, numCols) threads
-      // (threadgroup_barrier in kernel requires single threadgroup)
       NSUInteger numThreads = (NSUInteger)std::min((int64_t)256, numCols);
 
       encodeKernel(
@@ -2069,6 +2103,96 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
                       int64_t belowDiagOffset, int64_t numRowsBelowDiag,
                       int64_t lump, int64_t upperDataBase) override {
     if (explicitRecording_) return;
+
+    // CPU path: TODO — the TRSM implementation has a correctness issue.
+    // Needs investigation: likely a data-dependency or layout mismatch with the
+    // fused GPU kernel. For now, always use GPU postGetrfFused.
+    if (false) {
+      int64_t* piv = pivots + pivotOffset;
+
+      // 1. Perturb small diagonals
+      if (enablePerturb) {
+        if (!perturbCountBuf_) {
+          perturbCountBuf_ = [sym.device newBufferWithLength:sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
+          *(uint32_t*)[perturbCountBuf_ contents] = 0;
+          perturbCountPending_ = true;
+        }
+        uint32_t* pcount = (uint32_t*)[perturbCountBuf_ contents];
+        for (int64_t i = 0; i < lumpSize; i++) {
+          float& diag = data[diagOffset + i * lumpSize + i];
+          if (!std::isfinite(diag) || std::abs(diag) < threshold) {
+            diag = (diag >= 0) ? threshold : -threshold;
+            (*pcount)++;
+          }
+        }
+      }
+
+      // 2. Below-diagonal: pivot swap + trsmUpperRight (col-major, stride=lumpSize)
+      if (numRowsBelowDiag > 0) {
+        float* belowDiag = data + belowDiagOffset;
+        float* diag = data + diagOffset;
+
+        // 2a. Apply row permutation
+        for (int64_t i = 0; i < lumpSize; i++) {
+          int64_t swapRow = piv[i];
+          if (swapRow != i) {
+            for (int64_t c = 0; c < numRowsBelowDiag; c++) {
+              std::swap(belowDiag[i + c * lumpSize], belowDiag[swapRow + c * lumpSize]);
+            }
+          }
+        }
+
+        // 2b. trsmUpperRight: solve X * U = B (B = belowDiag, U = diag block)
+        // GPU kernel uses belowDiag[i * lumpSize + j] (row-major indexing for the solve)
+        for (int64_t j = 0; j < lumpSize; j++) {
+          float inv_diag = 1.0f / diag[j * lumpSize + j];
+          for (int64_t i = 0; i < numRowsBelowDiag; i++) {
+            float val = belowDiag[i * lumpSize + j];
+            for (int64_t k = 0; k < j; k++) {
+              val -= belowDiag[i * lumpSize + k] * diag[k * lumpSize + j];
+            }
+            belowDiag[i * lumpSize + j] = val * inv_diag;
+          }
+        }
+      }
+
+      // 3. Upper blocks: pivot swap + trsmLowerUnit (col-major, stride=colSize)
+      if (sym.skel.isGeneral()) {
+        float* diag = data + diagOffset;
+        int64_t rangeStart = sym.skel.upperChainRowPtr[lump];
+        int64_t rangeEnd = sym.skel.upperChainRowPtr[lump + 1];
+        for (int64_t idx = rangeStart; idx < rangeEnd; idx++) {
+          int64_t colSpan = sym.skel.upperChainColSpan[idx];
+          int64_t colSize = sym.skel.spanStart[colSpan + 1] - sym.skel.spanStart[colSpan];
+          float* block = data + upperDataBase + sym.skel.upperChainData[idx];
+
+          // 3a. Apply row permutation (col-major, stride=colSize)
+          for (int64_t p = 0; p < lumpSize; p++) {
+            int64_t swapRow = piv[p];
+            if (swapRow != p) {
+              for (int64_t c = 0; c < colSize; c++) {
+                std::swap(block[p + c * colSize], block[swapRow + c * colSize]);
+              }
+            }
+          }
+
+          // 3b. trsmLowerUnit: solve L * X = B (L = unit lower from diag, B = block)
+          // L is row-major (diag[i * lumpSize + j]), B is col-major (block[i + c * colSize])
+          for (int64_t j = 0; j < lumpSize; j++) {
+            for (int64_t c = 0; c < colSize; c++) {
+              float val = block[j + c * colSize];
+              for (int64_t k = 0; k < j; k++) {
+                val -= diag[j * lumpSize + k] * block[k + c * colSize];
+              }
+              block[j + c * colSize] = val;  // unit diagonal, no divide
+            }
+          }
+        }
+      }
+      return;
+    }
+
     @autoreleasepool {
       // Count upper spans for threadgroup dispatch
       int64_t rangeStart = sym.skel.isGeneral() ? sym.skel.upperChainRowPtr[lump] : 0;
@@ -2224,12 +2348,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       precomputedFlushIdx_ = 0;
     } else if (recordState_ == RecordState::Ready) {
       precomputedFlushIdx_ = 0;
-    } else if (recordState_ == RecordState::Idle && !explicitRecording_) {
-      // Start auto-recording on next factorLU
-      recordState_ = RecordState::Recording;
-      recordedItems_.clear();
-      recordedFlushPoints_.clear();
-      recordingBatchCount_ = 0;
+    } else if (recordState_ == RecordState::Idle) {
+      // Stay in Idle — only transition to Recording via explicit beginRecording()
     }
     // Buffers (tempBuffer, devSpanToChainOffset, devPivots, devAllPivots,
     // devGemmWorkBuf_, perturbCountBuf_, devPrecomputedItems_) are NOT freed — reused across calls.
@@ -2690,10 +2810,33 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   virtual void sparseElimSolveLUnit(const SymElimCtx& elimData, const float* data,
                                     int64_t lumpsBegin, int64_t lumpsEnd, float* C,
                                     int64_t ldc) override {
-    @autoreleasepool {
-      const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      SPRUX_CHECK_NOTNULL(pElim);
+    int64_t numLumps = lumpsEnd - lumpsBegin;
+    if (numLumps <= 0) return;
 
+    // CPU path for 1×1 scalar lumps: sequential forward L substitution on unified memory.
+    // Eliminates GPU dispatch overhead (~20 dispatches with near-zero utilization).
+    if (allLumpsSize1(lumpsBegin, lumpsEnd)) {
+      commitAndWait();  // flush any pending GPU work
+      const auto& lumpStart = sym.skel.lumpStart;
+      const auto& spanStart = sym.skel.spanStart;
+      const auto& chainColPtr = sym.skel.chainColPtr;
+      const auto& chainRowSpan = sym.skel.chainRowSpan;
+      const auto& chainData = sym.skel.chainData;
+      float* v = C;  // vec buffer (unified memory)
+
+      for (int64_t lump = lumpsBegin; lump < lumpsEnd; lump++) {
+        int64_t lumpIdx = lumpStart[lump];
+        float val = v[lumpIdx];
+        for (int64_t colPtr = chainColPtr[lump] + 1; colPtr < chainColPtr[lump + 1]; colPtr++) {
+          int64_t rowIdx = spanStart[chainRowSpan[colPtr]];
+          v[rowIdx] -= data[chainData[colPtr]] * val;
+        }
+      }
+      return;
+    }
+
+    // GPU path for larger lumps
+    @autoreleasepool {
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
       if (!dataBufferInfo.first || !cBufferInfo.first) {
@@ -2704,13 +2847,8 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      int64_t numLumps = lumpsEnd - lumpsBegin;
-      if (numLumps <= 0) return;
-
       int64_t nRHS64 = nRHS;
 
-      // No diagonal solve for unit L (diagonal is implicitly 1)
-      // Only encode below-diagonal scatter: v[rowSpan] -= L_below * v[lump]
       id<MTLComputePipelineState> subDiagPipeline =
           getPipeline("sparseElim_subDiagMult_float");
 
@@ -2740,10 +2878,39 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
   // LU sparse elimination backward solve: gather from upper triangle then U diagonal solve
   virtual void sparseElimSolveU(const SymElimCtx& elimData, const float* data, int64_t lumpsBegin,
                                 int64_t lumpsEnd, float* C, int64_t ldc) override {
-    @autoreleasepool {
-      const MetalSymElimCtx* pElim = dynamic_cast<const MetalSymElimCtx*>(&elimData);
-      SPRUX_CHECK_NOTNULL(pElim);
+    int64_t numLumps = lumpsEnd - lumpsBegin;
+    if (numLumps <= 0) return;
 
+    // CPU path for 1×1 scalar lumps: sequential backward U substitution on unified memory.
+    if (allLumpsSize1(lumpsBegin, lumpsEnd)) {
+      commitAndWait();  // flush any pending GPU work
+      const auto& lumpStart = sym.skel.lumpStart;
+      const auto& spanStart = sym.skel.spanStart;
+      const auto& chainColPtr = sym.skel.chainColPtr;
+      const auto& chainData = sym.skel.chainData;
+      const auto& upperChainRowPtr = sym.skel.upperChainRowPtr;
+      const auto& upperChainColSpan = sym.skel.upperChainColSpan;
+      const auto& upperChainData = sym.skel.upperChainData;
+      int64_t upperDataBase = sym.skel.dataSize();
+      float* v = C;  // vec buffer (unified memory)
+
+      for (int64_t lump = lumpsEnd - 1; lump >= lumpsBegin; lump--) {
+        int64_t lumpIdx = lumpStart[lump];
+
+        // Upper gather: v[lump] -= U[lump, col] * v[col]
+        for (int64_t ptr = upperChainRowPtr[lump]; ptr < upperChainRowPtr[lump + 1]; ptr++) {
+          int64_t colIdx = spanStart[upperChainColSpan[ptr]];
+          v[lumpIdx] -= data[upperDataBase + upperChainData[ptr]] * v[colIdx];
+        }
+
+        // Diagonal divide: v[lump] /= U_diag[lump]
+        v[lumpIdx] /= data[chainData[chainColPtr[lump]]];
+      }
+      return;
+    }
+
+    // GPU path for larger lumps
+    @autoreleasepool {
       auto dataBufferInfo = MetalBufferRegistry::instance().findBuffer(data);
       auto cBufferInfo = MetalBufferRegistry::instance().findBuffer(C);
       if (!dataBufferInfo.first || !cBufferInfo.first) {
@@ -2754,14 +2921,9 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
       size_t dataOffset = dataBufferInfo.second;
       size_t cOffset = cBufferInfo.second;
 
-      int64_t numLumps = lumpsEnd - lumpsBegin;
-      if (numLumps <= 0) return;
-
       int64_t nRHS64 = nRHS;
       int64_t upperDataBase = sym.skel.dataSize();
 
-      // First: gather from upper triangle entries: v[lump] -= U_row * v[colSpan]
-      // Use size-1 flat kernel when all lumps are size-1
       auto gatherEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
         [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer() offset:0 atIndex:0];
         [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer() offset:0 atIndex:1];
@@ -2783,77 +2945,35 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
         [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
       };
 
-      bool size1 = allLumpsSize1(lumpsBegin, lumpsEnd);
+      id<MTLComputePipelineState> gatherPipeline =
+          getPipeline("sparseElim_upperGather_float");
+      NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
+      encodeKernelWithGroups(gatherPipeline, gatherEncodeBlock,
+                             (NSUInteger)numLumps, gatherTgSize);
 
-      if (size1) {
-        // Fused kernel: upper gather + diagonal divide in one dispatch
-        id<MTLComputePipelineState> fusedPipeline =
-            getPipeline("sparseElim_fusedSolveU_size1_float");
-        encodeKernel(
-            fusedPipeline,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                          offset:0
-                         atIndex:0];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devSpanStart.buffer()
-                          offset:0
-                         atIndex:1];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainRowPtr.buffer()
-                          offset:0
-                         atIndex:2];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainColSpan.buffer()
-                          offset:0
-                         atIndex:3];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devUpperChainData.buffer()
-                          offset:0
-                         atIndex:4];
-              [encoder setBuffer:dataBuffer offset:dataOffset atIndex:5];
-              [encoder setBuffer:cBuffer offset:cOffset atIndex:6];
-              [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:7];
-              [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:8];
-              [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:9];
-              [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:10];
-              [encoder setBytes:&upperDataBase length:sizeof(int64_t) atIndex:11];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                          offset:0
-                         atIndex:12];
-              [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                          offset:0
-                         atIndex:13];
-            },
-            (NSUInteger)numLumps);
-      } else {
-        id<MTLComputePipelineState> gatherPipeline =
-            getPipeline("sparseElim_upperGather_float");
-        NSUInteger gatherTgSize = MIN(gatherPipeline.maxTotalThreadsPerThreadgroup, 256);
-        encodeKernelWithGroups(gatherPipeline, gatherEncodeBlock,
-                               (NSUInteger)numLumps, gatherTgSize);
+      auto diagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
+                    offset:0
+                   atIndex:0];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
+                    offset:0
+                   atIndex:1];
+        [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
+                    offset:0
+                   atIndex:2];
+        [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
+        [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
+        [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
+        [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
+        [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
+        [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
+      };
 
-        // Then: diagonal U solve: v[lump] /= U_diagonal
-        auto diagEncodeBlock = ^(id<MTLComputeCommandEncoder> encoder) {
-          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devLumpStart.buffer()
-                      offset:0
-                     atIndex:0];
-          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainColPtr.buffer()
-                      offset:0
-                     atIndex:1];
-          [encoder setBuffer:(__bridge id<MTLBuffer>)sym.devChainData.buffer()
-                      offset:0
-                     atIndex:2];
-          [encoder setBuffer:dataBuffer offset:dataOffset atIndex:3];
-          [encoder setBuffer:cBuffer offset:cOffset atIndex:4];
-          [encoder setBytes:&ldc length:sizeof(int64_t) atIndex:5];
-          [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:6];
-          [encoder setBytes:&lumpsBegin length:sizeof(int64_t) atIndex:7];
-          [encoder setBytes:&lumpsEnd length:sizeof(int64_t) atIndex:8];
-        };
-
-        id<MTLComputePipelineState> diagPipeline =
-            getPipeline("sparseElim_diagDivU_float");
-        NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
-        encodeKernelWithGroups(diagPipeline, diagEncodeBlock,
-                               (NSUInteger)numLumps, tgSize);
-      }
+      id<MTLComputePipelineState> diagPipeline =
+          getPipeline("sparseElim_diagDivU_float");
+      NSUInteger tgSize = MIN(diagPipeline.maxTotalThreadsPerThreadgroup, 256);
+      encodeKernelWithGroups(diagPipeline, diagEncodeBlock,
+                             (NSUInteger)numLumps, tgSize);
     }
   }
 
@@ -3505,47 +3625,38 @@ struct MetalSolveCtx<float> : SolveCtx<float> {
 
   virtual void batchedApplyRowPermVec(float* vecData, int64_t stride,
       int64_t numLumps, const PermLumpInfo* lumpInfos) override {
-    @autoreleasepool {
-      if (numLumps <= 0) return;
+    if (numLumps <= 0) return;
 
-      // Resolve pivot buffer
-      id<MTLBuffer> pivotBuffer = nil;
+    // CPU path: apply pivot permutations directly on unified memory.
+    // Resolves pivot pointer from device-resident or uploaded pivots.
+    {
+      commitAndWait();  // flush any pending GPU work
+
+      // Resolve pivot base pointer (unified memory, CPU-accessible)
+      const int64_t* pivotBase = nullptr;
       if (externalDevPivots_) {
-        auto pivBufInfo = MetalBufferRegistry::instance().findBuffer(externalDevPivots_);
-        if (pivBufInfo.first) {
-          pivotBuffer = (__bridge id<MTLBuffer>)pivBufInfo.first;
-        }
+        pivotBase = externalDevPivots_;
+      } else if (devPivots.buffer()) {
+        pivotBase = devPivots.ptr();
       }
-      if (!pivotBuffer) {
-        pivotBuffer = (__bridge id<MTLBuffer>)devPivots.buffer();
-      }
-      if (!pivotBuffer) {
+      if (!pivotBase) {
         throw std::runtime_error("MetalSolveCtx::batchedApplyRowPermVec: no pivot buffer");
       }
 
-      auto vecBufferInfo = MetalBufferRegistry::instance().findBuffer(vecData);
-      if (!vecBufferInfo.first) {
-        throw std::runtime_error("MetalSolveCtx::batchedApplyRowPermVec: vec buffer not found");
+      for (int64_t l = 0; l < numLumps; l++) {
+        const int64_t* pivots =
+            reinterpret_cast<const int64_t*>(
+                reinterpret_cast<const char*>(pivotBase) + lumpInfos[l].pivotByteOffset);
+        int64_t lumpStart = lumpInfos[l].lumpStart;
+        int32_t lumpSize = lumpInfos[l].lumpSize;
+
+        for (int32_t i = 0; i < lumpSize; i++) {
+          int64_t swapIdx = pivots[i];
+          if (swapIdx != i) {
+            std::swap(vecData[lumpStart + i], vecData[lumpStart + swapIdx]);
+          }
+        }
       }
-      id<MTLBuffer> vecBuffer = (__bridge id<MTLBuffer>)vecBufferInfo.first;
-      size_t vecBaseOffset = vecBufferInfo.second;
-
-      id<MTLComputePipelineState> pipeline = getPipeline(
-              "lu_batchedApplyRowPerm_kernel_float");
-
-      int64_t nRHS64 = nRHS;
-      int32_t numLumps32 = (int32_t)numLumps;
-      encodeKernel(
-          pipeline,
-          ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:pivotBuffer offset:0 atIndex:0];
-            [encoder setBuffer:vecBuffer offset:vecBaseOffset atIndex:1];
-            [encoder setBytes:&stride length:sizeof(int64_t) atIndex:2];
-            [encoder setBytes:&nRHS64 length:sizeof(int64_t) atIndex:3];
-            [encoder setBytes:lumpInfos length:numLumps * sizeof(PermLumpInfo) atIndex:4];
-            [encoder setBytes:&numLumps32 length:sizeof(int32_t) atIndex:5];
-          },
-          (NSUInteger)numLumps);
     }
   }
 
