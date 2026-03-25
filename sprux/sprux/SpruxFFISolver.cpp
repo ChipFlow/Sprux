@@ -49,15 +49,28 @@ struct SpruxFFISolver::Impl {
   // AMD permutation from solver (reference, not owned)
   const std::vector<int64_t>* perm = nullptr;
 
-  // Factor data and pivots (CPU-side, loaded to MetalMirror per solve)
-  std::vector<float> data;
-  std::vector<int64_t> pivots;
+  bool useMetal = false;
+
+#ifdef SPRUX_USE_METAL
+  // Persistent GPU buffers (unified memory, grow-only)
+  MetalMirror<float> dataGpu;
+  MetalMirror<float> xGpu;
+  MetalMirror<int64_t> devPivots;
+
+  // Persistent factorization/solve contexts (reused via reset)
+  NumericCtxPtr<float> numCtx;
+  SolveCtxPtr<float> solveCtx;
+#endif
+
+  // CPU fallback buffers
+  std::vector<float> dataCpu;
+  std::vector<int64_t> pivotsCpu;
 
   // Temporaries reused across solves to avoid allocation
-  std::vector<double> permValues;    // permuted + equilibrated CSR values
+  std::vector<double> permValues;
   std::vector<double> rowScale;
   std::vector<double> colScale;
-  std::vector<double> xAccum;  // f64 accumulator for refinement
+  std::vector<double> xAccum;
 };
 
 // ---------------------------------------------------------------------------
@@ -91,9 +104,7 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
   SparseStructure ss =
       csrToSymmetricSparseStructure(n, d.permRowPtr.data(), d.permColInd.data());
 
-  // Step 3: Compute static pivot threshold from equilibrated first matrix diagonal.
-  // This avoids GPU→CPU sync during factorization (sprux auto threshold=0 does
-  // maxAbsDiag which requires a readback).
+  // Step 3: Compute static pivot threshold from equilibrated first matrix diagonal
   double pivotThreshold;
   {
     std::vector<double> rowScale0, colScale0;
@@ -121,6 +132,7 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
   Settings settings;
 #ifdef SPRUX_USE_METAL
   settings.backend = BackendMetal;
+  d.useMetal = true;
 #else
   settings.backend = BackendFast;
 #endif
@@ -134,9 +146,54 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
   d.perm = &d.solver->paramToSpan();
   int64_t totalDataSz = d.solver->totalDataSize();
 
-  // Allocate factor data and pivot buffers
-  d.data.resize(totalDataSz, 0.0f);
-  d.pivots.resize(n, 0);
+#ifdef SPRUX_USE_METAL
+  {
+    auto& symCtx = d.solver->internalSymbolicContext();
+
+    // Disable OpStat timers — prevents unnecessary GPU syncs
+    symCtx.disableAllStats();
+
+    // Allocate persistent GPU buffers (unified memory, grow-only)
+    d.dataGpu.resizeToAtLeast(totalDataSz);
+    d.xGpu.resizeToAtLeast(n);
+    d.devPivots.resizeToAtLeast(n);
+
+    // Create persistent contexts (one-time allocation, reused via reset)
+    d.numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
+    d.numCtx->beginRecording();
+    d.numCtx->preAllocateForLU(1, n);
+    d.solveCtx = symCtx.createSolveCtx<float>(1, static_cast<float*>(nullptr));
+
+    // Recording pass — capture GemmWorkItem schedule
+    d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
+    d.numCtx->endRecording();
+
+    // MPS warmup — first factorization produces wrong results during shader JIT.
+    // Load valid data and run a dummy factorLU to force compilation.
+    {
+      std::vector<double> wRowScale, wColScale;
+      computeEquilibration(n, d.permRowPtr.data(), d.permColInd.data(), d.permValues.data(),
+                           wRowScale, wColScale);
+      std::vector<int64_t> wRowPtr, wColInd;
+      std::vector<double> wValues;
+      applyRowPermAndScaleToCsr<double>(n, d.csrIndptr.data(), d.csrIndices.data(), csr_data_init,
+                                       d.preproc.rowPerm.data(), wRowScale.data(), wColScale.data(),
+                                       wRowPtr, wColInd, wValues);
+      std::vector<float> wSValues(wValues.begin(), wValues.end());
+      std::memset(d.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+      d.solver->loadFromCsr(wRowPtr.data(), wColInd.data(), d.blockSizes.data(), wSValues.data(),
+                            d.dataGpu.ptr());
+
+      d.numCtx->reset();
+      d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
+      d.numCtx->flush();
+    }
+  }
+#endif
+
+  // CPU fallback buffers (also used when Metal is available but we need CPU path)
+  d.dataCpu.resize(totalDataSz, 0.0f);
+  d.pivotsCpu.resize(n, 0);
 
   // Pre-allocate reusable temporaries
   d.permValues.resize(nnz);
@@ -171,47 +228,97 @@ void SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_
   // Convert equilibrated values to f32
   std::vector<float> sValues(eqValues.begin(), eqValues.end());
 
-  // Step 2: Load f32 values into solver's coalesced format
-  std::fill(d.data.begin(), d.data.end(), 0.0f);
-  d.solver->loadFromCsr(eqRowPtr.data(), eqColInd.data(), d.blockSizes.data(), sValues.data(),
-                        d.data.data());
-
-  // Step 3: Factor on GPU (or CPU), copy data back
 #ifdef SPRUX_USE_METAL
-  {
-    MetalMirror<float> dataGpu(d.data);
-    d.solver->factorLU(dataGpu.ptr(), d.pivots.data());
-    dataGpu.get(d.data);
+  if (d.useMetal) {
+    auto& symCtx = d.solver->internalSymbolicContext();
+    auto& metalCtx = MetalContext::instance();
+    int64_t totalDataSz = d.solver->totalDataSize();
+
+    // Step 2: Load f32 values directly into persistent GPU buffer (zero-copy)
+    std::memset(d.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+    d.solver->loadFromCsr(eqRowPtr.data(), eqColInd.data(), d.blockSizes.data(), sValues.data(),
+                          d.dataGpu.ptr());
+
+    // Step 3: Permute RHS into persistent GPU buffer
+    for (int64_t j = 0; j < n; j++) {
+      d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
+    }
+
+    // Step 4: GPU factor + initial solve in one command buffer
+    void* cmdBuf = metalCtx.createCommandBuffer();
+    void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+    symCtx.setExternalEncoder(cmdBuf, encoder);
+
+    d.numCtx->reset();
+    d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
+    d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
+                      PivotLocation::Device);
+
+    // Step 5: Iterative refinement with encoder cycling
+    std::fill(d.xAccum.begin(), d.xAccum.end(), 0.0);
+
+    for (int iter = 0; iter < d.maxRefine; iter++) {
+      // Flush GPU results to unified memory
+      symCtx.clearExternalEncoder();
+
+      // Accumulate: x_accum[j] += colScale[j] * xGpu[perm[j]]
+      for (int64_t j = 0; j < n; j++) {
+        d.xAccum[j] += d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
+      }
+
+      // SpMV residual in f64 with ORIGINAL matrix values
+      for (int64_t j = 0; j < n; j++) {
+        int64_t srcRow = d.preproc.rowPerm[j];
+        double sum = 0.0;
+        for (int64_t k = d.csrIndptr[srcRow]; k < d.csrIndptr[srcRow + 1]; k++) {
+          sum += csr_data[k] * d.xAccum[d.csrIndices[k]];
+        }
+        double residual = rhs[srcRow] - sum;
+        d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * residual);
+      }
+
+      // Re-create encoder for GPU correction solve
+      void* newCmdBuf = metalCtx.createCommandBuffer();
+      void* newEncoder = metalCtx.createComputeEncoder(newCmdBuf);
+      symCtx.setExternalEncoder(newCmdBuf, newEncoder);
+
+      d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
+                        PivotLocation::Device);
+    }
+
+    // Flush final GPU results
+    symCtx.clearExternalEncoder();
+
+    // Final accumulate and unpermute to output
+    for (int64_t j = 0; j < n; j++) {
+      x_out[j] = d.xAccum[j] + d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
+    }
+    return;
   }
-#else
-  d.solver->factorLU(d.data.data(), d.pivots.data());
 #endif
 
-  // Step 4: Initial solve — permute RHS, solve, unpermute
+  // CPU fallback path
+  int64_t totalDataSz = d.solver->totalDataSize();
+  std::fill(d.dataCpu.begin(), d.dataCpu.end(), 0.0f);
+  d.solver->loadFromCsr(eqRowPtr.data(), eqColInd.data(), d.blockSizes.data(), sValues.data(),
+                        d.dataCpu.data());
+
+  d.solver->factorLU(d.dataCpu.data(), d.pivotsCpu.data());
+
+  // Initial solve
   std::vector<float> bp(n);
   for (int64_t j = 0; j < n; j++) {
     bp[perm[j]] = float(d.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
   }
+  d.solver->solveLU(d.dataCpu.data(), d.pivotsCpu.data(), bp.data(), n, 1);
 
-#ifdef SPRUX_USE_METAL
-  {
-    MetalMirror<float> dataGpu(d.data);
-    MetalMirror<float> xGpu(bp);
-    d.solver->solveLU(dataGpu.ptr(), d.pivots.data(), xGpu.ptr(), n, 1);
-    xGpu.get(bp);
-  }
-#else
-  d.solver->solveLU(d.data.data(), d.pivots.data(), bp.data(), n, 1);
-#endif
-
-  // Step 5: Unscale initial solution to double
+  // Unscale initial solution
   for (int64_t j = 0; j < n; j++) {
     x_out[j] = d.colScale[j] * double(bp[perm[j]]);
   }
 
-  // Step 6: Iterative refinement — CPU f64 SpMV + GPU f32 correction solve
+  // Iterative refinement on CPU
   for (int iter = 0; iter < d.maxRefine; iter++) {
-    // Compute residual r = b - A*x in f64 with ORIGINAL matrix values
     std::vector<float> rp(n);
     for (int64_t j = 0; j < n; j++) {
       int64_t srcRow = d.preproc.rowPerm[j];
@@ -223,19 +330,8 @@ void SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_
       rp[perm[j]] = float(d.rowScale[j] * residual);
     }
 
-    // Solve for correction in f32
-#ifdef SPRUX_USE_METAL
-    {
-      MetalMirror<float> dataGpu(d.data);
-      MetalMirror<float> xGpu(rp);
-      d.solver->solveLU(dataGpu.ptr(), d.pivots.data(), xGpu.ptr(), n, 1);
-      xGpu.get(rp);
-    }
-#else
-    d.solver->solveLU(d.data.data(), d.pivots.data(), rp.data(), n, 1);
-#endif
+    d.solver->solveLU(d.dataCpu.data(), d.pivotsCpu.data(), rp.data(), n, 1);
 
-    // Apply correction in f64
     for (int64_t j = 0; j < n; j++) {
       x_out[j] += d.colScale[j] * double(rp[perm[j]]);
     }
