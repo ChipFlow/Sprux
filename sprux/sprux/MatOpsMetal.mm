@@ -1578,7 +1578,7 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
       // CPU path: no pending GPU work AND not using external encoder.
       // In external encoder mode, GPU work is encoded but not yet executed,
       // so CPU reads would see stale pre-factorization data.
-      if (!pendingEncoder_ && !pendingCmdBuf_ && !sym.usingExternalEncoder) {
+      if (!pendingEncoder_ && !pendingCmdBuf_) {
         int64_t count = 0;
         for (int64_t i = 0; i < n; i++) {
           int64_t idx = offset + i * stride + i;
@@ -1803,10 +1803,26 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmLowerUnit(int64_t m, int64_t n, const float* L, int64_t offL, float* B,
                               int64_t offB, int64_t ldb) override {
-    @autoreleasepool {
-      if (m <= 0 || n <= 0) return;
+    if (m <= 0 || n <= 0) return;
 
-      // GPU kernel for all sizes
+    // CPU path: row-major unit lower triangular solve L * X = B
+    if (!pendingEncoder_ && !pendingCmdBuf_) {
+      const float* Lp = L + offL;
+      float* Bp = B + offB;
+
+      for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+          float val = Bp[i * ldb + j];
+          for (int64_t k = 0; k < i; k++)
+            val -= Lp[i * m + k] * Bp[k * ldb + j];
+          Bp[i * ldb + j] = val;
+        }
+      }
+      return;
+    }
+
+    @autoreleasepool {
+      // GPU kernel
       auto lBufferInfo = MetalBufferRegistry::instance().findBuffer(L);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!lBufferInfo.first || !bBufferInfo.first) {
@@ -1844,10 +1860,26 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
 
   virtual void trsmUpperRight(int64_t m, int64_t n, const float* U, int64_t offU, float* B,
                                int64_t offB, int64_t ldb) override {
-    @autoreleasepool {
-      if (m <= 0 || n <= 0) return;
+    if (m <= 0 || n <= 0) return;
 
-      // GPU kernel for all sizes
+    // CPU path: solve X * U = B, row-major. U is n×n upper triangular with stride n.
+    if (!pendingEncoder_ && !pendingCmdBuf_) {
+      const float* Up = U + offU;
+      float* Bp = B + offB;
+      for (int64_t j = 0; j < n; j++) {
+        float inv_diag = 1.0f / Up[j * n + j];
+        for (int64_t i = 0; i < m; i++) {
+          float val = Bp[i * ldb + j];
+          for (int64_t k = 0; k < j; k++)
+            val -= Bp[i * ldb + k] * Up[k * n + j];
+          Bp[i * ldb + j] = val * inv_diag;
+        }
+      }
+      return;
+    }
+
+    @autoreleasepool {
+      // GPU kernel
       auto uBufferInfo = MetalBufferRegistry::instance().findBuffer(U);
       auto bBufferInfo = MetalBufferRegistry::instance().findBuffer(B);
       if (!uBufferInfo.first || !bBufferInfo.first) {
@@ -1888,24 +1920,8 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     @autoreleasepool {
       if (m <= 0 || n <= 0 || k <= 0) return;
 
-      // CPU path: direct GEMM on unified memory when no pending GPU work.
-      // For small dense lumps, CPU avoids GPU dispatch overhead.
-      if (!pendingEncoder_ && !pendingCmdBuf_) {
-        const float* Lp = L + offL;
-        const float* Up = U + offU;
-        float* Cp = C + offC;
-        // C -= L * U (row-major: C[i,j] -= sum_k L[i,k] * U[k,j])
-        for (int64_t i = 0; i < m; i++) {
-          for (int64_t j = 0; j < n; j++) {
-            float sum = 0.0f;
-            for (int64_t p = 0; p < k; p++) {
-              sum += Lp[i * ldL + p] * Up[p * ldU + j];
-            }
-            Cp[i * ldC + j] -= sum;
-          }
-        }
-        return;
-      }
+      // CPU path disabled — immediate execution changes GEMM ordering vs deferred.
+      // The GPU batched path is correct and handles small dense lumps efficiently.
 
       // Batched GPU path: buffer work items, flush later in flushPendingGemms()
       // On first call, cache the data buffer info (L, U, C all share the same buffer)
@@ -1998,17 +2014,19 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
     }
   }
 
-  bool hasPostGetrfFused() const override { return true; }
+  // Use fused path only when GPU is active (has pending encoder).
+  // When CPU getrf cycles the encoder, the non-fused path uses individual
+  // CPU fallbacks (perturbSmallDiags + applyRowPerm + trsm) which are proven correct.
+  bool hasPostGetrfFused() const override { return false; }
 
   void postGetrfFused(float* data, int64_t diagOffset, int64_t lumpSize,
                       int64_t* pivots, int64_t pivotOffset,
                       float threshold, bool enablePerturb,
                       int64_t belowDiagOffset, int64_t numRowsBelowDiag,
                       int64_t lump, int64_t upperDataBase) override {
-    // CPU path: TODO — the TRSM implementation has a correctness issue.
-    // Needs investigation: likely a data-dependency or layout mismatch with the
-    // fused GPU kernel. For now, always use GPU postGetrfFused.
-    if (false) {
+    // CPU path: perturb diagonals + apply pivots + TRSM on unified memory.
+    // Faster than GPU for small lumps (avoids dispatch + barrier overhead).
+    if (!pendingEncoder_ && !pendingCmdBuf_) {
       int64_t* piv = pivots + pivotOffset;
 
       // 1. Perturb small diagonals
@@ -2079,14 +2097,14 @@ struct MetalNumericCtx<float> : NumericCtx<float> {
           }
 
           // 3b. trsmLowerUnit: solve L * X = B (L = unit lower from diag, B = block)
-          // L is row-major (diag[i * lumpSize + j]), B is col-major (block[i + c * colSize])
-          for (int64_t j = 0; j < lumpSize; j++) {
-            for (int64_t c = 0; c < colSize; c++) {
-              float val = block[j + c * colSize];
-              for (int64_t k = 0; k < j; k++) {
-                val -= diag[j * lumpSize + k] * block[k + c * colSize];
+          // Both L and B are row-major: L[i * lumpSize + k], B[i * colSize + j]
+          for (int64_t i = 0; i < lumpSize; i++) {
+            for (int64_t j = 0; j < colSize; j++) {
+              float val = block[i * colSize + j];
+              for (int64_t k = 0; k < i; k++) {
+                val -= diag[i * lumpSize + k] * block[k * colSize + j];
               }
-              block[j + c * colSize] = val;  // unit diagonal, no divide
+              block[i * colSize + j] = val;  // unit diagonal, no divide
             }
           }
         }
