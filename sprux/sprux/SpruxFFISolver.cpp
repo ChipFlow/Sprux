@@ -27,6 +27,19 @@
 #include "sprux/sprux/MetalDefs.h"
 #endif
 
+#ifdef __APPLE__
+#include <os/signpost.h>
+static os_log_t sprux_signpost_log() {
+  static os_log_t log = os_log_create("com.chipflow.sprux", "SpruxFFISolver");
+  return log;
+}
+#define SPRUX_SIGNPOST_BEGIN(name) os_signpost_interval_begin(sprux_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+#define SPRUX_SIGNPOST_END(name) os_signpost_interval_end(sprux_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, name)
+#else
+#define SPRUX_SIGNPOST_BEGIN(name)
+#define SPRUX_SIGNPOST_END(name)
+#endif
+
 namespace Sprux {
 
 struct SpruxFFISolver::Impl {
@@ -292,8 +305,10 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
   const auto& perm = *d.perm;
 
   // Step 1: Per-matrix equilibration (fresh scales, matching lu_bench)
+  SPRUX_SIGNPOST_BEGIN("equilibrate");
   computeEquilibrationFromOrigCsr(n, d.csrIndptr.data(), d.csrIndices.data(), csr_data,
                                   d.preproc.rowPerm.data(), d.rowScale, d.colScale);
+  SPRUX_SIGNPOST_END("equilibrate");
 
 #ifdef SPRUX_USE_METAL
   if (d.useMetal) {
@@ -302,18 +317,23 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
     int64_t totalDataSz = d.solver->totalDataSize();
 
     // Step 2: Scatter equilibrated values directly into GPU buffer
+    SPRUX_SIGNPOST_BEGIN("scatter");
     std::memset(d.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
     scatterEquilibratedValues(n, d.nnz, d.csrIndptr.data(), d.csrIndices.data(),
                               csr_data, d.preproc.rowPerm.data(),
                               d.rowScale.data(), d.colScale.data(),
                               d.csrToDataMap.data(), d.dataGpu.ptr());
+    SPRUX_SIGNPOST_END("scatter");
 
     // Step 3: Permute RHS into persistent GPU buffer
+    SPRUX_SIGNPOST_BEGIN("permute_rhs");
     for (int64_t j = 0; j < n; j++) {
       d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
     }
+    SPRUX_SIGNPOST_END("permute_rhs");
 
     // Step 4: GPU factor + initial solve in one command buffer
+    SPRUX_SIGNPOST_BEGIN("gpu_factor_solve");
     void* cmdBuf = metalCtx.createCommandBuffer();
     void* encoder = metalCtx.createComputeEncoder(cmdBuf);
     symCtx.setExternalEncoder(cmdBuf, encoder);
@@ -322,6 +342,7 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
     d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
     d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
                       PivotLocation::Device);
+    SPRUX_SIGNPOST_END("gpu_factor_solve");
 
     // Step 5: Iterative refinement with encoder cycling and early termination.
     // Each iteration: flush GPU → CPU accumulate + SpMV residual → check convergence → GPU solve.
@@ -332,8 +353,11 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
 
     int itersUsed = 0;
     for (int iter = 0; iter < d.maxRefine; iter++) {
+      SPRUX_SIGNPOST_BEGIN("refine_flush");
       symCtx.clearExternalEncoder();
+      SPRUX_SIGNPOST_END("refine_flush");
 
+      SPRUX_SIGNPOST_BEGIN("refine_cpu_spmv");
       for (int64_t j = 0; j < n; j++) {
         d.xAccum[j] += d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
       }
@@ -349,6 +373,7 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
         resNormSq += residual * residual;
         d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * residual);
       }
+      SPRUX_SIGNPOST_END("refine_cpu_spmv");
       itersUsed = iter + 1;
 
       // Early termination: skip GPU solve if residual is below tolerance
@@ -356,15 +381,19 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
         break;
       }
 
+      SPRUX_SIGNPOST_BEGIN("refine_gpu_solve");
       void* newCmdBuf = metalCtx.createCommandBuffer();
       void* newEncoder = metalCtx.createComputeEncoder(newCmdBuf);
       symCtx.setExternalEncoder(newCmdBuf, newEncoder);
 
       d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
                         PivotLocation::Device);
+      SPRUX_SIGNPOST_END("refine_gpu_solve");
     }
 
+    SPRUX_SIGNPOST_BEGIN("final_flush");
     symCtx.clearExternalEncoder();
+    SPRUX_SIGNPOST_END("final_flush");
 
     for (int64_t j = 0; j < n; j++) {
       x_out[j] = d.xAccum[j] + d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
