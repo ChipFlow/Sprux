@@ -81,13 +81,6 @@ struct NumericCtxBase {
   // Default: no-op (CPU backends don't have deferred pivot copies).
   virtual void flushDevicePivots(int64_t* devDstPivots) { (void)devDstPivots; }
 
-  // Recording mode: run factorLU with GPU operations as no-ops to capture
-  // all GemmWorkItem data and flush-point boundaries. The recorded data is
-  // structure-dependent only (never changes between NR iterations), so it can
-  // be pre-uploaded to device and reused across all subsequent factorizations.
-  // This eliminates per-lump CPU→GPU transfers during CUDA graph capture/replay.
-  virtual void beginRecording() {}
-  virtual void endRecording() {}
 };
 
 struct SolveCtxBase {

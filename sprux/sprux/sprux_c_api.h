@@ -149,7 +149,7 @@ typedef struct sprux_ffi_solver* sprux_ffi_solver_t;
  * Create an FFI solver for a given sparsity pattern.
  *
  * Performs one-time setup: BTF max transversal, symmetric structure,
- * solver creation with auto-computed pivot threshold, recording pass,
+ * solver creation with auto-computed pivot threshold,
  * and MPS shader warmup (Metal) or CPU BLAS setup.
  *
  * @param n               Matrix dimension (n x n)

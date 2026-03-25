@@ -17,7 +17,7 @@ namespace Sprux {
  *
  * Encapsulates the full Metal-accelerated LU pipeline:
  *   - One-time setup: BTF max transversal, symmetric structure, solver creation,
- *     recording pass, MPS shader warmup, static pivot threshold
+ *     MPS shader warmup, static pivot threshold
  *   - Per-solve: equilibration, f64→f32 CSR load, GPU factorLU + solveLU
  *     (Metal float32 only), CPU f64 iterative refinement (SpMV residual
  *     with original f64 matrix values), unpermute — recovers near-f64 accuracy
