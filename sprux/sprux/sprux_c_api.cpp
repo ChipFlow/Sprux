@@ -15,6 +15,10 @@
 #include "sprux/sprux/Solver.h"
 #include "sprux/sprux/SpruxFFISolver.h"
 
+#ifdef SPRUX_USE_METAL
+#include "sprux/sprux/MetalDefs.h"
+#endif
+
 using namespace Sprux;
 
 struct sprux_solver {
@@ -191,6 +195,28 @@ int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x,
   } catch (...) {
     return -1;
   }
+}
+
+int sprux_begin_capture(const char* output_path) {
+#ifdef SPRUX_USE_METAL
+  try {
+    return MetalContext::instance().beginCapture(output_path) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+#else
+  (void)output_path;
+  return 0;
+#endif
+}
+
+void sprux_end_capture(void) {
+#ifdef SPRUX_USE_METAL
+  try {
+    MetalContext::instance().endCapture();
+  } catch (...) {
+  }
+#endif
 }
 
 }  // extern "C"

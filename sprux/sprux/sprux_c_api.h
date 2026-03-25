@@ -197,6 +197,20 @@ int sprux_ffi_solve(sprux_ffi_solver_t h, const double* csr_data, const double* 
  */
 int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x, double* b_out);
 
+/**
+ * Begin a GPU trace capture. Writes a .gputrace file for analysis in
+ * Xcode or apple-profiler tools.
+ *
+ * @param output_path  Path for .gputrace output (e.g. "/tmp/sprux.gputrace")
+ * @return 1 if capture started, 0 if not (Metal not available or already capturing)
+ */
+int sprux_begin_capture(const char* output_path);
+
+/**
+ * End a GPU trace capture started with sprux_begin_capture.
+ */
+void sprux_end_capture(void);
+
 #ifdef __cplusplus
 }
 #endif
