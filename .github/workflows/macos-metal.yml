@@ -1,0 +1,172 @@
+name: macOS Metal Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      benchmark_iterations:
+        description: 'Number of benchmark iterations per problem'
+        required: false
+        default: '3'
+      problem_filter:
+        description: 'Regex filter for problems (empty = all)'
+        required: false
+        default: ''
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest-xlarge  # Bare-metal Apple Silicon with GPU access
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Print system info
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        sysctl -n machdep.cpu.brand_string || echo "CPU info not available"
+        system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores"
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+        echo "OpenBLAS installed at: $(brew --prefix openblas)"
+        echo "LLVM installed at: $(brew --prefix llvm)"
+
+    - name: Configure CMake
+      run: |
+        export PATH="$(brew --prefix llvm)/bin:$PATH"
+        export LDFLAGS="-L$(brew --prefix openblas)/lib"
+        export CPPFLAGS="-I$(brew --prefix openblas)/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="$(brew --prefix openblas)"
+
+    - name: Build
+      run: |
+        export PATH="$(brew --prefix llvm)/bin:$PATH"
+        cmake --build build --config "${{ env.BUILD_TYPE }}" -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run all tests (CPU + Metal GPU)
+      run: |
+        ctest --test-dir build --output-on-failure --parallel "$(sysctl -n hw.ncpu)"
+
+  benchmark:
+    runs-on: macos-latest-xlarge  # Bare-metal Apple Silicon with GPU access
+    needs: build-and-test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Print system info
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        sysctl -n machdep.cpu.brand_string || echo "CPU info not available"
+        system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores"
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+        echo "OpenBLAS installed at: $(brew --prefix openblas)"
+        echo "LLVM installed at: $(brew --prefix llvm)"
+
+    - name: Configure CMake
+      run: |
+        export PATH="$(brew --prefix llvm)/bin:$PATH"
+        export LDFLAGS="-L$(brew --prefix openblas)/lib"
+        export CPPFLAGS="-I$(brew --prefix openblas)/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="$(brew --prefix openblas)"
+
+    - name: Build
+      run: |
+        export PATH="$(brew --prefix llvm)/bin:$PATH"
+        cmake --build build --config "${{ env.BUILD_TYPE }}" -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run Performance Benchmarks
+      run: |
+        mkdir -p benchmark_results
+        cd benchmark_results
+
+        # Set benchmark parameters
+        ITERATIONS="${{ github.event.inputs.benchmark_iterations || '3' }}"
+        PROBLEM_FILTER="${{ github.event.inputs.problem_filter || '' }}"
+
+        echo "=== Running Sprux Benchmarks ===" | tee benchmark_output.txt
+        echo "Iterations per problem: $ITERATIONS" | tee -a benchmark_output.txt
+        echo "Date: $(date)" | tee -a benchmark_output.txt
+        echo "" | tee -a benchmark_output.txt
+
+        # Run CPU baseline benchmark
+        echo "=== CPU Baseline (BLAS) ===" | tee -a benchmark_output.txt
+        if [ -n "$PROBLEM_FILTER" ]; then
+          ../build/sprux/benchmarking/bench -S "BLAS" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
+        else
+          ../build/sprux/benchmarking/bench -S "BLAS" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt
+        fi
+
+        # Run Metal GPU benchmark
+        echo "" | tee -a benchmark_output.txt
+        echo "=== Metal GPU ===" | tee -a benchmark_output.txt
+        if [ -n "$PROBLEM_FILTER" ]; then
+          ../build/sprux/benchmarking/bench -S "Metal" -R "$PROBLEM_FILTER" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
+        else
+          ../build/sprux/benchmarking/bench -S "Metal" -n $ITERATIONS 2>&1 | tee -a benchmark_output.txt || echo "Metal benchmark failed" | tee -a benchmark_output.txt
+        fi
+
+    - name: Upload Benchmark Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-${{ github.sha }}
+        path: benchmark_results/
+        retention-days: 30
+
+    - name: Post Benchmark Summary
+      run: |
+        {
+          echo "## Benchmark Results"
+          echo ""
+          echo "### System Info"
+          echo "- Runner: macos-latest-xlarge (Apple Silicon)"
+          echo "- Chip: $(system_profiler SPHardwareDataType | grep 'Chip' | cut -d':' -f2 | xargs)"
+          echo "- Memory: $(system_profiler SPHardwareDataType | grep 'Memory' | cut -d':' -f2 | xargs)"
+          echo ""
+          echo "### Results"
+          echo "\`\`\`"
+          cat benchmark_results/benchmark_output.txt
+          echo "\`\`\`"
+        } >> "$GITHUB_STEP_SUMMARY"

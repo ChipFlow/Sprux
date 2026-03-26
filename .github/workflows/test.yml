@@ -1,0 +1,198 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main, metal-backend]
+  pull_request:
+    branches: [main, metal-backend]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # Linux CPU-only build and tests
+  linux-cpu:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libopenblas-dev cmake build-essential
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Run Tests
+      run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+    - name: Scipy cross-validation (CPU)
+      run: |
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+
+  # Linux with OpenCL (CPU backend via pocl)
+  linux-opencl:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libopenblas-dev cmake build-essential \
+          opencl-headers ocl-icd-opencl-dev pocl-opencl-icd libclblast-dev
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=ON \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=OFF
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Run Tests (OpenCL via PoCL CPU backend)
+      run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+  # macOS with Metal GPU tests
+  macos-metal:
+    runs-on: macos-latest-xlarge  # Bare-metal Apple Silicon with GPU access
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+
+    - name: Configure CMake
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        OPENBLAS_PREFIX="$(brew --prefix openblas)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        export LDFLAGS="-L${OPENBLAS_PREFIX}/lib"
+        export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
+
+    - name: Build
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run all tests (CPU + Metal GPU)
+      run: ctest --test-dir build --output-on-failure -j"$(sysctl -n hw.ncpu)"
+
+    - name: Scipy cross-validation (CPU + Metal)
+      run: |
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary MetalSequenceSolveTest
+
+  # CUDA GPU tests on self-hosted NVIDIA runner
+  cuda-gpu:
+    runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      options: --gpus all
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev python3-pip
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA ==="
+        nvcc --version
+        echo "=== CMake ==="
+        cmake --version
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Run all tests
+      run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+    - name: Scipy cross-validation (CPU + CUDA)
+      run: |
+        apt-get install -y -qq python3-venv
+        python3 -m venv .venv
+        .venv/bin/pip install --quiet scipy numpy
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary SequenceSolveTest
+        .venv/bin/python tests/scipy_ring_comparison.py --build-dir build --test-binary CudaSequenceSolveTest

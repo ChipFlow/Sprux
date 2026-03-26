@@ -1,0 +1,92 @@
+name: GPU Tests (Metal)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  metal-gpu:
+    runs-on: macos-latest-xlarge  # Bare-metal Apple Silicon with GPU access
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: System info
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        sysctl -n machdep.cpu.brand_string || true
+        system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores" || true
+        echo ""
+        echo "=== Metal Device ==="
+        system_profiler SPDisplaysDataType | grep -E "Chipset|Metal|VRAM" || true
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+
+    - name: Configure CMake
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        OPENBLAS_PREFIX="$(brew --prefix openblas)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        export LDFLAGS="-L${OPENBLAS_PREFIX}/lib"
+        export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
+
+    - name: Build
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run all tests (CPU + Metal GPU)
+      run: |
+        ctest --test-dir build --output-on-failure -j"$(sysctl -n hw.ncpu)"
+
+    - name: Run benchmarks
+      run: |
+        echo "=== CPU Baseline (BLAS) ==="
+        ./build/sprux/benchmarking/bench -S "BLAS" -n 3 2>&1 || true
+        echo ""
+        echo "=== Metal GPU ==="
+        ./build/sprux/benchmarking/bench -S "Metal" -n 3 2>&1 || true
+
+    - name: Summary
+      if: always()
+      run: |
+        {
+          echo "## Metal GPU Test Results"
+          echo ""
+          echo "- **Commit:** \`${{ github.sha }}\`"
+          echo "- **Runner:** macos-latest-xlarge (Apple Silicon)"
+          echo "- **Chip:** $(system_profiler SPHardwareDataType | grep 'Chip' | cut -d':' -f2 | xargs || echo unknown)"
+          echo ""
+          if [ "${{ job.status }}" = "success" ]; then
+            echo ":white_check_mark: All tests passed (CPU + Metal GPU)"
+          else
+            echo ":x: Tests failed"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

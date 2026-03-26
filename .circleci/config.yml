@@ -95,7 +95,7 @@ setup_project_nocuda: &setup_project_nocuda
       name: Setting up project (without Cuda)
       working_directory: ~/project
       command: |
-        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBASPACHO_USE_CUBLAS=0
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSPRUX_USE_CUBLAS=0
 
 build_project: &build_project
   - run:

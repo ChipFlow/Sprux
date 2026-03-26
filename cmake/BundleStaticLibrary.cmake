@@ -77,7 +77,9 @@ function(bundle_static_library tgt_name bundled_tgt_name)
       if (LLVM_AR)
         set(ar_tool "${LLVM_AR}")
       else()
-        message(FATAL_ERROR "llvm-ar not found!")
+        message(FATAL_ERROR
+          "llvm-ar not found! Apple's ar does not support MRI scripts (-M).\n"
+          "Install llvm-ar via: brew install llvm && sudo ln -sf $(brew --prefix llvm)/bin/llvm-ar /usr/local/bin/llvm-ar")
       endif()
     endif()
 
@@ -105,7 +107,7 @@ function(bundle_static_library tgt_name bundled_tgt_name)
   add_custom_target(bundling_target ALL DEPENDS ${bundled_tgt_full_name})
   add_dependencies(bundling_target ${tgt_name})
 
-  add_library(${bundled_tgt_name} STATIC IMPORTED)
+  add_library(${bundled_tgt_name} STATIC IMPORTED GLOBAL)
   set_target_properties(${bundled_tgt_name} 
     PROPERTIES 
       IMPORTED_LOCATION ${bundled_tgt_full_name}

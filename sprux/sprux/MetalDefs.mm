@@ -1,0 +1,412 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+// Copyright (c) Robert Taylor, 2026. All rights reserved.
+// Licensed under the MIT license found in the LICENSE file.
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+
+#include "sprux/sprux/MetalDefs.h"
+
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
+
+namespace Sprux {
+
+// Implementation class for MetalContext - holds Objective-C objects
+class MetalContextImpl {
+ public:
+  id<MTLDevice> device;
+  id<MTLCommandQueue> commandQueue;    // Primary queue for solve/factor
+  id<MTLCommandQueue> asyncQueue;      // Async queue for pipelined sparse elim
+  id<MTLLibrary> library;
+  std::unordered_map<std::string, id<MTLComputePipelineState>> pipelineCache;
+  std::mutex pipelineMutex;
+
+  MetalContextImpl() {
+    @autoreleasepool {
+      // Get the default Metal device
+      device = MTLCreateSystemDefaultDevice();
+      mtlCHECK(device != nil, "Failed to create Metal device");
+
+      // Create primary command queue (for main solve/factor work)
+      commandQueue = [device newCommandQueue];
+      mtlCHECK(commandQueue != nil, "Failed to create Metal command queue");
+
+      // Create async command queue (for pipelined sparse elimination)
+      asyncQueue = [device newCommandQueue];
+      mtlCHECK(asyncQueue != nil, "Failed to create Metal async command queue");
+
+      // Load the compiled shader library.
+      // Priority: SPRUX_METALLIB_PATH env var > compiled-in path > default library.
+      NSError* error = nil;
+      const char* envPath = getenv("SPRUX_METALLIB_PATH");
+      if (envPath) {
+        NSString* libraryPath = [NSString stringWithUTF8String:envPath];
+        NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
+        library = [device newLibraryWithURL:libraryURL error:&error];
+        if (error != nil) {
+          NSLog(@"Failed to load Metal library from env SPRUX_METALLIB_PATH=%@: %@",
+                libraryPath, error);
+        }
+      }
+#ifdef SPRUX_METAL_LIBRARY_PATH
+      if (library == nil) {
+        error = nil;
+        NSString* libraryPath = @SPRUX_METAL_LIBRARY_PATH;
+        NSURL* libraryURL = [NSURL fileURLWithPath:libraryPath];
+        library = [device newLibraryWithURL:libraryURL error:&error];
+        if (error != nil) {
+          NSLog(@"Failed to load Metal library from %@: %@", libraryPath, error);
+        }
+      }
+#endif
+      if (library == nil) {
+        library = [device newDefaultLibrary];
+      }
+      mtlCHECK(library != nil, "Failed to load Metal shader library");
+
+      NSLog(@"Metal initialized: %@", device.name);
+    }
+  }
+
+  ~MetalContextImpl() {
+    @autoreleasepool {
+      pipelineCache.clear();
+      library = nil;
+      asyncQueue = nil;
+      commandQueue = nil;
+      device = nil;
+    }
+  }
+
+  id<MTLComputePipelineState> getPipelineState(const char* functionName) {
+    std::string name(functionName);
+
+    std::lock_guard<std::mutex> lock(pipelineMutex);
+
+    auto it = pipelineCache.find(name);
+    if (it != pipelineCache.end()) {
+      return it->second;
+    }
+
+    @autoreleasepool {
+      NSError* error = nil;
+      NSString* nsName = [NSString stringWithUTF8String:functionName];
+      id<MTLFunction> function = [library newFunctionWithName:nsName];
+      if (function == nil) {
+        NSLog(@"Failed to find Metal function: %@", nsName);
+        // List available functions for debugging
+        NSArray<NSString*>* names = [library functionNames];
+        NSLog(@"Available functions in library (%lu):", (unsigned long)[names count]);
+        for (NSString* n in names) {
+          NSLog(@"  %@", n);
+        }
+      }
+      mtlCHECK(function != nil, "Failed to find Metal function");
+
+      id<MTLComputePipelineState> pipeline =
+          [device newComputePipelineStateWithFunction:function error:&error];
+      mtlCHECK(pipeline != nil && error == nil, "Failed to create compute pipeline");
+
+      pipelineCache[name] = pipeline;
+      return pipeline;
+    }
+  }
+};
+
+// MetalContext singleton implementation
+MetalContext& MetalContext::instance() {
+  static MetalContext ctx;
+  return ctx;
+}
+
+MetalContext::MetalContext() { impl = new MetalContextImpl(); }
+
+MetalContext::~MetalContext() { delete impl; }
+
+void* MetalContext::device() { return (__bridge void*)impl->device; }
+
+void* MetalContext::commandQueue() { return (__bridge void*)impl->commandQueue; }
+
+void* MetalContext::asyncQueue() { return (__bridge void*)impl->asyncQueue; }
+
+void* MetalContext::library() { return (__bridge void*)impl->library; }
+
+void MetalContext::synchronize() {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+  }
+}
+
+void* MetalContext::getPipelineState(const char* functionName) {
+  return (__bridge void*)impl->getPipelineState(functionName);
+}
+
+void* MetalContext::createCommandBuffer() {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cmdBuf = [impl->commandQueue commandBuffer];
+    return (__bridge_retained void*)cmdBuf;
+  }
+}
+
+void* MetalContext::createComputeEncoder(void* cmdBuf) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cmdBuf;
+    id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+    return (__bridge_retained void*)encoder;
+  }
+}
+
+void MetalContext::endEncoding(void* encoder) {
+  @autoreleasepool {
+    id<MTLComputeCommandEncoder> enc = (__bridge_transfer id<MTLComputeCommandEncoder>)encoder;
+    [enc endEncoding];
+  }
+}
+
+void MetalContext::commitAndWait(void* cmdBuf) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>)cmdBuf;
+    [cb commit];
+    [cb waitUntilCompleted];
+  }
+}
+
+void MetalContext::setPipelineState(void* encoder, void* pipelineState) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipelineState;
+  [enc setComputePipelineState:pso];
+}
+
+void MetalContext::setBuffer(void* encoder, void* buffer, int index) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
+  [enc setBuffer:buf offset:0 atIndex:index];
+}
+
+void MetalContext::setBytes(void* encoder, const void* data, size_t length, int index) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  [enc setBytes:data length:length atIndex:index];
+}
+
+void MetalContext::dispatchThreads(void* encoder, void* pipelineState, int numThreads) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipelineState;
+  NSUInteger threadGroupSize = MIN(pso.maxTotalThreadsPerThreadgroup, 256);
+  threadGroupSize = MIN(threadGroupSize, (NSUInteger)numThreads);
+  MTLSize threadsPerGroup = MTLSizeMake(threadGroupSize, 1, 1);
+  MTLSize numGroups = MTLSizeMake(((NSUInteger)numThreads + threadGroupSize - 1) / threadGroupSize, 1, 1);
+  [enc dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+}
+
+void MetalContext::memoryBarrier(void* encoder) {
+  id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+  [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+bool MetalContext::beginCapture(const char* outputPath) {
+  @autoreleasepool {
+    MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];
+    if (![captureManager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+      NSLog(@"Metal capture to GPU trace document not supported. "
+            @"Set METAL_CAPTURE_ENABLED=1 environment variable before launching.");
+      return false;
+    }
+
+    // Remove existing trace file if present
+    NSString* path = [NSString stringWithUTF8String:outputPath];
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+
+    MTLCaptureDescriptor* descriptor = [[MTLCaptureDescriptor alloc] init];
+    descriptor.captureObject = impl->device;
+    descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+    descriptor.outputURL = [NSURL fileURLWithPath:path];
+
+    NSError* error = nil;
+    if (![captureManager startCaptureWithDescriptor:descriptor error:&error]) {
+      NSLog(@"Failed to start Metal capture: %@", error);
+      return false;
+    }
+    NSLog(@"Metal GPU capture started → %s", outputPath);
+    return true;
+  }
+}
+
+void MetalContext::endCapture() {
+  @autoreleasepool {
+    MTLCaptureManager* captureManager = [MTLCaptureManager sharedCaptureManager];
+    if ([captureManager isCapturing]) {
+      [captureManager stopCapture];
+      NSLog(@"Metal GPU capture stopped");
+    }
+  }
+}
+
+bool MetalContext::beginCaptureIfRequested(const char* outputPath) {
+  const char* val = getenv("SPRUX_GPU_CAPTURE");
+  if (val && std::string(val) == "1") {
+    return beginCapture(outputPath);
+  }
+  return false;
+}
+
+void MetalContext::endCaptureIfActive() {
+  endCapture();  // endCapture already checks isCapturing
+}
+
+// MetalMirror template implementation
+template <typename T>
+void MetalMirror<T>::clear() {
+  @autoreleasepool {
+    if (buffer_) {
+      // Unregister from buffer registry
+      MetalBufferRegistry::instance().unregisterBuffer(ptr_);
+      // Release the buffer by setting to nil (ARC handles release)
+      id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buffer_;
+      buf = nil;
+      buffer_ = nullptr;
+      ptr_ = nullptr;
+      allocSize_ = 0;
+    }
+  }
+}
+
+template <typename T>
+void MetalMirror<T>::resizeToAtLeast(size_t size) {
+  if (allocSize_ < size) {
+    clear();
+  }
+  if (!buffer_ && size > 0) {
+    @autoreleasepool {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)MetalContext::instance().device();
+      // Use shared storage mode for CPU/GPU access
+      id<MTLBuffer> buf = [device newBufferWithLength:size * sizeof(T)
+                                              options:MTLResourceStorageModeShared];
+      CHECK_METAL_ALLOCATION(buf, size * sizeof(T));
+      buffer_ = (__bridge_retained void*)buf;
+      ptr_ = static_cast<T*>([buf contents]);
+      allocSize_ = size;
+      // Register with buffer registry for MPS operations
+      MetalBufferRegistry::instance().registerBuffer(ptr_, buffer_, size * sizeof(T));
+    }
+  }
+}
+
+template <typename T>
+void MetalMirror<T>::load(const std::vector<T>& vec) {
+  if (vec.empty()) {
+    return;
+  }
+  resizeToAtLeast(vec.size());
+  // Copy data to shared buffer (directly accessible from CPU)
+  memcpy(ptr_, vec.data(), vec.size() * sizeof(T));
+}
+
+template <typename T>
+void MetalMirror<T>::get(std::vector<T>& vec) const {
+  if (!ptr_ || vec.empty()) {
+    return;
+  }
+  // Copy data from shared buffer (directly accessible from CPU)
+  memcpy(vec.data(), ptr_, vec.size() * sizeof(T));
+}
+
+// MetalPtrMirror template implementation
+template <typename T>
+void MetalPtrMirror<T>::clear() {
+  @autoreleasepool {
+    if (buffer_) {
+      id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buffer_;
+      buf = nil;
+      buffer_ = nullptr;
+      ptr_ = nullptr;
+      allocSize_ = 0;
+    }
+  }
+}
+
+template <typename T>
+void MetalPtrMirror<T>::load(const std::vector<T*>& vec, int64_t offset) {
+  if (vec.empty()) {
+    return;
+  }
+
+  if (allocSize_ < vec.size()) {
+    clear();
+  }
+
+  @autoreleasepool {
+    if (!buffer_) {
+      id<MTLDevice> device = (__bridge id<MTLDevice>)MetalContext::instance().device();
+      id<MTLBuffer> buf = [device newBufferWithLength:vec.size() * sizeof(T*)
+                                              options:MTLResourceStorageModeShared];
+      CHECK_METAL_ALLOCATION(buf, vec.size() * sizeof(T*));
+      buffer_ = (__bridge_retained void*)buf;
+      ptr_ = static_cast<T**>([buf contents]);
+      allocSize_ = vec.size();
+    }
+
+    // Copy pointers with offset applied
+    for (size_t i = 0; i < vec.size(); i++) {
+      ptr_[i] = vec[i] + offset;
+    }
+  }
+}
+
+// Explicit template instantiations
+template class MetalMirror<float>;
+template class MetalMirror<double>;
+template class MetalMirror<int64_t>;
+template class MetalMirror<int32_t>;
+template class MetalMirror<uint32_t>;
+
+template class MetalPtrMirror<float>;
+template class MetalPtrMirror<double>;
+
+// MetalBufferRegistry implementation
+MetalBufferRegistry& MetalBufferRegistry::instance() {
+  static MetalBufferRegistry registry;
+  return registry;
+}
+
+void MetalBufferRegistry::registerBuffer(void* ptr, void* buffer, size_t sizeBytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // Remove any existing entry for this pointer
+  buffers_.erase(std::remove_if(buffers_.begin(), buffers_.end(),
+                                [ptr](const BufferInfo& info) { return info.basePtr == ptr; }),
+                 buffers_.end());
+  // Add new entry
+  buffers_.push_back({buffer, ptr, sizeBytes});
+}
+
+void MetalBufferRegistry::unregisterBuffer(void* ptr) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  buffers_.erase(std::remove_if(buffers_.begin(), buffers_.end(),
+                                [ptr](const BufferInfo& info) { return info.basePtr == ptr; }),
+                 buffers_.end());
+}
+
+std::pair<void*, size_t> MetalBufferRegistry::findBuffer(const void* ptr) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const char* charPtr = static_cast<const char*>(ptr);
+
+  for (const auto& info : buffers_) {
+    const char* baseCharPtr = static_cast<const char*>(info.basePtr);
+    if (charPtr >= baseCharPtr && charPtr < baseCharPtr + info.sizeBytes) {
+      size_t offset = static_cast<size_t>(charPtr - baseCharPtr);
+      return {info.buffer, offset};
+    }
+  }
+  return {nullptr, 0};
+}
+
+}  // end namespace Sprux

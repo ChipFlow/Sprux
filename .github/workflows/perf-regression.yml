@@ -1,0 +1,443 @@
+name: Performance Regression Detection
+
+on:
+  push:
+    branches: [main, metal-backend]
+  pull_request:
+    branches: [main, metal-backend]
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Regression threshold (e.g. 0.20 for 20%)'
+        required: false
+        default: '0.20'
+      iterations:
+        description: 'Benchmark iterations per problem'
+        required: false
+        default: '5'
+
+env:
+  BUILD_TYPE: Release
+  THRESHOLD: ${{ inputs.threshold || '0.20' }}
+  ITERATIONS: ${{ inputs.iterations || '5' }}
+
+jobs:
+  perf-macos-metal:
+    runs-on: macos-latest-xlarge
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: System info
+      run: |
+        echo "=== System Info ==="
+        uname -a
+        sysctl -n machdep.cpu.brand_string || true
+        system_profiler SPHardwareDataType | grep -E "Chip|Memory|Cores" || true
+
+    - name: Install dependencies
+      run: |
+        brew install openblas llvm
+
+    - name: Configure CMake
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        OPENBLAS_PREFIX="$(brew --prefix openblas)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        export LDFLAGS="-L${OPENBLAS_PREFIX}/lib"
+        export CPPFLAGS="-I${OPENBLAS_PREFIX}/include"
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=OFF \
+          -DSPRUX_USE_METAL=ON \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON \
+          -DBLA_VENDOR=OpenBLAS \
+          -DCMAKE_PREFIX_PATH="${OPENBLAS_PREFIX}"
+
+    - name: Build
+      run: |
+        LLVM_PREFIX="$(brew --prefix llvm)"
+        export PATH="${LLVM_PREFIX}/bin:$PATH"
+        cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(sysctl -n hw.ncpu)"
+
+    - name: Restore baseline
+      id: baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: baseline.json
+        key: perf-baseline-macOS-ARM64-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-baseline-macOS-ARM64-
+
+    - name: Run benchmarks
+      run: |
+        ./build/sprux/benchmarking/bench -J \
+          -S "Metal|BLAS" \
+          -R "10_FLAT|30_GRID|40_MERI|MTX" \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -O "factor" -n "$ITERATIONS" > results-metal.json
+        echo "=== Results ==="
+        python3 -c "
+        import json
+        with open('results-metal.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare with baseline
+      if: steps.baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py baseline.json results-metal.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-metal.json
+
+    - name: First run notice
+      if: steps.baseline.outputs.cache-hit != 'true'
+      run: |
+        echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Job summary
+      if: always()
+      run: |
+        if [ -f comparison-metal.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-metal.json \
+            --comparison comparison-metal.json \
+            --title "macOS Metal Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-metal.json \
+            --title "macOS Metal Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-macos-metal-${{ github.sha }}
+        path: |
+          results-metal.json
+          comparison-metal.json
+        retention-days: 30
+
+    - name: Save baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-metal.json baseline.json
+
+    - name: Save baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: baseline.json
+        key: perf-baseline-macOS-ARM64-${{ github.sha }}
+
+    # --- LU Benchmarks ---
+
+    - name: Restore LU baseline
+      id: lu-baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-macOS-ARM64-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-lu-baseline-macOS-ARM64-
+
+    - name: Run LU benchmarks
+      run: |
+        ./build/sprux/benchmarking/lu_bench -J \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -r test_data/c6288_jacobian/rhs.mtx \
+          -n "$ITERATIONS" > results-lu-metal.json
+        echo "=== LU Results ==="
+        python3 -c "
+        import json
+        with open('results-lu-metal.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare LU with baseline
+      if: steps.lu-baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py lu-baseline.json results-lu-metal.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-lu-metal.json
+
+    - name: LU job summary
+      if: always()
+      run: |
+        if [ -f comparison-lu-metal.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-lu-metal.json \
+            --comparison comparison-lu-metal.json \
+            --title "macOS Metal LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-lu-metal.json \
+            --title "macOS Metal LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload LU results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-lu-macos-metal-${{ github.sha }}
+        path: |
+          results-lu-metal.json
+          comparison-lu-metal.json
+        retention-days: 30
+
+    - name: Save LU baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-lu-metal.json lu-baseline.json
+
+    - name: Save LU baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-macOS-ARM64-${{ github.sha }}
+
+  perf-cuda:
+    runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      options: --gpus all
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-cuda-
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev python3 cudss-cuda-12
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA Version ==="
+        nvcc --version || echo "nvcc not available"
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=OFF \
+          -DSPRUX_BUILD_EXAMPLES=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} -j"$(nproc)"
+
+    - name: Restore baseline
+      id: baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: baseline.json
+        key: perf-baseline-Linux-X64-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-baseline-Linux-X64-cuda-
+
+    - name: Run benchmarks
+      run: |
+        ./build/sprux/benchmarking/bench -J \
+          -S "CUDA|BLAS|cuDSS" \
+          -R "10_FLAT|30_GRID|40_MERI|MTX" \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -O "factor" -n "$ITERATIONS" > results-cuda.json
+        echo "=== Results ==="
+        python3 -c "
+        import json
+        with open('results-cuda.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare with baseline
+      if: steps.baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py baseline.json results-cuda.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-cuda.json
+
+    - name: First run notice
+      if: steps.baseline.outputs.cache-hit != 'true'
+      run: |
+        echo "No baseline found -- storing initial baseline. Comparison will run on next push."
+
+    - name: Job summary
+      if: always()
+      run: |
+        if [ -f comparison-cuda.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-cuda.json \
+            --comparison comparison-cuda.json \
+            --title "CUDA Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-cuda.json \
+            --title "CUDA Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-cuda-${{ github.sha }}
+        path: |
+          results-cuda.json
+          comparison-cuda.json
+        retention-days: 30
+
+    - name: Save baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-cuda.json baseline.json
+
+    - name: Save baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: baseline.json
+        key: perf-baseline-Linux-X64-cuda-${{ github.sha }}
+
+    # --- LU Benchmarks ---
+
+    - name: Restore LU baseline
+      id: lu-baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-Linux-X64-cuda-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: perf-lu-baseline-Linux-X64-cuda-
+
+    - name: Run LU benchmarks
+      run: |
+        ./build/sprux/benchmarking/lu_bench -J \
+          -i test_data/c6288_jacobian/jacobian.mtx \
+          -r test_data/c6288_jacobian/rhs.mtx \
+          -n "$ITERATIONS" -S "CUDA|CPU|cuDSS" > results-lu-cuda.json
+        echo "=== LU Results ==="
+        python3 -c "
+        import json
+        with open('results-lu-cuda.json') as f:
+            data = json.load(f)
+        for r in data['results']:
+            print(f\"{r['problem']:50s} {r['solver']:25s} {r['operation']:10s} {r['median_sec']:.6f}s\")
+        "
+
+    - name: Compare LU with baseline
+      if: steps.lu-baseline.outputs.cache-hit == 'true'
+      run: |
+        python3 scripts/compare_bench.py lu-baseline.json results-lu-cuda.json --threshold "$THRESHOLD"
+        cp comparison_summary.json comparison-lu-cuda.json
+
+    - name: LU job summary
+      if: always()
+      run: |
+        if [ -f comparison-lu-cuda.json ]; then
+          python3 scripts/summarize_bench.py \
+            --results results-lu-cuda.json \
+            --comparison comparison-lu-cuda.json \
+            --title "CUDA LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        else
+          python3 scripts/summarize_bench.py \
+            --results results-lu-cuda.json \
+            --title "CUDA LU Performance" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload LU results artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: perf-results-lu-cuda-${{ github.sha }}
+        path: |
+          results-lu-cuda.json
+          comparison-lu-cuda.json
+        retention-days: 30
+
+    - name: Save LU baseline
+      if: github.ref == 'refs/heads/main'
+      run: cp results-lu-cuda.json lu-baseline.json
+
+    - name: Save LU baseline cache
+      uses: actions/cache/save@v4
+      if: github.ref == 'refs/heads/main'
+      with:
+        path: lu-baseline.json
+        key: perf-lu-baseline-Linux-X64-cuda-${{ github.sha }}
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [perf-macos-metal, perf-cuda]
+    if: always()
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: scripts/summarize_bench.py
+        sparse-checkout-cone-mode: false
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: perf-results-*
+        merge-multiple: true
+        path: results/
+
+    - name: Post summary
+      env:
+        METAL_STATUS: ${{ needs.perf-macos-metal.result }}
+        CUDA_STATUS: ${{ needs.perf-cuda.result }}
+      run: |
+        python3 -c "
+        import glob, subprocess, sys, os
+
+        metal = os.environ.get('METAL_STATUS', 'skipped')
+        cuda = os.environ.get('CUDA_STATUS', 'skipped')
+        threshold = os.environ.get('THRESHOLD', '0.20')
+
+        icons = {'success': ':white_check_mark: Pass', 'skipped': ':next_track_button: Skipped'}
+
+        lines = [
+            '## Performance Regression Summary', '',
+            '| Platform | Status |',
+            '|----------|--------|',
+            f'| macOS Metal | {icons.get(metal, \":x: Fail\")} |',
+            f'| CUDA | {icons.get(cuda, \":x: Fail\")} |',
+            '', f'Threshold: {threshold} ({float(threshold)*100:.0f}% slowdown)', '',
+        ]
+
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write('\n'.join(lines) + '\n')
+
+        # Collect result and comparison files
+        results = sorted(glob.glob('results/results-*.json'))
+        comparisons = sorted(glob.glob('results/comparison-*.json'))
+
+        if results or comparisons:
+            cmd = [sys.executable, 'scripts/summarize_bench.py', '--title', 'Detailed Results']
+            if results:
+                cmd += ['--results'] + results
+            if comparisons:
+                cmd += ['--comparison'] + comparisons
+            output = subprocess.check_output(cmd, text=True)
+            with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                f.write(output)
+        "

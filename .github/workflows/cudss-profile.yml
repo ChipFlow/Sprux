@@ -1,0 +1,105 @@
+name: cuDSS vs Sprux Profiling
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsys_args:
+        description: 'Extra nsys arguments (e.g. --trace=cuda,nvtx,cublas)'
+        default: ''
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  profile:
+    runs-on: [nvidia-runner-1]
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      options: --gpus all
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache CMake FetchContent dependencies
+      uses: actions/cache@v4
+      with:
+        path: build/_deps
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install build dependencies
+      run: |
+        apt-get update
+        apt-get install -y cmake build-essential libopenblas-dev \
+          nsight-systems-2025.5.2 cudss-cuda-12
+
+    - name: System info
+      run: |
+        echo "=== GPU Info ==="
+        nvidia-smi || echo "nvidia-smi not available"
+        echo "=== CUDA Version ==="
+        nvcc --version || echo "nvcc not available"
+        echo "=== nsys Version ==="
+        nsys --version || echo "nsys not available"
+        echo "=== cuDSS ==="
+        dpkg -l | grep cudss || echo "cuDSS packages not found"
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+          -DSPRUX_USE_CUBLAS=ON \
+          -DSPRUX_USE_METAL=OFF \
+          -DSPRUX_USE_OPENCL=OFF \
+          -DSPRUX_BUILD_TESTS=ON \
+          -DSPRUX_BUILD_EXAMPLES=ON
+
+    - name: Build CudssBenchmarkTest
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} --target CudssBenchmarkTest -j"$(nproc)"
+
+    - name: Run nsys profile
+      run: |
+        export SPRUX_MTX_DIR=test_data/c6288_jacobian
+
+        nsys profile \
+          --trace=cuda,nvtx,osrt \
+          --stats=true \
+          --output /tmp/cudss_vs_sprux \
+          ${{ inputs.nsys_args }} \
+          ./build/sprux/tests/CudssBenchmarkTest
+
+    - name: Generate stats summary
+      run: |
+        echo "## cuDSS vs Sprux Profiling Results" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### NVTX Range Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report nvtxsum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### CUDA Kernel Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudakernsum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### CUDA API Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudaapisum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -60 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### Memory Transfer Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        nsys stats --report cudamemcpysum /tmp/cudss_vs_sprux.nsys-rep 2>&1 | head -40 >> "$GITHUB_STEP_SUMMARY" || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload nsys report
+      uses: actions/upload-artifact@v4
+      with:
+        name: nsys-profile-cudss-vs-sprux
+        path: /tmp/cudss_vs_sprux.nsys-rep
+        retention-days: 30
