@@ -197,6 +197,23 @@ int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x,
   }
 }
 
+int sprux_ffi_begin_solve(sprux_ffi_solver_t h, const double* csr_data, const double* rhs) {
+  try {
+    h->solver->beginSolve(csr_data, rhs);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+int sprux_ffi_end_solve(sprux_ffi_solver_t h, double* x_out) {
+  try {
+    return h->solver->endSolve(x_out);
+  } catch (...) {
+    return -1;
+  }
+}
+
 int sprux_begin_capture(const char* output_path) {
 #ifdef SPRUX_USE_METAL
   try {

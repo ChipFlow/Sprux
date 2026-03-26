@@ -198,6 +198,35 @@ int sprux_ffi_solve(sprux_ffi_solver_t h, const double* csr_data, const double* 
 int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x, double* b_out);
 
 /**
+ * Split-phase solve: submit GPU factor+solve asynchronously.
+ *
+ * CPU preprocessing (equilibrate, scatter) runs immediately, then GPU
+ * factor+solve is submitted and returns without waiting. Call
+ * sprux_ffi_end_solve() to complete refinement and get the result.
+ *
+ * Uses double-buffered GPU slots internally — safe to call beginSolve
+ * for step k+1 before calling endSolve for step k.
+ *
+ * @param h         Solver handle
+ * @param csr_data  CSR non-zero values [nnz], f64
+ * @param rhs       Right-hand side vector [n], f64
+ * @return 0 on success, -1 on error
+ */
+int sprux_ffi_begin_solve(sprux_ffi_solver_t h, const double* csr_data, const double* rhs);
+
+/**
+ * Split-phase solve: wait for GPU and complete iterative refinement.
+ *
+ * Must be called after sprux_ffi_begin_solve(). Waits for GPU completion,
+ * runs CPU f64 iterative refinement, writes result.
+ *
+ * @param h         Solver handle
+ * @param x_out     Solution vector [n], f64 (output)
+ * @return Number of refinement iterations used, or -1 on error
+ */
+int sprux_ffi_end_solve(sprux_ffi_solver_t h, double* x_out);
+
+/**
  * Begin a GPU trace capture. Writes a .gputrace file for analysis in
  * Xcode or apple-profiler tools.
  *
