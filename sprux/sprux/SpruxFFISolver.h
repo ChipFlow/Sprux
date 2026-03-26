@@ -92,6 +92,27 @@ class SpruxFFISolver {
   int endSolve(double* x_out);
 
   /**
+   * Solve with the previously factored matrix (chord Newton).
+   *
+   * Reuses the factored LU data from the most recent solve() or beginSolve()
+   * call. No equilibration, no scatter, no refactorization — just:
+   *   1. Permute RHS by BTF + AMD ordering + cached equilibration scales
+   *   2. GPU solveLU (forward/backward substitution)
+   *   3. CPU f64 iterative refinement
+   *   4. Unpermute result
+   *
+   * For chord Newton: the caller recomputes the residual f with updated
+   * voltages but reuses the Jacobian factorization from the first NR iteration.
+   * The csr_data is still needed for the f64 SpMV in iterative refinement.
+   *
+   * @param csr_data  CSR non-zero values [nnz], f64 (for refinement SpMV)
+   * @param rhs       Right-hand side vector [n], f64
+   * @param x_out     Solution vector [n], f64 (output)
+   * @return Number of refinement iterations performed.
+   */
+  int solveOnly(const double* csr_data, const double* rhs, double* x_out);
+
+  /**
    * Sparse matrix-vector multiply: b_out = A @ x (CPU, f64).
    *
    * Uses the original CSR structure directly (no permutation).

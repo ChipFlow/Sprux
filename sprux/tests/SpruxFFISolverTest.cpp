@@ -223,6 +223,50 @@ TEST(SpruxFFISolver, SmallMatrix) {
   EXPECT_LT(relRes, 1e-5) << "Small matrix solve failed";
 }
 
+// Test: solveOnly() reuses factored data for chord Newton
+TEST(SpruxFFISolver, SolveOnly) {
+  int32_t n = 3, nnz = 7;
+  vector<int32_t> indptr = {0, 2, 5, 7};
+  vector<int32_t> indices = {0, 1, 0, 1, 2, 1, 2};
+  vector<double> data = {4.0, 1.0, 1.0, 3.0, 1.0, 1.0, 4.0};
+
+  SpruxFFISolver solver(n, nnz, indptr.data(), indices.data(), data.data(), 10);
+
+  // First: full solve to establish factorization
+  vector<double> rhs1 = {5.0, 5.0, 5.0};
+  vector<double> x1(n);
+  solver.solve(data.data(), rhs1.data(), x1.data());
+
+  // Now: solveOnly with a different RHS but same matrix (chord Newton scenario)
+  vector<double> rhs2 = {1.0, 2.0, 3.0};
+  vector<double> x2(n);
+  solver.solveOnly(data.data(), rhs2.data(), x2.data());
+
+  // Verify x2 = A^-1 * rhs2
+  double relRes = 0, bNorm = 0;
+  for (int i = 0; i < n; i++) {
+    double Ax_i = 0;
+    for (int k = indptr[i]; k < indptr[i + 1]; k++) {
+      Ax_i += data[k] * x2[indices[k]];
+    }
+    double r = Ax_i - rhs2[i];
+    relRes += r * r;
+    bNorm += rhs2[i] * rhs2[i];
+  }
+  relRes = sqrt(relRes / bNorm);
+  cout << "  solveOnly: x = [" << x2[0] << ", " << x2[1] << ", " << x2[2] << "]" << endl;
+  cout << "  solveOnly: relative residual = " << scientific << setprecision(3) << relRes << endl;
+  EXPECT_LT(relRes, 1e-5) << "solveOnly failed";
+
+  // Also test solveOnly vs fresh solve — should give same result
+  vector<double> x2_ref(n);
+  solver.solve(data.data(), rhs2.data(), x2_ref.data());
+  double maxDiff = 0;
+  for (int i = 0; i < n; i++) maxDiff = max(maxDiff, abs(x2[i] - x2_ref[i]));
+  cout << "  solveOnly vs solve diff: " << scientific << setprecision(3) << maxDiff << endl;
+  EXPECT_LT(maxDiff, 1e-10) << "solveOnly doesn't match solve";
+}
+
 // Test: dot() computes correct SpMV
 TEST(SpruxFFISolver, DotProduct) {
   string dir = findTestDataDir("c6288_sequence");

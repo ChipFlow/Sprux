@@ -198,6 +198,25 @@ int sprux_ffi_solve(sprux_ffi_solver_t h, const double* csr_data, const double* 
 int sprux_ffi_dot(sprux_ffi_solver_t h, const double* csr_data, const double* x, double* b_out);
 
 /**
+ * Solve using the previously factored matrix (chord Newton).
+ *
+ * Reuses the LU factorization from the most recent sprux_ffi_solve() call.
+ * No equilibration, no scatter, no refactorization — just permute RHS,
+ * forward/backward substitution, and iterative refinement.
+ *
+ * For chord Newton: the caller recomputes the residual f with updated
+ * voltages but reuses the Jacobian factorization.
+ *
+ * @param h         Solver handle
+ * @param csr_data  CSR non-zero values [nnz], f64 (needed for refinement SpMV)
+ * @param rhs       Right-hand side vector [n], f64
+ * @param x_out     Solution vector [n], f64 (output)
+ * @return Number of refinement iterations, or -1 on error
+ */
+int sprux_ffi_solve_only(sprux_ffi_solver_t h, const double* csr_data, const double* rhs,
+                         double* x_out);
+
+/**
  * Split-phase solve: submit GPU factor+solve asynchronously.
  *
  * CPU preprocessing (equilibrate, scatter) runs immediately, then GPU

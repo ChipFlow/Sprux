@@ -505,6 +505,132 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
 }
 
 // ---------------------------------------------------------------------------
+// solveOnly(): reuse cached factorization for chord Newton.
+// No equilibrate, no scatter, no factorLU — just permute RHS + solveLU + refine.
+// Uses equilibration scales and factored data from the most recent solve().
+// ---------------------------------------------------------------------------
+
+int SpruxFFISolver::solveOnly(const double* csr_data, const double* rhs, double* x_out) {
+  auto& d = *impl_;
+  const int64_t n = d.n;
+  const auto& perm = *d.perm;
+
+  // Use equilibration scales from the most recent solve() (stored in d.rowScale/colScale
+  // for CPU path, or in the last-used slot for Metal path).
+
+#ifdef SPRUX_USE_METAL
+  if (d.useMetal) {
+    auto& symCtx = d.solver->internalSymbolicContext();
+    auto& metalCtx = MetalContext::instance();
+
+    // The last completed slot has the factored data (solve() calls begin+end, swaps curSlot).
+    int factSlot = 1 - d.curSlot;
+    auto& slot = d.slots[factSlot];
+
+    // Permute RHS using the cached equilibration scales from the factored solve
+    for (int64_t j = 0; j < n; j++) {
+      slot.xGpu.ptr()[perm[j]] = float(slot.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
+    }
+
+    // GPU solve only (no factor) — reuse factored dataGpu + devPivots
+    void* cmdBuf = metalCtx.createCommandBuffer();
+    void* encoder = metalCtx.createComputeEncoder(cmdBuf);
+    symCtx.setExternalEncoder(cmdBuf, encoder);
+
+    d.solver->solveLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), slot.xGpu.ptr(), n, 1,
+                      *d.solveCtx, PivotLocation::Device);
+
+    // Iterative refinement with the NEW csr_data (for accurate f64 SpMV)
+    std::fill(slot.xAccum.begin(), slot.xAccum.end(), 0.0);
+    double bNormSq = 0.0;
+    for (int64_t j = 0; j < n; j++) bNormSq += rhs[j] * rhs[j];
+
+    int itersUsed = 0;
+    for (int iter = 0; iter < d.maxRefine; iter++) {
+      symCtx.clearExternalEncoder();
+
+      for (int64_t j = 0; j < n; j++) {
+        slot.xAccum[j] += slot.colScale[j] * double(slot.xGpu.ptr()[perm[j]]);
+      }
+
+      double resNormSq = 0.0;
+      for (int64_t j = 0; j < n; j++) {
+        int64_t srcRow = d.preproc.rowPerm[j];
+        double sum = 0.0;
+        for (int64_t k = d.csrIndptr[srcRow]; k < d.csrIndptr[srcRow + 1]; k++) {
+          sum += csr_data[k] * slot.xAccum[d.csrIndices[k]];
+        }
+        double residual = rhs[srcRow] - sum;
+        resNormSq += residual * residual;
+        slot.xGpu.ptr()[perm[j]] = float(slot.rowScale[j] * residual);
+      }
+      itersUsed = iter + 1;
+
+      if (d.refineTol > 0 && resNormSq <= d.refineTol * d.refineTol * std::max(bNormSq, 1e-300)) {
+        break;
+      }
+
+      void* newCmdBuf = metalCtx.createCommandBuffer();
+      void* newEncoder = metalCtx.createComputeEncoder(newCmdBuf);
+      symCtx.setExternalEncoder(newCmdBuf, newEncoder);
+
+      d.solver->solveLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), slot.xGpu.ptr(), n, 1,
+                        *d.solveCtx, PivotLocation::Device);
+    }
+
+    symCtx.clearExternalEncoder();
+
+    for (int64_t j = 0; j < n; j++) {
+      x_out[j] = slot.xAccum[j] + slot.colScale[j] * double(slot.xGpu.ptr()[perm[j]]);
+    }
+    return itersUsed;
+  }
+#endif
+
+  // CPU fallback — reuse cached dataCpu + pivotsCpu (from last solve())
+  auto& bp = d.bpCpu;
+  for (int64_t j = 0; j < n; j++) {
+    bp[perm[j]] = float(d.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
+  }
+  d.solver->solveLU(d.dataCpu.data(), d.pivotsCpu.data(), bp.data(), n, 1);
+
+  for (int64_t j = 0; j < n; j++) {
+    x_out[j] = d.colScale[j] * double(bp[perm[j]]);
+  }
+
+  double bNormSq = 0.0;
+  for (int64_t j = 0; j < n; j++) bNormSq += rhs[j] * rhs[j];
+  int itersUsed = 0;
+
+  for (int iter = 0; iter < d.maxRefine; iter++) {
+    std::fill(bp.begin(), bp.end(), 0.0f);
+    double resNormSq = 0.0;
+    for (int64_t j = 0; j < n; j++) {
+      int64_t srcRow = d.preproc.rowPerm[j];
+      double sum = 0.0;
+      for (int64_t k = d.csrIndptr[srcRow]; k < d.csrIndptr[srcRow + 1]; k++) {
+        sum += csr_data[k] * x_out[d.csrIndices[k]];
+      }
+      double residual = rhs[srcRow] - sum;
+      resNormSq += residual * residual;
+      bp[perm[j]] = float(d.rowScale[j] * residual);
+    }
+    itersUsed = iter + 1;
+
+    if (d.refineTol > 0 && resNormSq <= d.refineTol * d.refineTol * std::max(bNormSq, 1e-300)) {
+      break;
+    }
+
+    d.solver->solveLU(d.dataCpu.data(), d.pivotsCpu.data(), bp.data(), n, 1);
+
+    for (int64_t j = 0; j < n; j++) {
+      x_out[j] += d.colScale[j] * double(bp[perm[j]]);
+    }
+  }
+  return itersUsed;
+}
+
+// ---------------------------------------------------------------------------
 // dot(): sparse matrix-vector multiply (CPU, f64, no permutation)
 // ---------------------------------------------------------------------------
 
