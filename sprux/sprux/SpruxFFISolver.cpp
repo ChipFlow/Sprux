@@ -74,9 +74,22 @@ struct SpruxFFISolver::Impl {
   bool useMetal = false;
 
 #ifdef SPRUX_USE_METAL
-  MetalMirror<float> dataGpu;
-  MetalMirror<float> xGpu;
-  MetalMirror<int64_t> devPivots;
+  // Double-buffered GPU resources for pipelined batch processing.
+  // slot[cur] is being factored, slot[prev] is being refined.
+  struct PipelineSlot {
+    MetalMirror<float> dataGpu;
+    MetalMirror<float> xGpu;
+    MetalMirror<int64_t> devPivots;
+    std::vector<double> rowScale;
+    std::vector<double> colScale;
+    std::vector<double> xAccum;
+    const double* csrData = nullptr;   // pointer to caller's CSR data (for SpMV refine)
+    const double* rhs = nullptr;       // pointer to caller's RHS (for SpMV refine)
+    bool active = false;               // has pending GPU work
+  };
+  PipelineSlot slots[2];
+  int curSlot = 0;
+
   NumericCtxPtr<float> numCtx;
   SolveCtxPtr<float> solveCtx;
 #endif
@@ -264,9 +277,15 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
     auto& symCtx = d.solver->internalSymbolicContext();
     symCtx.disableAllStats();
 
-    d.dataGpu.resizeToAtLeast(totalDataSz);
-    d.xGpu.resizeToAtLeast(n);
-    d.devPivots.resizeToAtLeast(n);
+    // Initialize both pipeline slots
+    for (int s = 0; s < 2; s++) {
+      d.slots[s].dataGpu.resizeToAtLeast(totalDataSz);
+      d.slots[s].xGpu.resizeToAtLeast(n);
+      d.slots[s].devPivots.resizeToAtLeast(n);
+      d.slots[s].rowScale.resize(n);
+      d.slots[s].colScale.resize(n);
+      d.slots[s].xAccum.resize(n, 0.0);
+    }
 
     d.numCtx = symCtx.createNumericCtx<float>(0, static_cast<float*>(nullptr));
     d.numCtx->preAllocateForLU(1, n);
@@ -274,14 +293,15 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
 
     // Warmup with valid data (forces MPS shader JIT compilation)
     {
-      std::memset(d.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+      auto& slot = d.slots[0];
+      std::memset(slot.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
       scatterEquilibratedValues(n, nnz, d.csrIndptr.data(), d.csrIndices.data(),
                                 csr_data_init, d.preproc.rowPerm.data(),
                                 d.rowScale.data(), d.colScale.data(),
-                                d.csrToDataMap.data(), d.dataGpu.ptr());
+                                d.csrToDataMap.data(), slot.dataGpu.ptr());
 
       d.numCtx->reset();
-      d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
+      d.solver->factorLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
       d.numCtx->flush();
     }
   }
@@ -296,72 +316,87 @@ SpruxFFISolver::SpruxFFISolver(int32_t n, int32_t nnz, const int32_t* csr_indptr
 SpruxFFISolver::~SpruxFFISolver() = default;
 
 // ---------------------------------------------------------------------------
-// solve(): per-NR-iteration — equilibrate, scatter, factor, solve, refine
-// Matches lu_bench's benchmarkLUMetalFFI: per-matrix equilibration with
-// pre-computed CSR→coalesced scatter map (no loadFromCsr).
+// beginSolve(): submit GPU factor + initial solve (non-blocking).
 // ---------------------------------------------------------------------------
 
-int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_out) {
+void SpruxFFISolver::beginSolve(const double* csr_data, const double* rhs) {
   auto& d = *impl_;
   const int64_t n = d.n;
   const auto& perm = *d.perm;
-
-  // Step 1: Per-matrix equilibration (fresh scales, matching lu_bench)
-  SPRUX_FFI_SIGNPOST_BEGIN("equilibrate");
-  computeEquilibrationFromOrigCsr(n, d.csrIndptr.data(), d.csrIndices.data(), csr_data,
-                                  d.preproc.rowPerm.data(), d.rowScale, d.colScale);
-  SPRUX_FFI_SIGNPOST_END("equilibrate");
 
 #ifdef SPRUX_USE_METAL
   if (d.useMetal) {
     auto& symCtx = d.solver->internalSymbolicContext();
     auto& metalCtx = MetalContext::instance();
     int64_t totalDataSz = d.solver->totalDataSize();
+    auto& slot = d.slots[d.curSlot];
+    SPRUX_CHECK(!slot.active);  // call endSolve before next beginSolve
 
-    // Step 2: Scatter equilibrated values directly into GPU buffer
-    SPRUX_FFI_SIGNPOST_BEGIN("scatter");
-    std::memset(d.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
+    // Equilibrate into this slot's scale arrays
+    computeEquilibrationFromOrigCsr(n, d.csrIndptr.data(), d.csrIndices.data(), csr_data,
+                                    d.preproc.rowPerm.data(), slot.rowScale, slot.colScale);
+
+    // Scatter into this slot's GPU buffer
+    std::memset(slot.dataGpu.ptr(), 0, totalDataSz * sizeof(float));
     scatterEquilibratedValues(n, d.nnz, d.csrIndptr.data(), d.csrIndices.data(),
                               csr_data, d.preproc.rowPerm.data(),
-                              d.rowScale.data(), d.colScale.data(),
-                              d.csrToDataMap.data(), d.dataGpu.ptr());
-    SPRUX_FFI_SIGNPOST_END("scatter");
+                              slot.rowScale.data(), slot.colScale.data(),
+                              d.csrToDataMap.data(), slot.dataGpu.ptr());
 
-    // Step 3: Permute RHS into persistent GPU buffer
-    SPRUX_FFI_SIGNPOST_BEGIN("permute_rhs");
+    // Permute RHS
     for (int64_t j = 0; j < n; j++) {
-      d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
+      slot.xGpu.ptr()[perm[j]] = float(slot.rowScale[j] * rhs[d.preproc.rowPerm[j]]);
     }
-    SPRUX_FFI_SIGNPOST_END("permute_rhs");
 
-    // Step 4: GPU factor + initial solve in one command buffer
-    SPRUX_FFI_SIGNPOST_BEGIN("gpu_factor_solve");
+    // Submit GPU factor + initial solve
     void* cmdBuf = metalCtx.createCommandBuffer();
     void* encoder = metalCtx.createComputeEncoder(cmdBuf);
     symCtx.setExternalEncoder(cmdBuf, encoder);
 
     d.numCtx->reset();
-    d.solver->factorLU(d.dataGpu.ptr(), d.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
-    d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
+    d.solver->factorLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), *d.numCtx, PivotLocation::Device);
+    d.solver->solveLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), slot.xGpu.ptr(), n, 1, *d.solveCtx,
                       PivotLocation::Device);
-    SPRUX_FFI_SIGNPOST_END("gpu_factor_solve");
 
-    // Step 5: Iterative refinement with encoder cycling and early termination.
-    // Each iteration: flush GPU → CPU accumulate + SpMV residual → check convergence → GPU solve.
-    // The residual norm is computed for free from the SpMV already needed for the correction.
-    std::fill(d.xAccum.begin(), d.xAccum.end(), 0.0);
+    // Store caller pointers for refinement in endSolve()
+    slot.csrData = csr_data;
+    slot.rhs = rhs;
+    slot.active = true;
+    std::fill(slot.xAccum.begin(), slot.xAccum.end(), 0.0);
+    return;
+  }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// endSolve(): complete refinement and write result.
+// ---------------------------------------------------------------------------
+
+int SpruxFFISolver::endSolve(double* x_out) {
+  auto& d = *impl_;
+  const int64_t n = d.n;
+  const auto& perm = *d.perm;
+
+#ifdef SPRUX_USE_METAL
+  if (d.useMetal) {
+    auto& symCtx = d.solver->internalSymbolicContext();
+    auto& metalCtx = MetalContext::instance();
+    auto& slot = d.slots[d.curSlot];
+
+    if (!slot.active) return 0;
+
+    const double* csr_data = slot.csrData;
+    const double* rhs = slot.rhs;
+
     double bNormSq = 0.0;
     for (int64_t j = 0; j < n; j++) bNormSq += rhs[j] * rhs[j];
 
     int itersUsed = 0;
     for (int iter = 0; iter < d.maxRefine; iter++) {
-      SPRUX_FFI_SIGNPOST_BEGIN("refine_flush");
       symCtx.clearExternalEncoder();
-      SPRUX_FFI_SIGNPOST_END("refine_flush");
 
-      SPRUX_FFI_SIGNPOST_BEGIN("refine_cpu_spmv");
       for (int64_t j = 0; j < n; j++) {
-        d.xAccum[j] += d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
+        slot.xAccum[j] += slot.colScale[j] * double(slot.xGpu.ptr()[perm[j]]);
       }
 
       double resNormSq = 0.0;
@@ -369,38 +404,52 @@ int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_o
         int64_t srcRow = d.preproc.rowPerm[j];
         double sum = 0.0;
         for (int64_t k = d.csrIndptr[srcRow]; k < d.csrIndptr[srcRow + 1]; k++) {
-          sum += csr_data[k] * d.xAccum[d.csrIndices[k]];
+          sum += csr_data[k] * slot.xAccum[d.csrIndices[k]];
         }
         double residual = rhs[srcRow] - sum;
         resNormSq += residual * residual;
-        d.xGpu.ptr()[perm[j]] = float(d.rowScale[j] * residual);
+        slot.xGpu.ptr()[perm[j]] = float(slot.rowScale[j] * residual);
       }
-      SPRUX_FFI_SIGNPOST_END("refine_cpu_spmv");
       itersUsed = iter + 1;
 
-      // Early termination: skip GPU solve if residual is below tolerance
       if (d.refineTol > 0 && resNormSq <= d.refineTol * d.refineTol * std::max(bNormSq, 1e-300)) {
         break;
       }
 
-      SPRUX_FFI_SIGNPOST_BEGIN("refine_gpu_solve");
       void* newCmdBuf = metalCtx.createCommandBuffer();
       void* newEncoder = metalCtx.createComputeEncoder(newCmdBuf);
       symCtx.setExternalEncoder(newCmdBuf, newEncoder);
 
-      d.solver->solveLU(d.dataGpu.ptr(), d.devPivots.ptr(), d.xGpu.ptr(), n, 1, *d.solveCtx,
+      d.solver->solveLU(slot.dataGpu.ptr(), slot.devPivots.ptr(), slot.xGpu.ptr(), n, 1, *d.solveCtx,
                         PivotLocation::Device);
-      SPRUX_FFI_SIGNPOST_END("refine_gpu_solve");
     }
 
-    SPRUX_FFI_SIGNPOST_BEGIN("final_flush");
     symCtx.clearExternalEncoder();
-    SPRUX_FFI_SIGNPOST_END("final_flush");
 
     for (int64_t j = 0; j < n; j++) {
-      x_out[j] = d.xAccum[j] + d.colScale[j] * double(d.xGpu.ptr()[perm[j]]);
+      x_out[j] = slot.xAccum[j] + slot.colScale[j] * double(slot.xGpu.ptr()[perm[j]]);
     }
+    slot.active = false;
+    d.curSlot = 1 - d.curSlot;  // swap to other slot for next beginSolve
     return itersUsed;
+  }
+#endif
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// solve(): synchronous wrapper — calls beginSolve + endSolve.
+// ---------------------------------------------------------------------------
+
+int SpruxFFISolver::solve(const double* csr_data, const double* rhs, double* x_out) {
+  auto& d = *impl_;
+  const int64_t n = d.n;
+  const auto& perm = *d.perm;
+
+#ifdef SPRUX_USE_METAL
+  if (d.useMetal) {
+    beginSolve(csr_data, rhs);
+    return endSolve(x_out);
   }
 #endif
 

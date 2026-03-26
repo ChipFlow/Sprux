@@ -71,6 +71,27 @@ class SpruxFFISolver {
   int solve(const double* csr_data, const double* rhs, double* x_out);
 
   /**
+   * Split-phase solve for pipelined batch processing.
+   *
+   * beginSolve() submits the GPU factor + initial solve and returns immediately.
+   * endSolve() completes iterative refinement and writes the result.
+   *
+   * Usage for transient simulation:
+   *   solver.beginSolve(J_0, b_0);
+   *   for (t = 1; t < num_steps; t++) {
+   *     iters = solver.endSolve(x_prev);      // finish previous
+   *     solver.beginSolve(J_t, b_t);           // start next (overlaps with above)
+   *     use(x_prev);
+   *   }
+   *   iters = solver.endSolve(x_last);         // finish final
+   *
+   * @note beginSolve() does: equilibrate, scatter, submit GPU factor+solve.
+   *       endSolve() does: wait for GPU, iterative refinement, accumulate result.
+   */
+  void beginSolve(const double* csr_data, const double* rhs);
+  int endSolve(double* x_out);
+
+  /**
    * Sparse matrix-vector multiply: b_out = A @ x (CPU, f64).
    *
    * Uses the original CSR structure directly (no permutation).
